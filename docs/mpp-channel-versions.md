@@ -56,6 +56,24 @@ program, ABI version and hook policy used at opening. V2 recovery must validate
 the account owner and on-chain hook commitment against that stored policy.
 Changing process defaults must not reinterpret an existing channel.
 
+V2 session gateways require durable Redis storage: set `PAY_MPP_REDIS_URL`
+(or the legacy `PAY_SESSION_REDIS_URL`) and use a binary built with
+`redis-session-store`. Use the same Redis namespace for the gateway and
+settlement worker (`PAY_MPP_REDIS_PREFIX`, falling back to
+`PAY_SESSION_REDIS_PREFIX`; default `pay:session:v1:`). The namespace name does
+not select the channel ABI. Startup fails rather than falling back to memory.
+Configure Redis persistence and backups to retain vouchers and session bindings.
+
+The SDK stores an immutable configuration snapshot for ordinary V2 sessions as
+well as deployment-owned sessions. An ordinary binding has a null deployment
+policy; the worker still restores and validates its snapshot. Missing or
+malformed V2 bindings must not be reconstructed from current defaults or chain
+data.
+
+Connect currently uses memory-backed session storage and rejects V2 sessions.
+Its V1 session behavior is unchanged; this restriction does not disable
+standalone V2 channel-backed charge routes.
+
 Chain-only adoption is not supported for V2: public channel state does not
 reconstruct the original merchant policy and consumer authentication binding.
 Retain access to the V1 deployment and its configuration while V1 channels are

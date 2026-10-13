@@ -29,6 +29,17 @@ pub const SECRET_ENV: &str = "PAY_CONNECT_SELL_SECRET";
 const STABLECOIN_DECIMALS: u8 = 6;
 const BLOCKHASH_REFRESH: std::time::Duration = std::time::Duration::from_secs(10);
 
+fn validate_session_storage(channel_version: Option<u8>) -> Result<(), String> {
+    if channel_version == Some(2) {
+        return Err(
+            "V2 MPP sessions require durable storage; Connect's memory-backed session \
+             backend does not support V2"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// The deployment's signing identity behind every seller's endpoint.
 pub struct Operator {
     pub signer: Arc<dyn TransactionSigner>,
@@ -225,6 +236,7 @@ impl EndpointBackends {
             let (channel_program, channel_version, channel_hooks) =
                 pay_core::mpp_channel_profile::server_profile()
                     .map_err(|error| error.to_string())?;
+            validate_session_storage(channel_version)?;
             for mint in &mints {
                 let token_program = solana_pubkey::Pubkey::from_str(
                     pay_kit::mpp::protocol::solana::default_token_program_for_currency(mint, None),
@@ -397,6 +409,17 @@ mod tests {
     use pay_core::sell_inference::SellPricing;
 
     const RECIPIENT: &str = "Cs2zdfUNonRdRGsiZUQQLdTxzxVvJZmgiX2mpLYKuEqP";
+
+    #[test]
+    fn connect_memory_sessions_reject_v2_and_preserve_v1() {
+        assert!(validate_session_storage(None).is_ok());
+        assert!(validate_session_storage(Some(1)).is_ok());
+        assert!(
+            validate_session_storage(Some(2))
+                .unwrap_err()
+                .contains("Connect")
+        );
+    }
 
     #[test]
     fn streaming_view_keeps_channel_backends_but_removes_upto() {

@@ -135,7 +135,17 @@ impl ConfiguredSessionStore {
         config: pay_kit::mpp::server::session::SessionConfig,
         secret: &str,
     ) -> pay_core::Result<SessionMpp> {
+        config
+            .channel_deployment()
+            .map_err(|error| pay_core::Error::Config(error.to_string()))?;
         match self {
+            Self::Static { durable: false, .. } if config.channel_version == Some(2) => {
+                Err(pay_core::Error::Config(
+                    "V2 MPP sessions require durable Redis storage; set PAY_MPP_REDIS_URL or \
+                     PAY_SESSION_REDIS_URL and build with redis-session-store"
+                        .into(),
+                ))
+            }
             Self::Static { store, .. } => Ok(SessionMpp::new_with_channel_store(
                 config,
                 secret,
@@ -4148,6 +4158,16 @@ mod tests {
             static_store.reconciliation(),
             super::SessionLifecycleReconciliation::Embedded
         );
+        let mut config = pay_kit::mpp::server::session::SessionConfig::default();
+        assert!(static_store.session(config.clone(), "test-secret").is_ok());
+        config.channel_version = Some(2);
+        config.channel_program = Some(
+            Pubkey::from_str(pay_kit::core::payment_channel::v2::PAYMENT_CHANNELS_PROGRAM_ID)
+                .unwrap(),
+        );
+        config.network = "devnet".into();
+        let error = static_store.session(config, "test-secret").err().unwrap();
+        assert!(error.to_string().contains("PAY_MPP_REDIS_URL"));
         assert!(missing_deployment_store.is_err());
         assert!(invalid_deployment_store.is_err());
     }

@@ -585,7 +585,7 @@ impl SettlementRuntime {
 }
 
 fn binding_error(error: impl std::fmt::Display) -> JobError {
-    JobError::Config(format!("deployment session binding: {error}"))
+    JobError::Config(format!("session binding: {error}"))
 }
 
 async fn restore_bound_session(
@@ -593,23 +593,16 @@ async fn restore_bound_session(
     session: &ChannelRuntime,
     mut state: ChannelState,
 ) -> Result<(ChannelState, Option<SessionConfig>), JobError> {
-    let Some(value) = channel_binding(&state).map_err(binding_error)? else {
+    let Some((value, config)) = restore_session_config(
+        &state,
+        &runtime.rpc_url,
+        Some(runtime.signer.clone()),
+        &runtime.network,
+        &runtime.operator,
+    )?
+    else {
         return Ok((state, None));
     };
-    let binding = pay_types::deployment_policy::DeploymentSessionBinding::from_value(value.clone())
-        .map_err(binding_error)?;
-    let snapshot = SessionConfigSnapshot::from_channel(&state)
-        .map_err(binding_error)?
-        .ok_or_else(|| binding_error("missing configuration snapshot"))?;
-    let mut config = SessionConfig {
-        rpc_url: Some(runtime.rpc_url.clone()),
-        fee_payer_signer: snapshot
-            .requires_fee_payer()
-            .then(|| runtime.signer.clone()),
-        ..SessionConfig::default()
-    };
-    snapshot.apply_to(&mut config).map_err(binding_error)?;
-    validate_bound_config(&binding, &config, &runtime.network, &runtime.operator)?;
     let server = SessionServer::new(config.clone(), Arc::new(session.store.clone()))
         .with_channel_binding(value);
     if resume_scanned_pending_open(&state, runtime.dry_run, |id| {
@@ -635,6 +628,60 @@ async fn restore_bound_session(
         .require_channel_binding(&state)
         .map_err(binding_error)?;
     Ok((state, Some(config)))
+}
+
+fn restore_session_config(
+    state: &ChannelState,
+    rpc_url: &str,
+    signer: Option<Arc<dyn TransactionSigner>>,
+    network: &str,
+    operator: &Pubkey,
+) -> Result<Option<(serde_json::Value, SessionConfig)>, JobError> {
+    let Some(policy) = channel_binding(state).map_err(binding_error)? else {
+        return Ok(None);
+    };
+    let snapshot = SessionConfigSnapshot::from_channel(state)
+        .map_err(binding_error)?
+        .ok_or_else(|| binding_error("missing configuration snapshot"))?;
+    let mut config = SessionConfig {
+        rpc_url: Some(rpc_url.into()),
+        fee_payer_signer: if snapshot.requires_fee_payer() {
+            signer
+        } else {
+            None
+        },
+        ..SessionConfig::default()
+    };
+    snapshot.apply_to(&mut config).map_err(binding_error)?;
+    validate_session_binding(&policy, &config, network, operator)?;
+    Ok(Some((policy, config)))
+}
+
+/// Ordinary V2 sessions carry a snapshot with a null host policy. That is a
+/// binding, not an unbound V1 channel, and must retain its original profile.
+fn validate_session_binding(
+    policy: &serde_json::Value,
+    config: &SessionConfig,
+    network: &str,
+    operator: &Pubkey,
+) -> Result<(), JobError> {
+    if policy.is_null() {
+        let deployment = channel::session_deployment(config)?;
+        if deployment.version != 2
+            || config.network != network
+            || config.operator != operator.to_string()
+        {
+            return Err(binding_error(
+                "ordinary snapshot differs from V2 deployment or worker identity",
+            ));
+        }
+        Ok(())
+    } else {
+        let binding =
+            pay_types::deployment_policy::DeploymentSessionBinding::from_value(policy.clone())
+                .map_err(binding_error)?;
+        validate_bound_config(&binding, config, network, operator)
+    }
 }
 
 /// Recovery is driven by durable enumeration, not by another opening request.
@@ -3347,6 +3394,99 @@ mod tests {
             }),
         );
         (state, config)
+    }
+
+    fn ordinary_v2_fixture() -> (ChannelState, SessionConfig) {
+        let (mut state, mut config) = bound_fixture();
+        config.channel_program = Some(
+            pay_kit::core::payment_channels_v2::PAYMENT_CHANNELS_PROGRAM_ID
+                .parse()
+                .unwrap(),
+        );
+        config.channel_version = Some(2);
+        config.channel_hooks = Some(Default::default());
+        state.extra.insert(
+            "mppSessionBinding".into(),
+            serde_json::json!({
+                "version": 1,
+                "policy": null,
+                "snapshot": SessionConfigSnapshot::capture(&config),
+            }),
+        );
+        (state, config)
+    }
+
+    fn assert_ordinary_v2_recovery(state: &ChannelState, original: &SessionConfig) {
+        let (policy, config) = restore_session_config(
+            state,
+            "http://restarted.invalid",
+            None,
+            "devnet",
+            &original.operator.parse().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(policy.is_null());
+        assert_eq!(
+            SessionConfigSnapshot::capture(&config),
+            SessionConfigSnapshot::capture(original)
+        );
+        let server = SessionServer::new(config, pay_kit::core::store::MemoryChannelStore::new());
+        server.require_channel_binding(state).unwrap();
+        let mut missing = state.clone();
+        missing.extra.remove("mppSessionBinding");
+        assert!(server.require_channel_binding(&missing).is_err());
+    }
+
+    #[test]
+    fn ordinary_v2_snapshot_recovery_requires_valid_binding() {
+        let (state, original) = ordinary_v2_fixture();
+        let restored: ChannelState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_ordinary_v2_recovery(&restored, &original);
+        let operator = original.operator.parse().unwrap();
+        for malformed in [
+            serde_json::Value::Null,
+            serde_json::json!({"version": 1, "policy": null}),
+            serde_json::json!({"version": 99, "policy": null, "snapshot": SessionConfigSnapshot::capture(&original)}),
+        ] {
+            let mut state = state.clone();
+            state.extra.insert("mppSessionBinding".into(), malformed);
+            assert!(restore_session_config(&state, "", None, "devnet", &operator).is_err());
+        }
+        assert!(restore_session_config(&state, "", None, "mainnet", &operator).is_err());
+        assert!(restore_session_config(&state, "", None, "devnet", &Pubkey::new_unique()).is_err());
+        // Truly unbound records remain the legacy V1 path.
+        assert!(
+            restore_session_config(&channel_state(), "", None, "devnet", &operator)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PAY_WORKER_TEST_REDIS_URL"]
+    async fn ordinary_v2_restart_recreates_redis_store_and_server() {
+        let url = std::env::var("PAY_WORKER_TEST_REDIS_URL").unwrap();
+        let prefix = format!("pay-worker-v2-restart:{}:", unix_nanos());
+        let (state, original) = ordinary_v2_fixture();
+        let store = RedisChannelStore::connect(&url, prefix.clone())
+            .await
+            .unwrap();
+        store
+            .put_channel(&state.channel_id, state.clone())
+            .await
+            .unwrap();
+        drop(store);
+        let restarted = RedisChannelStore::connect(&url, prefix).await.unwrap();
+        let recovered = restarted
+            .get_channel(&state.channel_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.cumulative, state.cumulative);
+        assert_ordinary_v2_recovery(&recovered, &original);
+        restarted.delete_channel(&state.channel_id).await.unwrap();
     }
 
     #[test]
