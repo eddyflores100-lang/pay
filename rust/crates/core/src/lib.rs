@@ -3,6 +3,7 @@ pub mod accounts;
 mod b58;
 pub mod backend;
 pub mod config;
+pub mod credit_provider;
 pub mod error;
 pub mod explorer;
 pub mod instructions;

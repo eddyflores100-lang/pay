@@ -52,6 +52,38 @@ fn parse_server_profile(
     Ok((program, version, hooks))
 }
 
+/// Enable channel-backed charges only for an explicitly selected V2 deployment.
+/// The operator owns the channel; the merchant remains the payout recipient.
+pub fn server_charge_config(
+    signer: Option<std::sync::Arc<dyn pay_kit::solana_keychain::TransactionSigner>>,
+) -> Result<Option<pay_kit::mpp::server::ChannelChargeConfig>> {
+    let (_, version, hooks) = server_profile()?;
+    if version != Some(2) {
+        return Ok(None);
+    }
+    let payee_signer = signer.ok_or_else(|| {
+        Error::Config("V2 channel-backed charges require an operator transaction signer".into())
+    })?;
+    Ok(Some(pay_kit::mpp::server::ChannelChargeConfig {
+        payee_signer,
+        hooks: hooks.unwrap_or_default(),
+    }))
+}
+
+/// Issue the configured charge mode. Used both for challenges and for rebuilding
+/// route pricing during verification; native charge behavior is unchanged.
+pub fn charge_with_options(
+    mpp: &pay_kit::mpp::server::Mpp,
+    amount: &str,
+    options: pay_kit::mpp::server::ChargeOptions<'_>,
+) -> std::result::Result<pay_kit::mpp::PaymentChallenge, pay_kit::mpp::Error> {
+    if mpp.channel_charge_enabled() {
+        mpp.charge_channel_with_options(amount, options)
+    } else {
+        mpp.charge_with_options(amount, options)
+    }
+}
+
 /// Validate the remote profile before requesting wallet access. Hook execution
 /// requires an exact descriptor match with local policy, not just a program ID.
 pub fn validate_challenge(request: &pay_kit::mpp::SessionRequest) -> Result<()> {
@@ -74,19 +106,81 @@ pub fn validate_challenge(request: &pay_kit::mpp::SessionRequest) -> Result<()> 
         hooks
             .validate()
             .map_err(|error| Error::Mpp(error.to_string()))?;
-        let trusted = environment("PAY_MPP_TRUSTED_CHANNEL_HOOKS")?
-            .map(|value| serde_json::from_str::<ChannelHooks>(&value))
-            .transpose()
-            .map_err(|_| Error::Config("invalid PAY_MPP_TRUSTED_CHANNEL_HOOKS".into()))?;
+        let trusted = trusted_hooks()?;
         require_trusted_hooks(hooks, trusted.as_ref())?;
     }
     Ok(())
 }
 
+fn trusted_hooks() -> Result<Option<ChannelHooks>> {
+    environment("PAY_MPP_TRUSTED_CHANNEL_HOOKS")?
+        .map(|value| serde_json::from_str::<ChannelHooks>(&value))
+        .transpose()
+        .map_err(|_| Error::Config("invalid PAY_MPP_TRUSTED_CHANNEL_HOOKS".into()))
+}
+
+/// Validate channel-backed charge policy before wallet access. Native charges
+/// return `None` and do not consult the hook policy.
+pub fn validate_charge_challenge(
+    request: &pay_kit::mpp::ChargeRequest,
+) -> Result<Option<ChannelHooks>> {
+    let Some(profile) = request
+        .method_details
+        .as_ref()
+        .and_then(|details| details.get("channelCharge"))
+    else {
+        return Ok(None);
+    };
+    let trusted = trusted_hooks()?;
+    validate_charge_profile(
+        profile,
+        request
+            .method_details
+            .as_ref()
+            .and_then(|details| details.get("network"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("mainnet"),
+        trusted.as_ref(),
+    )
+    .map(Some)
+}
+
+fn validate_charge_profile(
+    profile: &serde_json::Value,
+    network: &str,
+    trusted: Option<&ChannelHooks>,
+) -> Result<ChannelHooks> {
+    let profile: pay_kit::mpp::protocol::channel_charge::ChannelChargeProfile =
+        serde_json::from_value(profile.clone())
+            .map_err(|error| Error::Mpp(format!("invalid channel charge profile: {error}")))?;
+    if profile.channel_version != 2 {
+        return Err(Error::Mpp(
+            "channel-backed charges require version 2".into(),
+        ));
+    }
+    pay_kit::mpp::program::channel_deployment::resolve_for_network(
+        profile
+            .channel_program
+            .parse()
+            .map_err(|_| Error::Mpp("invalid charge channel program".into()))?,
+        Some(profile.channel_version),
+        Some(&profile.channel_hooks),
+        network,
+    )
+    .map_err(|error| Error::Mpp(format!("invalid charge channel deployment: {error}")))?;
+    profile
+        .channel_hooks
+        .validate()
+        .map_err(|error| Error::Mpp(error.to_string()))?;
+    // Even an empty descriptor requires explicit approval for this opt-in path.
+    require_trusted_hooks(&profile.channel_hooks, trusted)?;
+    Ok(profile.channel_hooks)
+}
+
 fn require_trusted_hooks(hooks: &ChannelHooks, trusted: Option<&ChannelHooks>) -> Result<()> {
     if trusted != Some(hooks) {
         return Err(Error::Mpp(
-            "session channel hooks are not approved by local PAY_MPP_TRUSTED_CHANNEL_HOOKS policy"
+            "MPP channel hooks are not approved by local PAY_MPP_TRUSTED_CHANNEL_HOOKS policy"
                 .into(),
         ));
     }
@@ -96,6 +190,32 @@ fn require_trusted_hooks(hooks: &ChannelHooks, trusted: Option<&ChannelHooks>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_charge_requires_exact_policy_and_valid_v2_profile() {
+        let hooks = ChannelHooks::default();
+        let profile = serde_json::json!({
+            "channelProgram": "CHNLxBtXw7VPqd5GMcbtVoEbn4ehyaSoiHj56Ao5sWkJ",
+            "channelVersion": 2,
+            "channelHooks": {},
+            "recentSlot": 42
+        });
+        assert!(validate_charge_profile(&profile, "devnet", None).is_err());
+        assert_eq!(
+            validate_charge_profile(&profile, "devnet", Some(&hooks)).unwrap(),
+            hooks
+        );
+        let mut invalid = profile.clone();
+        invalid["channelVersion"] = serde_json::json!(1);
+        assert!(validate_charge_profile(&invalid, "devnet", Some(&hooks)).is_err());
+        let mut invalid = profile.clone();
+        invalid["channelProgram"] = serde_json::json!(Pubkey::new_unique().to_string());
+        assert!(validate_charge_profile(&invalid, "devnet", Some(&hooks)).is_err());
+        let mut invalid = profile.clone();
+        invalid.as_object_mut().unwrap().remove("recentSlot");
+        assert!(validate_charge_profile(&invalid, "devnet", Some(&hooks)).is_err());
+        assert!(validate_charge_profile(&serde_json::Value::Null, "devnet", Some(&hooks)).is_err());
+    }
 
     #[test]
     fn default_is_v1_and_invalid_explicit_program_fails_closed() {

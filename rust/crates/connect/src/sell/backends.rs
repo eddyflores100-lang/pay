@@ -178,6 +178,9 @@ impl EndpointBackends {
 
         let mut charge = Vec::new();
         if schemes.contains(&Scheme::MppCharge) {
+            let channel_charge =
+                pay_core::mpp_channel_profile::server_charge_config(Some(operator.signer.clone()))
+                    .map_err(|error| error.to_string())?;
             for mint in &mints {
                 let mpp = Mpp::new(pay_kit::mpp::server::Config {
                     recipient: sale.recipient.clone(),
@@ -188,6 +191,7 @@ impl EndpointBackends {
                     challenge_binding_secret: Some(operator.challenge_binding_secret.clone()),
                     fee_payer: true,
                     fee_payer_signer: Some(operator.signer.clone()),
+                    channel_charge: channel_charge.clone(),
                     html: false,
                     ..Default::default()
                 })

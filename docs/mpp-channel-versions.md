@@ -63,7 +63,41 @@ still active.
 
 ## Scope
 
-This integration supports MPP sessions. Direct-transfer MPP charge and x402
-behavior are unchanged. Channel-backed charge, Coinflow transaction preparation,
-and a production credit-redemption/recredit adapter are not implemented here.
+This integration supports MPP sessions and opt-in channel-backed MPP charges.
+Without the explicit V2 profile, charges remain direct transfers. x402 behavior
+is unchanged. Coinflow transaction preparation and a production
+credit-redemption/recredit adapter are not implemented here.
 Program hooks alone do not confer permission to debit or mint issuer credits.
+
+## Channel-backed charge routes
+
+With the V2 environment profile above, existing `mpp-charge` routes use a
+one-shot payment channel. Keep the same route metering and prices; the CLI
+gateway and Connect seller backends advertise the opt-in
+`methodDetails.channelCharge` profile. It contains `channelProgram`,
+`channelVersion`, `channelHooks`, and the server's `recentSlot`.
+
+Configure an operator transaction signer for the server. For sponsored charges,
+the channel payee is the operator identified by `feePayerKey`; the merchant
+remains the payout recipient and does not need to provide a private key.
+The client checks the exact hook descriptor before requesting wallet approval.
+Even a channel-backed charge without hooks requires the explicit client policy:
+
+```sh
+export PAY_MPP_TRUSTED_CHANNEL_HOOKS='{}'
+```
+
+The client builds the transaction from the challenge's blockhash and slot
+without an additional RPC request. A separate ephemeral key signs the voucher;
+the wallet signs the transaction. The server retains route-price validation,
+challenge authentication, replay rejection, and ordinary `Payment-Receipt`
+responses. Hook simulation failures fail closed: channel charges do not retry
+with preflight disabled.
+
+The experimental path supports SPL Token payments. Transaction versions follow
+the server's advertised capabilities and the wallet's signing support. Hook
+profiles that exceed the V0 packet limit require a mutually supported V1
+transaction; they cannot bypass packet limits. Unsupported tokens, split
+allocations that cannot be represented exactly in basis points, and oversized
+transactions fail rather than falling back to a direct transfer. Test the
+complete configured hook profile before enabling it for a route.

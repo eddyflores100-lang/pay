@@ -1528,6 +1528,9 @@ impl StartCommand {
 
         let op = api.operator.clone();
         let op = op.as_ref();
+        if let Some(operator) = op {
+            pay_core::credit_provider::validate_operator(operator)?;
+        }
 
         // Note: we used to refuse any `operator.signer` block unless the
         // `gcp_kms` feature was built. That was over-broad — the new
@@ -1841,6 +1844,13 @@ impl StartCommand {
                 fee_payer,
                 fee_payer_signer.clone(),
                 &blockhash_cache,
+                api.endpoints.iter().any(|endpoint| {
+                    endpoint.metering.as_ref().is_some_and(|meter| {
+                        meter
+                            .accepted_schemes()
+                            .contains(&pay_types::metering::Scheme::MppCharge)
+                    })
+                }),
             )?;
             // ── Create one session MPP server per configured currency ──
             let session_mpps: Vec<Arc<SessionMpp>> = if let Some(ref sess) = api.session {
@@ -3955,10 +3965,13 @@ async fn gateway_verify(
             };
             let mut last_error = None;
             for mpp in &mpps {
+                use pay_core::mpp_channel_profile::charge_with_options;
+
                 // Audit #2: verify against the request this route would issue
                 // (rebuilt from the gateway's own price + splits), not the
                 // values echoed in the client's credential.
-                let expected: pay_kit::mpp::ChargeRequest = match mpp.charge_with_options(
+                let expected: pay_kit::mpp::ChargeRequest = match charge_with_options(
+                    mpp,
                     &req.price,
                     pay_kit::mpp::server::ChargeOptions {
                         description: req.description.as_deref(),
@@ -4072,7 +4085,8 @@ fn gateway_charge_challenges(
 ) -> Result<Vec<pay_kit::mpp::PaymentChallenge>, pay_kit::mpp::Error> {
     mpps.iter()
         .map(|mpp| {
-            mpp.charge_with_options(
+            pay_core::mpp_channel_profile::charge_with_options(
+                mpp,
                 &req.price,
                 pay_kit::mpp::server::ChargeOptions {
                     description: req.description.as_deref(),
