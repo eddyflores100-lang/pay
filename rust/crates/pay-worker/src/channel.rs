@@ -1,7 +1,7 @@
 //! Channel decoding, distribution-preimage recovery, and instruction building
 //! for the payment-channels program.
 //!
-//! Bound sessions use pay-kit's ownership-aware, versioned decoder. Legacy
+//! Bound sessions use pay-kit's ownership-aware, versioned decoder. Existing
 //! fleet jobs remain V1-only and reject V2 rather than decoding its V1 prefix.
 //! ATA derivation and RPC access come from pay-api-core.
 
@@ -197,7 +197,7 @@ pub async fn fetch_channel_for_program(
     if account.owner != program_id.to_string() {
         return Err(JobError::Config("session channel program mismatch".into()));
     }
-    decode_legacy_channel(address, &account.data)
+    decode_v1_channel(address, &account.data)
 }
 
 /// Validate persisted ABI selection before any recovery or transaction building.
@@ -236,7 +236,7 @@ pub async fn fetch_session_channel(
 ) -> Result<Option<DecodedChannel>, JobError> {
     let deployment = session_deployment(config)?;
     if deployment.version == 1 {
-        // Preserve legacy tombstone handling, but still reject a V2 prefix.
+        // Preserve V1 tombstone handling, but still reject a V2 prefix.
         return fetch_channel_for_program(rpc, rpc_url, address, &deployment.program_id).await;
     }
     let accounts = rpc
@@ -250,16 +250,13 @@ pub async fn fetch_session_channel(
     decode_session_channel(address, &owner, &account.data, config).map(Some)
 }
 
-fn decode_legacy_channel(
-    address: &Pubkey,
-    data: &[u8],
-) -> Result<Option<DecodedChannel>, JobError> {
+fn decode_v1_channel(address: &Pubkey, data: &[u8]) -> Result<Option<DecodedChannel>, JobError> {
     // Codama's V1 decoder accepts a V2 prefix. Never infer V1 from that success.
     if data.get(1) == Some(&2)
         || data.len() == pay_kit::core::payment_channels_v2::CHANNEL_ACCOUNT_SIZE
     {
         return Err(JobError::Config(
-            "V2 channel requires a persisted session deployment and hooks; legacy recovery is unsupported".into(),
+            "V2 channel requires a persisted session deployment and hooks; V1 recovery is unsupported".into(),
         ));
     }
     Ok(Channel::from_bytes(data)
@@ -270,20 +267,20 @@ fn decode_legacy_channel(
         }))
 }
 
-fn decode_legacy_account(
+fn decode_v1_account(
     address: &Pubkey,
     owner: &str,
     data: &[u8],
 ) -> Result<Option<DecodedChannel>, JobError> {
     if owner == pay_kit::core::payment_channels_v2::PAYMENT_CHANNELS_PROGRAM_ID {
         return Err(JobError::Config(
-            "V2 channel is unsupported by the legacy/batch worker path".into(),
+            "V2 channel is unsupported by the V1/batch worker path".into(),
         ));
     }
     if owner != default_program_id().to_string() {
         return Ok(None);
     }
-    decode_legacy_channel(address, data)
+    decode_v1_channel(address, data)
 }
 
 /// Fetch and decode up to 100 channels with one `getMultipleAccounts` call.
@@ -320,7 +317,7 @@ pub async fn fetch_channels(
             };
             // Tombstoned / closed channels are a different (short) account
             // shape; a decode failure means this is not a live channel.
-            decode_legacy_account(&address, &account.owner, &account.data)
+            decode_v1_account(&address, &account.owner, &account.data)
         })
         .collect()
 }
@@ -773,11 +770,11 @@ mod tests {
         let mut missing_version = config;
         missing_version.channel_version = None;
         assert!(decode_session_channel(&address, &owner, &bytes, &missing_version).is_err());
-        assert!(decode_legacy_channel(&address, &bytes).is_err());
+        assert!(decode_v1_channel(&address, &bytes).is_err());
         // Batch/fleet reconciliation must report unsupported rather than
         // treating a V2-owned account as absent and deleting its durable row.
-        assert!(decode_legacy_account(&address, &owner.to_string(), &bytes).is_err());
-        assert!(decode_legacy_account(&address, &owner.to_string(), &[0]).is_err());
+        assert!(decode_v1_account(&address, &owner.to_string(), &bytes).is_err());
+        assert!(decode_v1_account(&address, &owner.to_string(), &[0]).is_err());
     }
 
     #[test]
@@ -801,7 +798,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_recovery_refuses_v2_before_rpc_even_for_empty_plan() {
+    async fn v1_recovery_refuses_v2_before_rpc_even_for_empty_plan() {
         let (config, bytes) = v2_fixture();
         let mut channel = decode_session_channel(
             &Pubkey::new_unique(),
@@ -827,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_session_default_keeps_v1_account_layout() {
+    fn default_session_keeps_v1_account_layout() {
         let mut bytes = vec![0; CHANNEL_ACCOUNT_SIZE];
         bytes[0] = 1;
         bytes[1] = 1;
@@ -845,8 +842,8 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(decode_legacy_channel(&address, &bytes).unwrap().is_some());
-        assert!(decode_legacy_channel(&address, &[0]).unwrap().is_none());
+        assert!(decode_v1_channel(&address, &bytes).unwrap().is_some());
+        assert!(decode_v1_channel(&address, &[0]).unwrap().is_none());
     }
 
     #[test]

@@ -3683,15 +3683,15 @@ mod tests {
     }
 
     #[test]
-    fn bound_v1_distribution_matches_legacy_builder() {
+    fn bound_v1_distribution_matches_v1_builder() {
         let (_, config, onchain) = closing_fixture();
         let treasury = Pubkey::new_unique();
         let token = config.token_program.unwrap();
         let preimage = bound_preimage(&config, &onchain).unwrap();
-        let legacy = channel::build_distribute_ix(&onchain, &treasury, &token, &preimage).0;
+        let v1 = channel::build_distribute_ix(&onchain, &treasury, &token, &preimage).0;
         assert_eq!(
             bound_distribution_instruction(&config, &onchain, &treasury, &token).unwrap(),
-            legacy
+            v1
         );
     }
 
