@@ -63,6 +63,7 @@ impl LeaseHeartbeat {
         channel_id: String,
         owner: String,
         ttl: Duration,
+        binding: CloseBinding,
     ) -> (Self, CancellationToken) {
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
@@ -76,6 +77,7 @@ impl LeaseHeartbeat {
                     _ = interval.tick() => {
                         if let Err(error) = claim_due_close(
                             &store, &channel_id, unix_now_millis(), unix_now() as u64, &owner, ttl,
+                            Some(&binding),
                         ).await {
                             task_lost.cancel();
                             warn!(%channel_id, %error, "bound close ownership lost; stopping renewal");
@@ -588,6 +590,42 @@ fn binding_error(error: impl std::fmt::Display) -> JobError {
     JobError::Config(format!("session binding: {error}"))
 }
 
+/// Pin recovery's complete immutable binding through every atomic lease renewal.
+/// Deletion or replacement must never downgrade a close to the unbound V1 path.
+#[derive(Clone)]
+struct CloseBinding {
+    policy: serde_json::Value,
+    snapshot: SessionConfigSnapshot,
+}
+
+impl CloseBinding {
+    fn new(state: &ChannelState, config: &SessionConfig) -> Result<Self, JobError> {
+        let policy = channel_binding(state)
+            .map_err(binding_error)?
+            .ok_or_else(|| binding_error("missing session binding"))?;
+        let operator = config.operator.parse().map_err(binding_error)?;
+        validate_session_binding(&policy, config, &config.network, &operator)?;
+        let binding = Self {
+            policy,
+            snapshot: SessionConfigSnapshot::capture(config),
+        };
+        binding.require(state)?;
+        Ok(binding)
+    }
+
+    fn require(&self, state: &ChannelState) -> Result<(), JobError> {
+        if channel_binding(state).map_err(binding_error)?.as_ref() != Some(&self.policy)
+            || SessionConfigSnapshot::from_channel(state)
+                .map_err(binding_error)?
+                .as_ref()
+                != Some(&self.snapshot)
+        {
+            return Err(binding_error("session binding changed during close"));
+        }
+        Ok(())
+    }
+}
+
 async fn restore_bound_session(
     runtime: &SettlementRuntime,
     session: &ChannelRuntime,
@@ -868,6 +906,7 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
     let mut finalized = 0_usize;
     let mut inventory = LifecycleInventory::default();
     let mut bound_configs = HashMap::new();
+    let mut close_bindings = HashMap::new();
     let mut bound_close_heartbeats = Vec::new();
     let mut bound_close_ownership = HashMap::new();
     for scanned_state in channels {
@@ -887,6 +926,10 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
             };
         if let Some(config) = bound_config.as_ref() {
             bound_configs.insert(scanned_state.channel_id.clone(), config.clone());
+            close_bindings.insert(
+                scanned_state.channel_id.clone(),
+                CloseBinding::new(&scanned_state, config)?,
+            );
         }
         let now = unix_now();
         let now_ms = unix_now_millis();
@@ -912,6 +955,7 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
                 now as u64,
                 &lock.owner,
                 Duration::from_secs(runtime.lock_ttl),
+                close_bindings.get(&scanned_state.channel_id),
             ) {
                 Ok(state) => state,
                 Err(error) => {
@@ -929,6 +973,7 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
                 now as u64,
                 &lock.owner,
                 Duration::from_secs(runtime.lock_ttl),
+                close_bindings.get(&scanned_state.channel_id),
             )
             .await
             {
@@ -954,6 +999,10 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
                 state.channel_id.clone(),
                 lock.owner.clone(),
                 Duration::from_secs(runtime.lock_ttl),
+                close_bindings
+                    .get(&state.channel_id)
+                    .expect("bound close binding")
+                    .clone(),
             );
             bound_close_heartbeats.push(heartbeat);
             bound_close_ownership.insert(state.channel_id.clone(), lost);
@@ -1158,6 +1207,7 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
                     unix_now() as u64,
                     &lock.owner,
                     Duration::from_secs(runtime.lock_ttl),
+                    close_bindings.get(&candidate.channel_id),
                 )
                 .await
                 .map_err(|_| TxPipelineError::SubmissionGuardRejected)
@@ -1198,6 +1248,7 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
                     unix_now() as u64,
                     &lock.owner,
                     Duration::from_secs(runtime.lock_ttl),
+                    close_bindings.get(&candidate.channel_id),
                 )
                 .await
                 .map_err(|_| TxPipelineError::SubmissionGuardRejected)?;
@@ -1233,6 +1284,7 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
                     unix_now() as u64,
                     &lock.owner,
                     Duration::from_secs(runtime.lock_ttl),
+                    close_bindings.get(&candidate.channel_id),
                 )
                 .await
                 .map_err(|_| TxPipelineError::SubmissionGuardRejected)?;
@@ -2926,16 +2978,25 @@ async fn claim_due_close(
     now_seconds: u64,
     owner: &str,
     ttl: Duration,
+    binding: Option<&CloseBinding>,
 ) -> Result<ChannelState, JobError> {
     const MAX_ATTEMPTS: usize = 3;
     let mut last_error = None;
     for _ in 0..MAX_ATTEMPTS {
         let owner = owner.to_owned();
+        let binding = binding.cloned();
         let updated = store
             .update_channel(
                 channel_id,
                 Box::new(move |current| {
-                    transition_due_close(current, now_ms, now_seconds, &owner, ttl)
+                    transition_due_close(
+                        current,
+                        now_ms,
+                        now_seconds,
+                        &owner,
+                        ttl,
+                        binding.as_ref(),
+                    )
                 }),
             )
             .await;
@@ -2958,13 +3019,16 @@ fn transition_due_close(
     now_seconds: u64,
     owner: &str,
     ttl: Duration,
+    binding: Option<&CloseBinding>,
 ) -> Result<ChannelState, StoreError> {
     let mut state = current.ok_or_else(|| StoreError::Internal("Channel not found".into()))?;
     if session_open_is_terminal(&state) {
         return Err(StoreError::Internal("session open is terminal".into()));
     }
-    if let Some(value) = channel_binding(&state).map_err(|e| StoreError::Internal(e.to_string()))? {
-        pay_types::deployment_policy::DeploymentSessionBinding::from_value(value)
+    let policy = channel_binding(&state).map_err(|e| StoreError::Internal(e.to_string()))?;
+    if let Some(binding) = binding {
+        binding
+            .require(&state)
             .map_err(|e| StoreError::Internal(e.to_string()))?;
         if !pay_types::deployment_policy::claim_close(
             &mut state,
@@ -2980,6 +3044,11 @@ fn transition_due_close(
         }
         Ok(state)
     } else {
+        if policy.is_some() {
+            return Err(StoreError::Internal(
+                "bound close requires restored configuration".into(),
+            ));
+        }
         claim_channel_close(Some(state), now_ms, now_seconds)
     }
 }
@@ -3648,7 +3717,8 @@ mod tests {
                 1000,
                 1,
                 "worker",
-                Duration::from_secs(1)
+                Duration::from_secs(1),
+                None,
             )
             .await
             .is_err()
@@ -3835,6 +3905,276 @@ mod tests {
         );
     }
 
+    async fn assert_ordinary_v2_due_close(store: &impl ChannelStore) {
+        use pay_kit::core::payment_channels_v2::{ChannelHooks, HookAccount, HookDescriptor};
+        let (mut state, mut config, mut onchain) = closing_fixture();
+        config.channel_program = Some(
+            pay_kit::core::payment_channels_v2::PAYMENT_CHANNELS_PROGRAM_ID
+                .parse()
+                .unwrap(),
+        );
+        config.channel_version = Some(2);
+        let hook = HookDescriptor {
+            program_id: Pubkey::new_unique().to_string(),
+            entrypoint: *b"refund!!",
+            accounts: vec![HookAccount {
+                address: Pubkey::new_unique().to_string(),
+                writable: true,
+            }],
+            static_data: vec![9],
+        };
+        config.channel_hooks = Some(ChannelHooks {
+            pre_distribute: Some(hook.clone()),
+            post_distribute: Some(hook),
+            ..Default::default()
+        });
+        state.lifecycle.as_mut().unwrap().close_after = 120_000;
+        state.extra.insert(
+            "mppSessionBinding".into(),
+            serde_json::json!({
+                "version": 1,
+                "policy": null,
+                "snapshot": SessionConfigSnapshot::capture(&config),
+            }),
+        );
+        let id = state.channel_id.clone();
+        // Exercise a complete durable record, not just snapshot.apply_to.
+        let persisted: ChannelState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        store.put_channel(&id, persisted).await.unwrap();
+        let recovered = store.get_channel(&id).await.unwrap().unwrap();
+        let (_, restored) = restore_session_config(
+            &recovered,
+            "",
+            None,
+            "devnet",
+            &config.operator.parse().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let binding = CloseBinding::new(&recovered, &restored).unwrap();
+        let claimed = claim_due_close(
+            store,
+            &id,
+            120_000,
+            120,
+            "worker",
+            Duration::from_secs(10),
+            Some(&binding),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed.close_requested_at, Some(120));
+        assert_eq!(
+            store
+                .get_channel(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .close_requested_at,
+            Some(120),
+        );
+
+        // The real candidate builder must verify mint ownership and retain the
+        // V2 program and both mandatory distribution-hook account groups.
+        let token = restored.token_program.unwrap();
+        let app = Router::new().route(
+            "/",
+            axum::routing::post(
+                move |axum::Json(request): axum::Json<serde_json::Value>| async move {
+                    assert_eq!(request["method"], "getMultipleAccounts");
+                    axum::Json(serde_json::json!({
+                        "jsonrpc": "2.0", "id": request["id"],
+                        "result": {"context": {"slot": 42}, "value": [{
+                            "owner": token.to_string(), "data": ["", "base64"],
+                            "lamports": 1, "executable": false, "rentEpoch": 0
+                        }]}
+                    }))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let rpc = RpcClient::new(Duration::from_secs(5)).unwrap();
+        onchain.channel.version = 2;
+        onchain.channel.status = STATUS_OPEN;
+        onchain.channel.closure_started_at = 0;
+        verify_bound_channel(&restored, &claimed, &onchain).unwrap();
+        let operator = restored.operator.parse().unwrap();
+        let treasury = Pubkey::new_unique();
+        let candidate = build_idle_close_candidate(
+            &rpc,
+            &url,
+            &claimed,
+            &onchain,
+            120,
+            &operator,
+            &treasury,
+            Some(&restored),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let program = restored.channel_program.unwrap();
+        let close = close_settlement_instructions(&claimed, &onchain, 120, &operator, &program)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&candidate.instructions[..close.len()], &close);
+        assert!(close.iter().any(|ix| ix.program_id == program));
+        let preimage = bound_preimage(&restored, &onchain).unwrap();
+        let base = channel::build_distribute_ix_for_program(
+            &onchain, &treasury, &token, &preimage, &program,
+        )
+        .0;
+        let distribution = candidate.instructions.last().unwrap();
+        assert_eq!(distribution.program_id, program);
+        assert_eq!(distribution.data, base.data);
+        assert_eq!(
+            &distribution.accounts[..base.accounts.len()],
+            &base.accounts
+        );
+        assert_eq!(distribution.accounts.len(), base.accounts.len() + 6);
+        assert_ne!(
+            distribution.accounts[base.accounts.len() + 1],
+            distribution.accounts[base.accounts.len() + 4]
+        );
+        server.abort();
+        let _ = server.await;
+        store.delete_channel(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_v2_persisted_due_close_builds_hooked_candidate() {
+        assert_ordinary_v2_due_close(&pay_kit::core::store::MemoryChannelStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_v2_delivery_and_close_share_atomic_admission() {
+        use pay_kit::mpp::server::session::DeliveryRequest;
+        let (state, config) = ordinary_v2_fixture();
+        let binding = CloseBinding::new(&state, &config).unwrap();
+        let store = Arc::new(pay_kit::core::store::MemoryChannelStore::new());
+        let id = state.channel_id.clone();
+        store.put_channel(&id, state).await.unwrap();
+        let server = SessionServer::new(config, store.clone());
+        let mut delivery = DeliveryRequest::new(&id, 1);
+        delivery.expires_at = Some(2);
+        server.begin_delivery(delivery).await.unwrap();
+        assert!(
+            claim_due_close(
+                &store,
+                &id,
+                1000,
+                1,
+                "worker",
+                Duration::from_secs(1),
+                Some(&binding),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            store
+                .get_channel(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .close_requested_at
+                .is_none()
+        );
+        claim_due_close(
+            &store,
+            &id,
+            2000,
+            2,
+            "worker",
+            Duration::from_secs(1),
+            Some(&binding),
+        )
+        .await
+        .unwrap();
+        // Once close wins the CAS, ordinary SDK admission cannot add work,
+        // even after the close lease expires: the close marker is permanent.
+        let mut delivery = DeliveryRequest::new(&id, 1);
+        delivery.expires_at = Some(100);
+        assert!(server.begin_delivery(delivery).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn close_claim_rejects_missing_malformed_or_replaced_binding() {
+        let store = pay_kit::core::store::MemoryChannelStore::new();
+        for (original, config) in [ordinary_v2_fixture(), bound_fixture()] {
+            let binding = CloseBinding::new(&original, &config).unwrap();
+            for mutation in 0..5 {
+                let mut state = original.clone();
+                match mutation {
+                    0 => {
+                        state.extra.remove("mppSessionBinding");
+                    }
+                    1 => {
+                        state
+                            .extra
+                            .insert("mppSessionBinding".into(), serde_json::Value::Null);
+                    }
+                    2 => {
+                        state.extra.get_mut("mppSessionBinding").unwrap()["snapshot"] =
+                            serde_json::Value::Null;
+                    }
+                    3 => {
+                        state.extra.get_mut("mppSessionBinding").unwrap()["snapshot"]["amount"] =
+                            serde_json::json!(999);
+                    }
+                    _ => {
+                        state.extra.get_mut("mppSessionBinding").unwrap()["policy"] =
+                            channel_binding(&bound_fixture().0).unwrap().unwrap();
+                    }
+                }
+                let id = state.channel_id.clone();
+                store.put_channel(&id, state.clone()).await.unwrap();
+                assert!(
+                    claim_due_close(
+                        &store,
+                        &id,
+                        1000,
+                        1,
+                        "worker",
+                        Duration::from_secs(10),
+                        Some(&binding),
+                    )
+                    .await
+                    .is_err()
+                );
+                assert_eq!(
+                    serde_json::to_value(store.get_channel(&id).await.unwrap().unwrap()).unwrap(),
+                    serde_json::to_value(state).unwrap(),
+                );
+                store.delete_channel(&id).await.unwrap();
+            }
+            assert!(
+                transition_due_close(
+                    Some(original),
+                    1000,
+                    1,
+                    "worker",
+                    Duration::from_secs(10),
+                    None,
+                )
+                .is_err()
+            );
+        }
+        let mut v1 = channel_state();
+        v1.lifecycle = Some(ChannelLifecycle {
+            owner: "v1".into(),
+            close_after: 1000,
+        });
+        let claimed =
+            transition_due_close(Some(v1), 1000, 1, "worker", Duration::from_secs(10), None)
+                .unwrap();
+        assert_eq!(claimed.close_requested_at, Some(1));
+        assert!(!claimed.extra.contains_key("payDeploymentLifecycle"));
+    }
+
     fn closing_fixture() -> (ChannelState, SessionConfig, channel::DecodedChannel) {
         use pay_kit::generated::payment_channels::generated::{
             accounts::Channel, types::SettlementWatermarks,
@@ -3887,6 +4227,7 @@ mod tests {
     #[tokio::test]
     async fn dry_run_due_open_plans_close_without_persisting() {
         let (mut state, config, mut onchain) = closing_fixture();
+        let binding = CloseBinding::new(&state, &config).unwrap();
         state.lifecycle.as_mut().unwrap().close_after = 120_000;
         onchain.channel.status = STATUS_OPEN;
         onchain.channel.closure_started_at = 0;
@@ -3901,6 +4242,7 @@ mod tests {
             120,
             "worker",
             Duration::from_secs(10),
+            Some(&binding),
         )
         .unwrap();
         assert_eq!(planned.close_requested_at, Some(120));
@@ -3924,7 +4266,8 @@ mod tests {
 
     #[tokio::test]
     async fn dry_run_due_open_with_active_reservation_remains_unplanned() {
-        let (mut state, _, _) = closing_fixture();
+        let (mut state, config, _) = closing_fixture();
+        let binding = CloseBinding::new(&state, &config).unwrap();
         pay_types::deployment_policy::reserve(&mut state, "request", 1, 120_000, 130_000).unwrap();
         state.lifecycle.as_mut().unwrap().close_after = 120_000;
         assert!(state.close_requested_at.is_none());
@@ -3938,6 +4281,7 @@ mod tests {
                 120,
                 "worker",
                 Duration::from_secs(10),
+                Some(&binding),
             )
             .is_err()
         );
@@ -3950,6 +4294,7 @@ mod tests {
     #[tokio::test]
     async fn external_close_before_idle_deadline_settles_latest_voucher_in_grace() {
         let (state, config, onchain) = closing_fixture();
+        let binding = CloseBinding::new(&state, &config).unwrap();
         let store = pay_kit::core::store::MemoryChannelStore::new();
         let id = state.channel_id.clone();
         assert!(!channel_close_due(&state, 120_000));
@@ -3970,9 +4315,17 @@ mod tests {
         record_bound_close(&store, &id, &config, onchain.clone(), 120)
             .await
             .unwrap();
-        let state = claim_due_close(&store, &id, 120_000, 120, "worker", Duration::from_secs(10))
-            .await
-            .unwrap();
+        let state = claim_due_close(
+            &store,
+            &id,
+            120_000,
+            120,
+            "worker",
+            Duration::from_secs(10),
+            Some(&binding),
+        )
+        .await
+        .unwrap();
         let program = config.channel_program.unwrap();
         let actual = close_settlement_instructions(
             &state,
@@ -4000,6 +4353,7 @@ mod tests {
     #[tokio::test]
     async fn external_close_preserves_marker_while_reservation_defers_and_expiry_allows_takeover() {
         let (mut state, config, onchain) = closing_fixture();
+        let binding = CloseBinding::new(&state, &config).unwrap();
         pay_types::deployment_policy::reserve(&mut state, "request", 1, 120_000, 130_000).unwrap();
         let store = pay_kit::core::store::MemoryChannelStore::new();
         let id = state.channel_id.clone();
@@ -4008,9 +4362,17 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            claim_due_close(&store, &id, 120_000, 120, "a", Duration::from_secs(10))
-                .await
-                .is_err()
+            claim_due_close(
+                &store,
+                &id,
+                120_000,
+                120,
+                "a",
+                Duration::from_secs(10),
+                Some(&binding)
+            )
+            .await
+            .is_err()
         );
         assert_eq!(
             store
@@ -4021,21 +4383,53 @@ mod tests {
                 .close_requested_at,
             Some(120)
         );
-        claim_due_close(&store, &id, 130_000, 130, "a", Duration::from_secs(10))
-            .await
-            .unwrap();
+        claim_due_close(
+            &store,
+            &id,
+            130_000,
+            130,
+            "a",
+            Duration::from_secs(10),
+            Some(&binding),
+        )
+        .await
+        .unwrap();
         assert!(
-            claim_due_close(&store, &id, 130_001, 130, "b", Duration::from_secs(10))
-                .await
-                .is_err()
+            claim_due_close(
+                &store,
+                &id,
+                130_001,
+                130,
+                "b",
+                Duration::from_secs(10),
+                Some(&binding)
+            )
+            .await
+            .is_err()
         );
-        claim_due_close(&store, &id, 140_000, 140, "b", Duration::from_secs(10))
-            .await
-            .unwrap();
+        claim_due_close(
+            &store,
+            &id,
+            140_000,
+            140,
+            "b",
+            Duration::from_secs(10),
+            Some(&binding),
+        )
+        .await
+        .unwrap();
         assert!(
-            claim_due_close(&store, &id, 140_001, 140, "a", Duration::from_secs(10))
-                .await
-                .is_err()
+            claim_due_close(
+                &store,
+                &id,
+                140_001,
+                140,
+                "a",
+                Duration::from_secs(10),
+                Some(&binding)
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -4072,6 +4466,7 @@ mod tests {
     #[tokio::test]
     async fn external_sealed_close_and_terminal_tombstone_fail_closed() {
         let (mut state, config, mut onchain) = closing_fixture();
+        let binding = CloseBinding::new(&state, &config).unwrap();
         onchain.channel.status = STATUS_SEALED;
         let store = pay_kit::core::store::MemoryChannelStore::new();
         let id = state.channel_id.clone();
@@ -4096,9 +4491,17 @@ mod tests {
                 .is_err()
         );
         assert!(
-            claim_due_close(&store, &id, 120_000, 120, "a", Duration::from_secs(10))
-                .await
-                .is_err()
+            claim_due_close(
+                &store,
+                &id,
+                120_000,
+                120,
+                "a",
+                Duration::from_secs(10),
+                Some(&binding)
+            )
+            .await
+            .is_err()
         );
         assert_eq!(
             serde_json::to_value(store.get_channel(&id).await.unwrap().unwrap()).unwrap(),
@@ -4110,6 +4513,7 @@ mod tests {
     async fn external_close_waits_for_pending_setup_and_authorization() {
         use pay_kit::core::store::{PendingDelivery, PendingSetup};
         let (mut state, config, onchain) = closing_fixture();
+        let binding = CloseBinding::new(&state, &config).unwrap();
         state.pending_setup = Some(PendingSetup {
             payer_signature: "pending".into(),
             deposit: 1,
@@ -4123,9 +4527,17 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            claim_due_close(&store, &id, 120_000, 120, "a", Duration::from_secs(10))
-                .await
-                .is_err()
+            claim_due_close(
+                &store,
+                &id,
+                120_000,
+                120,
+                "a",
+                Duration::from_secs(10),
+                Some(&binding)
+            )
+            .await
+            .is_err()
         );
         assert_eq!(
             store
@@ -4156,63 +4568,133 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            claim_due_close(&store, &id, 120_000, 120, "a", Duration::from_secs(10))
-                .await
-                .is_err()
-        );
-        claim_due_close(&store, &id, 130_000, 130, "a", Duration::from_secs(10))
+            claim_due_close(
+                &store,
+                &id,
+                120_000,
+                120,
+                "a",
+                Duration::from_secs(10),
+                Some(&binding)
+            )
             .await
-            .unwrap();
+            .is_err()
+        );
+        claim_due_close(
+            &store,
+            &id,
+            130_000,
+            130,
+            "a",
+            Duration::from_secs(10),
+            Some(&binding),
+        )
+        .await
+        .unwrap();
     }
 
     async fn assert_reservation_close_exclusion(store: &impl ChannelStore) {
-        for _ in 0..20 {
-            let (state, _) = bound_fixture();
-            let id = state.channel_id.clone();
-            store.put_channel(&id, state).await.unwrap();
-            let (closed, reserved) = tokio::join!(
-                claim_due_close(store, &id, 1000, 1, "worker-a", Duration::from_secs(1)),
-                store.update_channel(
+        for ordinary in [false, true] {
+            for _ in 0..20 {
+                let (state, config) = if ordinary {
+                    ordinary_v2_fixture()
+                } else {
+                    bound_fixture()
+                };
+                let binding = CloseBinding::new(&state, &config).unwrap();
+                let id = state.channel_id.clone();
+                store.put_channel(&id, state).await.unwrap();
+                let (closed, reserved) = tokio::join!(
+                    claim_due_close(
+                        store,
+                        &id,
+                        1000,
+                        1,
+                        "worker-a",
+                        Duration::from_secs(1),
+                        Some(&binding)
+                    ),
+                    store.update_channel(
+                        &id,
+                        Box::new(|current| {
+                            let mut state = current.unwrap();
+                            pay_types::deployment_policy::reserve(
+                                &mut state, "request", 50_000, 1000, 2000,
+                            )
+                            .map_err(|error| StoreError::Internal(error.to_string()))?;
+                            Ok(state)
+                        })
+                    ),
+                );
+                assert_ne!(
+                    closed.is_ok(),
+                    reserved.is_ok(),
+                    "only one CAS contender may own lifecycle"
+                );
+                // A crash/expired reservation is recoverable; a live close owner
+                // excludes another external job even when the global job lock differs.
+                let recovered = claim_due_close(
+                    store,
                     &id,
-                    Box::new(|current| {
-                        let mut state = current.unwrap();
-                        pay_types::deployment_policy::reserve(
-                            &mut state, "request", 50_000, 1000, 2000,
-                        )
-                        .map_err(|error| StoreError::Internal(error.to_string()))?;
-                        Ok(state)
-                    })
-                ),
-            );
-            assert_ne!(
-                closed.is_ok(),
-                reserved.is_ok(),
-                "only one CAS contender may own lifecycle"
-            );
-            // A crash/expired reservation is recoverable; a live close owner
-            // excludes another external job even when the global job lock differs.
-            let recovered =
-                claim_due_close(store, &id, 2001, 2, "worker-b", Duration::from_secs(1))
-                    .await
-                    .unwrap();
-            assert!(recovered.close_requested_at.is_some());
-            assert!(
-                claim_due_close(store, &id, 2002, 2, "worker-c", Duration::from_secs(1))
-                    .await
-                    .is_err()
-            );
-            claim_due_close(store, &id, 2500, 2, "worker-b", Duration::from_secs(1))
+                    2001,
+                    2,
+                    "worker-b",
+                    Duration::from_secs(1),
+                    Some(&binding),
+                )
                 .await
                 .unwrap();
-            assert!(
-                claim_due_close(store, &id, 3002, 3, "worker-c", Duration::from_secs(1))
+                assert!(recovered.close_requested_at.is_some());
+                assert!(
+                    claim_due_close(
+                        store,
+                        &id,
+                        2002,
+                        2,
+                        "worker-c",
+                        Duration::from_secs(1),
+                        Some(&binding)
+                    )
                     .await
                     .is_err()
-            );
-            claim_due_close(store, &id, 3501, 3, "worker-c", Duration::from_secs(1))
+                );
+                claim_due_close(
+                    store,
+                    &id,
+                    2500,
+                    2,
+                    "worker-b",
+                    Duration::from_secs(1),
+                    Some(&binding),
+                )
                 .await
                 .unwrap();
-            store.delete_channel(&id).await.unwrap();
+                assert!(
+                    claim_due_close(
+                        store,
+                        &id,
+                        3002,
+                        3,
+                        "worker-c",
+                        Duration::from_secs(1),
+                        Some(&binding)
+                    )
+                    .await
+                    .is_err()
+                );
+                claim_due_close(
+                    store,
+                    &id,
+                    3501,
+                    3,
+                    "worker-c",
+                    Duration::from_secs(1),
+                    Some(&binding),
+                )
+                .await
+                .unwrap();
+                store.delete_channel(&id).await.unwrap();
+            }
         }
     }
 
@@ -4233,6 +4715,7 @@ mod tests {
         .await
         .unwrap();
         assert_reservation_close_exclusion(&store).await;
+        assert_ordinary_v2_due_close(&store).await;
     }
 
     #[test]

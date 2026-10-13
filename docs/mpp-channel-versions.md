@@ -70,6 +70,15 @@ policy; the worker still restores and validates its snapshot. Missing or
 malformed V2 bindings must not be reconstructed from current defaults or chain
 data.
 
+Ordinary V2 and deployment-owned sessions use the same atomic close claims,
+owner leases, and heartbeat renewals. Pending setup, live delivery authorizations,
+and usage reservations defer close. Once close is claimed, its durable marker
+blocks new usage even if the lease expires; another worker can reclaim expired
+ownership. Every renewal checks the original policy and configuration snapshot,
+so a deleted or replaced binding cannot downgrade the session to unbound V1.
+Close and distribution instructions retain the stored V2 program and mandatory
+distribution hooks.
+
 Connect currently uses memory-backed session storage and rejects V2 sessions.
 Its V1 session behavior is unchanged; this restriction does not disable
 standalone V2 channel-backed charge routes.
