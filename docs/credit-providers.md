@@ -1,6 +1,6 @@
 # Merchant credit-provider policy
 
-Configure credit providers beside accepted currencies, not inside a session:
+Configure credit providers beside accepted currencies:
 
 ```yaml
 operator:
