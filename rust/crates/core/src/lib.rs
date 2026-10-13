@@ -15,6 +15,8 @@ pub mod signer;
 pub mod skills;
 pub mod user_agent;
 
+pub mod mpp_channel_profile;
+
 // Client modules (CLI)
 pub mod client;
 

@@ -218,6 +218,9 @@ impl EndpointBackends {
             let idle_timeout_seconds = u32::try_from(spec.close_delay_ms.div_ceil(1_000))
                 .unwrap_or(pay_kit::mpp::MAX_IDLE_TIMEOUT_SECONDS)
                 .clamp(1, pay_kit::mpp::MAX_IDLE_TIMEOUT_SECONDS);
+            let (channel_program, channel_version, channel_hooks) =
+                pay_core::mpp_channel_profile::server_profile()
+                    .map_err(|error| error.to_string())?;
             for mint in &mints {
                 let token_program = solana_pubkey::Pubkey::from_str(
                     pay_kit::mpp::protocol::solana::default_token_program_for_currency(mint, None),
@@ -244,9 +247,9 @@ impl EndpointBackends {
                     grace_period_seconds:
                         pay_kit::mpp::program::payment_channels::DEFAULT_GRACE_PERIOD_SECONDS,
                     rpc_url: rpc_url.clone(),
-                    channel_program: Some(
-                        pay_kit::mpp::program::payment_channels::default_program_id(),
-                    ),
+                    channel_program: Some(channel_program),
+                    channel_version,
+                    channel_hooks: channel_hooks.clone(),
                     token_program: Some(token_program),
                 };
                 let session = SessionMpp::new(config, operator.challenge_binding_secret.clone())

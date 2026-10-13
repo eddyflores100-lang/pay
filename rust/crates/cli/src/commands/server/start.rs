@@ -1846,7 +1846,6 @@ impl StartCommand {
             let session_mpps: Vec<Arc<SessionMpp>> = if let Some(ref sess) = api.session {
                 use pay_kit::mpp::server::session::{SessionConfig, VoucherSigner};
                 use pay_types::metering::SessionVoucherSigner as ConfigVoucherSigner;
-                use std::str::FromStr;
 
                 ensure_session_currencies_usd_pegged(
                     &currency_configs,
@@ -1874,10 +1873,13 @@ impl StartCommand {
 
                 let session_secret = std::env::var("PAY_MPP_SECRET")
                     .unwrap_or_else(|_| challenge_binding_secret.clone());
-                let channel_program_id = std::env::var("PAY_PAYMENT_CHANNELS_PROGRAM_ID")
-                    .ok()
-                    .and_then(|value| solana_pubkey::Pubkey::from_str(&value).ok())
-                    .unwrap_or_else(pay_kit::mpp::program::payment_channels::default_program_id);
+                let (channel_program_id, channel_version, channel_hooks) =
+                    pay_core::mpp_channel_profile::server_profile()?;
+                if channel_version == Some(2) && sess.reuse_from_chain {
+                    return Err(pay_core::Error::Config(
+                        "V2 sessions require durable store recovery; disable session.reuse_from_chain".into(),
+                    ));
+                }
                 let session_splits = resolve_session_splits(&api, sess)?;
                 let voucher_signer = match sess.voucher_signer {
                     ConfigVoucherSigner::Client => VoucherSigner::Client,
@@ -1969,6 +1971,8 @@ impl StartCommand {
                             pay_kit::mpp::program::payment_channels::DEFAULT_GRACE_PERIOD_SECONDS,
                         rpc_url: Some(rpc_url.clone()),
                         channel_program: Some(channel_program_id),
+                        channel_version,
+                        channel_hooks: channel_hooks.clone(),
                         token_program: Some(token_program),
                     };
 

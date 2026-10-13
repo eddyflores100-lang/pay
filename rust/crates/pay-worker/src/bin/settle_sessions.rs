@@ -21,7 +21,8 @@ use pay_kit::core::store::{
 };
 use pay_kit::core::tx_pipeline::{TxPipeline, TxPipelineConfig, TxPipelineError};
 use pay_kit::mpp::server::session::{
-    SessionConfig, SessionConfigSnapshot, SessionServer, channel_binding, session_open_is_terminal,
+    SealParams, SessionConfig, SessionConfigSnapshot, SessionServer, channel_binding,
+    session_open_is_terminal,
 };
 use pay_kit::mpp::solana_keychain::TransactionSigner;
 use pay_worker::channel::{self, STATUS_CLOSING, STATUS_DISTRIBUTED, STATUS_OPEN, STATUS_SEALED};
@@ -670,6 +671,7 @@ fn validate_bound_config(
     network: &str,
     operator: &Pubkey,
 ) -> Result<(), JobError> {
+    channel::session_deployment(config)?;
     let payout = binding
         .effective_payout(&config.operator)
         .map_err(binding_error)?;
@@ -705,6 +707,37 @@ fn bound_preimage(
         })
         .collect::<Vec<_>>();
     channel::distribution_preimage_from_snapshot(&recipients, &onchain.channel.distribution_hash)
+}
+
+/// One distribution builder for all bound closes, including zero-value cleanup.
+fn bound_distribution_instruction(
+    config: &SessionConfig,
+    onchain: &channel::DecodedChannel,
+    treasury_owner: &Pubkey,
+    token_program: &Pubkey,
+) -> Result<solana_instruction::Instruction, JobError> {
+    let deployment = channel::session_deployment(config)?;
+    if onchain.channel.version != deployment.version {
+        return Err(binding_error("channel ABI differs from snapshot"));
+    }
+    bound_preimage(config, onchain)?;
+    SealParams {
+        channel_id: onchain.address,
+        authorized_signer: None,
+        payer: Some(onchain.payer()),
+        mint: Some(onchain.mint()),
+        program_id: deployment.program_id,
+        channel_version: config.channel_version,
+        channel_hooks: config.channel_hooks.clone(),
+        settled: onchain.channel.settlement.settled,
+        voucher_signature: None,
+        voucher_expires_at: None,
+        recipient: onchain.payee(),
+        splits: config.splits.clone(),
+        distribution_hash: onchain.channel.distribution_hash,
+    }
+    .distribute_instruction(&onchain.rent_payer(), treasury_owner, token_program)
+    .map_err(binding_error)
 }
 
 fn verify_bound_channel(
@@ -2561,29 +2594,33 @@ async fn reconcile_channel(
 
     let channel_id = Pubkey::from_str(&state.channel_id)
         .map_err(|_| JobError::InvalidAddress(state.channel_id.clone()))?;
-    let program = bound_config
-        .and_then(|config| config.channel_program)
-        .unwrap_or_else(payment_channels::default_program_id);
-    let onchain =
-        match channel::fetch_channel_for_program(rpc, rpc_url, &channel_id, &program).await {
-            Ok(Some(onchain)) => onchain,
-            Ok(None) => {
-                return Ok(ReconcileResult {
-                    channel_id: state_channel_id,
-                    candidate: None,
-                    store_disposition: if bound_config.is_some() {
-                        StoreDisposition::Keep
-                    } else {
-                        absent_disposition
-                    },
-                    snapshot: ChannelInventorySnapshot::default(),
-                    stablecoin_settled_base_units: None,
-                    stablecoin_distributed_base_units: None,
-                    escrow_active: Some(false),
-                });
-            }
-            Err(error) => return Err(error),
-        };
+    let program = match bound_config {
+        Some(config) => channel::session_deployment(config)?.program_id,
+        None => payment_channels::default_program_id(),
+    };
+    let fetched = match bound_config {
+        Some(config) => channel::fetch_session_channel(rpc, rpc_url, &channel_id, config).await,
+        None => channel::fetch_channel_for_program(rpc, rpc_url, &channel_id, &program).await,
+    };
+    let onchain = match fetched {
+        Ok(Some(onchain)) => onchain,
+        Ok(None) => {
+            return Ok(ReconcileResult {
+                channel_id: state_channel_id,
+                candidate: None,
+                store_disposition: if bound_config.is_some() {
+                    StoreDisposition::Keep
+                } else {
+                    absent_disposition
+                },
+                snapshot: ChannelInventorySnapshot::default(),
+                stablecoin_settled_base_units: None,
+                stablecoin_distributed_base_units: None,
+                escrow_active: Some(false),
+            });
+        }
+        Err(error) => return Err(error),
+    };
 
     if let Some(config) = bound_config {
         verify_bound_channel(config, &state, &onchain)?;
@@ -2791,12 +2828,8 @@ async fn observe_bound_close(
 ) -> Result<ChannelState, JobError> {
     let channel_id = Pubkey::from_str(&state.channel_id)
         .map_err(|_| JobError::InvalidAddress(state.channel_id.clone()))?;
-    let program = config
-        .channel_program
-        .unwrap_or_else(payment_channels::default_program_id);
     let Some(onchain) =
-        channel::fetch_channel_for_program(&runtime.rpc, &runtime.rpc_url, &channel_id, &program)
-            .await?
+        channel::fetch_session_channel(&runtime.rpc, &runtime.rpc_url, &channel_id, config).await?
     else {
         return Ok(state);
     };
@@ -2927,9 +2960,10 @@ async fn build_idle_close_candidate(
     treasury_owner: &Pubkey,
     bound_config: Option<&SessionConfig>,
 ) -> Result<Option<SettlementCandidate>, JobError> {
-    let program = bound_config
-        .and_then(|config| config.channel_program)
-        .unwrap_or_else(payment_channels::default_program_id);
+    let program = match bound_config {
+        Some(config) => channel::session_deployment(config)?.program_id,
+        None => payment_channels::default_program_id(),
+    };
     if onchain.payee() != *operator {
         return Err(JobError::Config(format!(
             "channel {} payee {} differs from lifecycle operator {operator}",
@@ -2944,19 +2978,15 @@ async fn build_idle_close_candidate(
         return Ok(None);
     };
 
-    let (token_program, preimage) = if let Some(config) = bound_config {
+    let distribution = if let Some(config) = bound_config {
         let token_program = config
             .token_program
             .ok_or_else(|| binding_error("missing token program"))?;
         channel::require_token_program(rpc, rpc_url, &onchain.mint(), &token_program).await?;
-        (token_program, bound_preimage(config, onchain)?)
+        bound_distribution_instruction(config, onchain, treasury_owner, &token_program)?
     } else {
-        (
-            channel::resolve_token_program(rpc, rpc_url, &onchain.mint()).await?,
-            channel::recover_distribution_preimage(rpc, rpc_url, onchain).await?,
-        )
-    };
-    instructions.push(
+        let token_program = channel::resolve_token_program(rpc, rpc_url, &onchain.mint()).await?;
+        let preimage = channel::recover_distribution_preimage(rpc, rpc_url, onchain).await?;
         channel::build_distribute_ix_for_program(
             onchain,
             treasury_owner,
@@ -2964,8 +2994,9 @@ async fn build_idle_close_candidate(
             &preimage,
             &program,
         )
-        .0,
-    );
+        .0
+    };
+    instructions.push(distribution);
     let before = inventory_snapshot(
         state.sealed,
         onchain.channel.status,
@@ -3582,6 +3613,86 @@ mod tests {
         onchain.channel.distribution_hash = payment_channels::distribution_hash(&recipients);
         onchain.channel.payee = payment_channels::to_address(&Pubkey::new_unique());
         assert!(verify_bound_channel(&config, &state, &onchain).is_err());
+    }
+
+    #[test]
+    fn restarted_v2_zero_value_cleanup_keeps_both_distribution_hooks() {
+        use pay_kit::core::payment_channels_v2::{ChannelHooks, HookAccount, HookDescriptor};
+        let (_, mut config, mut onchain) = closing_fixture();
+        config.channel_program = Some(
+            pay_kit::core::payment_channels_v2::PAYMENT_CHANNELS_PROGRAM_ID
+                .parse()
+                .unwrap(),
+        );
+        config.channel_version = Some(2);
+        config.network = "devnet".into();
+        let hook = HookDescriptor {
+            program_id: Pubkey::new_unique().to_string(),
+            entrypoint: *b"refund!!",
+            accounts: vec![HookAccount {
+                address: Pubkey::new_unique().to_string(),
+                writable: true,
+            }],
+            static_data: vec![9],
+        };
+        config.channel_hooks = Some(ChannelHooks {
+            pre_distribute: Some(hook.clone()),
+            post_distribute: Some(hook),
+            ..Default::default()
+        });
+        // Simulate a durable snapshot round trip instead of reconstructing from
+        // current deployment configuration at worker restart.
+        let snapshot: SessionConfigSnapshot = serde_json::from_value(
+            serde_json::to_value(SessionConfigSnapshot::capture(&config)).unwrap(),
+        )
+        .unwrap();
+        let mut restored = SessionConfig::default();
+        snapshot.apply_to(&mut restored).unwrap();
+        assert_eq!(restored.channel_hooks, config.channel_hooks);
+        onchain.channel.version = 2;
+        onchain.channel.status = STATUS_SEALED;
+        onchain.channel.settlement.settled = 0;
+        onchain.channel.settlement.payout_watermark = 0;
+        let treasury = Pubkey::new_unique();
+        let token = config.token_program.unwrap();
+        let preimage = bound_preimage(&restored, &onchain).unwrap();
+        let (base, _) = channel::build_distribute_ix_for_program(
+            &onchain,
+            &treasury,
+            &token,
+            &preimage,
+            &config.channel_program.unwrap(),
+        );
+        let ix = bound_distribution_instruction(&restored, &onchain, &treasury, &token).unwrap();
+        assert_eq!(ix.program_id, base.program_id);
+        assert_eq!(ix.data, base.data);
+        assert_eq!(&ix.accounts[..base.accounts.len()], &base.accounts);
+        assert_eq!(ix.accounts.len(), base.accounts.len() + 6);
+        assert!(
+            ix.accounts[base.accounts.len()..]
+                .iter()
+                .all(|meta| !meta.is_signer)
+        );
+        // Distinct phase capabilities even when the target program is shared.
+        assert_ne!(
+            ix.accounts[base.accounts.len() + 1],
+            ix.accounts[base.accounts.len() + 4]
+        );
+        restored.channel_version = Some(1);
+        assert!(bound_distribution_instruction(&restored, &onchain, &treasury, &token).is_err());
+    }
+
+    #[test]
+    fn bound_v1_distribution_matches_legacy_builder() {
+        let (_, config, onchain) = closing_fixture();
+        let treasury = Pubkey::new_unique();
+        let token = config.token_program.unwrap();
+        let preimage = bound_preimage(&config, &onchain).unwrap();
+        let legacy = channel::build_distribute_ix(&onchain, &treasury, &token, &preimage).0;
+        assert_eq!(
+            bound_distribution_instruction(&config, &onchain, &treasury, &token).unwrap(),
+            legacy
+        );
     }
 
     fn closing_fixture() -> (ChannelState, SessionConfig, channel::DecodedChannel) {
