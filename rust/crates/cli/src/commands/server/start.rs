@@ -254,39 +254,27 @@ fn x402_exact_backend(
         .with_tx_v1(pay_kit::core::tx::TxV1Mode::Auto))
 }
 
-async fn subscription_store() -> pay_core::Result<Arc<dyn pay_kit::mpp::store::Store>> {
-    let redis_url = ["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"]
-        .into_iter()
-        .find_map(|var| {
-            std::env::var(var)
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        });
-
-    let Some(redis_url) = redis_url else {
-        return Ok(Arc::new(pay_kit::mpp::store::MemoryStore::new()));
-    };
-
-    #[cfg(feature = "redis-session-store")]
-    {
-        let store = pay_core::server::subscription::RedisSubscriptionStore::connect(
-            &redis_url,
-            "pay:subscription:v1:",
-        )
-        .await?;
-        tracing::info!("using durable Redis store for subscription proofs");
-        Ok(Arc::new(store))
+/// Subscription activation and proof records. A hosted gateway that serves
+/// subscriptions refuses to keep them in process memory.
+async fn subscription_store(
+    network: &SolanaNetwork,
+    deployment_policy_mode: bool,
+    serves_subscriptions: bool,
+) -> pay_core::Result<Arc<dyn pay_kit::mpp::store::Store>> {
+    let (store, durable) = replay_store(
+        &["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"],
+        "pay:subscription:v1:",
+        "subscription proofs",
+    )
+    .await?;
+    if !durable && serves_subscriptions && requires_durable_store(network, deployment_policy_mode) {
+        return Err(pay_core::Error::Config(format!(
+            "{} subscriptions need a durable replay store; set PAY_MPP_REDIS_URL and build \
+             with redis-session-store",
+            network.slug()
+        )));
     }
-
-    #[cfg(not(feature = "redis-session-store"))]
-    {
-        let _ = redis_url;
-        Err(pay_core::Error::Config(
-            "an MPP Redis URL is set, but this pay binary was built without the redis-session-store feature"
-                .to_string(),
-        ))
-    }
+    Ok(store)
 }
 
 /// Resolve the channel store backing x402 `batch-settlement`.
@@ -1899,7 +1887,12 @@ impl StartCommand {
             // MPP_CHALLENGE_BINDING_SECRET for the subscription middleware —
             // see `payments::init_challenge_binding_secret`.)
             let challenge_binding_secret = payments::init_challenge_binding_secret();
-            let subscription_store = subscription_store().await?;
+            let subscription_store = subscription_store(
+                &network,
+                deployment_policy_mode,
+                api.endpoints.iter().any(|ep| ep.subscription.is_some()),
+            )
+            .await?;
 
             payments::ensure_payout_recipient_token_accounts(
                 &payout_recipients,
@@ -4272,6 +4265,41 @@ mod tests {
             store,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn hosted_subscriptions_refuse_a_process_local_store() {
+        let names = ["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"];
+        let saved = names.map(std::env::var_os);
+        for name in names {
+            unsafe { std::env::remove_var(name) };
+        }
+        let mainnet = super::subscription_store(&SolanaNetwork::Mainnet, false, true).await;
+        let custom =
+            super::subscription_store(&SolanaNetwork::Unknown("custom".into()), false, true).await;
+        let deployment = super::subscription_store(&SolanaNetwork::Devnet, true, true).await;
+        let devnet = super::subscription_store(&SolanaNetwork::Devnet, false, true).await;
+        let localnet = super::subscription_store(&SolanaNetwork::Localnet, false, true).await;
+        let no_subscriptions =
+            super::subscription_store(&SolanaNetwork::Mainnet, true, false).await;
+        for (name, value) in names.into_iter().zip(saved) {
+            if let Some(value) = value {
+                unsafe { std::env::set_var(name, value) };
+            }
+        }
+        for refused in [mainnet, custom, deployment] {
+            let Err(error) = refused else {
+                panic!("a hosted subscription store fell back to memory");
+            };
+            assert!(
+                error.to_string().contains("durable replay store"),
+                "{error}"
+            );
+        }
+        devnet.unwrap();
+        localnet.unwrap();
+        no_subscriptions.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
