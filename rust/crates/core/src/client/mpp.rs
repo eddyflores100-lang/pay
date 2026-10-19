@@ -661,13 +661,11 @@ pub(crate) fn check_client_network_intent(
 }
 
 fn format_amount(amount: &str, currency: &str) -> String {
+    if let Some(native) = crate::client::prompt::native_sol_display(amount, currency) {
+        return native;
+    }
     let base: u64 = amount.parse().unwrap_or(0);
-    let value = if currency.to_uppercase() == "SOL" {
-        base as f64 / 1_000_000_000.0
-    } else {
-        base as f64 / 1_000_000.0
-    };
-    format!("${}", format_value(value))
+    format!("${}", format_value(base as f64 / 1_000_000.0))
 }
 
 fn format_value(v: f64) -> String {
@@ -752,7 +750,7 @@ mod tests {
     #[test]
     fn format_amount_sol() {
         // 1000000000 = 1.0 SOL
-        assert_eq!(format_amount("1000000000", "SOL"), "$1.00");
+        assert_eq!(format_amount("1000000000", "SOL"), "1 SOL");
     }
 
     #[test]
@@ -768,7 +766,7 @@ mod tests {
     #[test]
     fn format_amount_sol_small() {
         // 1000000 lamports = 0.001 SOL
-        assert_eq!(format_amount("1000000", "SOL"), "$0.001");
+        assert_eq!(format_amount("1000000", "SOL"), "0.001 SOL");
     }
 
     #[test]

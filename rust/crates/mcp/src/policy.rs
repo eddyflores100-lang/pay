@@ -648,15 +648,15 @@ mod tests {
         assert!(gate.authenticate(&payment("$0.10")).is_ok());
     }
 
-    #[test]
-    fn hosted_siwx_header_is_not_signed_without_a_client_prompt() {
+    /// A throwaway file-backed `connector` account on mainnet that requires
+    /// approval, so the supplied gate runs inside signer resolution.
+    fn gated_file_store(dir: &tempfile::TempDir) -> pay_core::accounts::MemoryAccountsStore {
         const KEYPAIR: [u8; 64] = [
             41, 99, 180, 88, 51, 57, 48, 80, 61, 63, 219, 75, 176, 49, 116, 254, 227, 176, 196,
             204, 122, 47, 166, 133, 155, 252, 217, 0, 253, 17, 49, 143, 47, 94, 121, 167, 195, 136,
             72, 22, 157, 48, 77, 88, 63, 96, 57, 122, 181, 243, 236, 188, 241, 134, 174, 224, 100,
             246, 17, 170, 104, 17, 151, 48,
         ];
-        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connector.json");
         std::fs::write(&path, serde_json::to_string(&KEYPAIR.to_vec()).unwrap()).unwrap();
         let mut file = pay_core::accounts::AccountsFile::default();
@@ -677,7 +677,13 @@ mod tests {
                 subscriptions: Default::default(),
             },
         );
-        let store = pay_core::accounts::MemoryAccountsStore::with_file(file);
+        pay_core::accounts::MemoryAccountsStore::with_file(file)
+    }
+
+    #[test]
+    fn hosted_siwx_header_is_not_signed_without_a_client_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = gated_file_store(&dir);
         let challenge = pay_core::client::x402::SiwxAuthChallenge {
             extension: pay_kit::x402::siwx::SiwxExtension::new(
                 pay_kit::x402::siwx::SiwxExtensionInfo {
@@ -712,5 +718,92 @@ mod tests {
         // here the hosted gate refuses the raw proof.
         let err = result.expect_err("raw proof signed without approval");
         assert!(matches!(err, pay_core::Error::PaymentRejected(_)), "{err}");
+    }
+
+    #[test]
+    fn native_sol_x402_challenge_is_not_authorized_as_dollars() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = gated_file_store(&dir);
+        let ledger = Arc::new(MemoryLedger::new());
+        let gate = PolicyGate::new("tenant", SpendPolicy::dollars(1.0, 10.0), ledger.clone());
+        let requirements: pay_kit::x402::exact::PaymentRequirements =
+            serde_json::from_value(serde_json::json!({
+                "network": "mainnet",
+                "cluster": "mainnet",
+                "recipient": "11111111111111111111111111111111",
+                "amount": "1000000000",
+                "currency": "SOL",
+                "decimals": 9,
+                "resource": "https://attacker.example/paid",
+                "recentBlockhash": "11111111111111111111111111111111",
+            }))
+            .unwrap();
+        let challenge = pay_core::client::x402::Challenge {
+            x402_version: 2,
+            requirements,
+            siwx: None,
+            extensions: None,
+        };
+
+        let result = pay_core::client::x402::build_payment_with_override(
+            &challenge,
+            &store,
+            Some("mainnet"),
+            Some("connector"),
+            Some("https://attacker.example/paid"),
+            Some(Box::new(gate)),
+        );
+        let err = result.expect_err("1 SOL must not pass a $1 policy");
+        assert!(matches!(err, pay_core::Error::PaymentRejected(_)), "{err}");
+        assert_eq!(ledger.spent_today("tenant"), 0, "nothing recorded as USD");
+
+        // Control: the same store and policy sign an in-policy USDC payment.
+        let gate = PolicyGate::new("tenant", SpendPolicy::dollars(1.0, 10.0), ledger.clone());
+        let requirements: pay_kit::x402::exact::PaymentRequirements =
+            serde_json::from_value(serde_json::json!({
+                "network": "mainnet",
+                "cluster": "mainnet",
+                "recipient": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+                "amount": "500000",
+                "currency": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "decimals": 6,
+                "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "resource": "https://api.example/paid",
+                "recentBlockhash": "11111111111111111111111111111111",
+            }))
+            .unwrap();
+        pay_core::client::x402::build_payment_with_override(
+            &pay_core::client::x402::Challenge {
+                x402_version: 2,
+                requirements,
+                siwx: None,
+                extensions: None,
+            },
+            &store,
+            Some("mainnet"),
+            Some("connector"),
+            Some("https://api.example/paid"),
+            Some(Box::new(gate)),
+        )
+        .expect("in-policy stablecoin payment signs");
+        assert_eq!(ledger.spent_today("tenant"), 5_000);
+    }
+
+    #[test]
+    fn native_sol_intent_names_sol_and_carries_no_usd_value() {
+        let intent = AuthIntent::authorize_payment_details("1 SOL", "api", "attacker.example");
+        assert_eq!(intent.amount_minor_units(), None);
+        assert_eq!(intent.payment_limit(), None);
+        assert!(intent.message().contains("1 SOL"));
+        let gate = PolicyGate::new(
+            "sub",
+            SpendPolicy::dollars(100.0, 100.0),
+            Arc::new(MemoryLedger::new()),
+        );
+        let err = gate.authenticate(&intent).unwrap_err();
+        assert!(
+            err.to_string().contains("does not state an amount"),
+            "{err}"
+        );
     }
 }

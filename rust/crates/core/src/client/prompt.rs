@@ -19,6 +19,29 @@ pub(crate) fn payment_prompt_context(
     }
 }
 
+/// Exact decimal rendering of `base` units at `decimals` places, without
+/// trailing zeros (`1500000000`, 9 -> `1.5`).
+pub(crate) fn format_base_units(base: u64, decimals: u32) -> String {
+    let scale = 10u128.pow(decimals);
+    let base = u128::from(base);
+    let whole = base / scale;
+    let fraction = base % scale;
+    if fraction == 0 {
+        return whole.to_string();
+    }
+    let fraction = format!("{fraction:0width$}", width = decimals as usize);
+    format!("{whole}.{}", fraction.trim_end_matches('0'))
+}
+
+/// Native SOL is not a USD amount. It is named in SOL so no USD spending
+/// policy reads it as dollars; such a policy then refuses it as unpriced.
+pub(crate) fn native_sol_display(base_units: &str, currency: &str) -> Option<String> {
+    currency.eq_ignore_ascii_case("SOL").then(|| {
+        let base = base_units.parse::<u64>().unwrap_or(0);
+        format!("{} SOL", format_base_units(base, 9))
+    })
+}
+
 pub(crate) fn payment_description(
     challenge_description: Option<&str>,
     resource_urls: &[Option<&str>],
@@ -159,5 +182,29 @@ mod tests {
 
         assert_eq!(context.reason, "API access");
         assert_eq!(context.operator, "example.com");
+    }
+
+    #[test]
+    fn format_base_units_is_exact() {
+        assert_eq!(format_base_units(0, 9), "0");
+        assert_eq!(format_base_units(1_000_000_000, 9), "1");
+        assert_eq!(format_base_units(1, 9), "0.000000001");
+        assert_eq!(format_base_units(1_500_000_000, 9), "1.5");
+        assert_eq!(format_base_units(u64::MAX, 0), u64::MAX.to_string());
+        assert_eq!(format_base_units(u64::MAX, 19), "1.8446744073709551615");
+        assert_eq!(format_base_units(50_000_000, 2), "500000");
+    }
+
+    #[test]
+    fn native_sol_display_only_for_sol() {
+        assert_eq!(
+            native_sol_display("1000000000", "SOL").as_deref(),
+            Some("1 SOL")
+        );
+        assert_eq!(
+            native_sol_display("1", "sol").as_deref(),
+            Some("0.000000001 SOL")
+        );
+        assert_eq!(native_sol_display("1000000", "USDC"), None);
     }
 }
