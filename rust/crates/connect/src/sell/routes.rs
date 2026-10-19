@@ -3292,6 +3292,75 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread")]
+        async fn cancelled_per_token_stream_earns_its_committed_prefix() {
+            let fixture = Fixture::new().await;
+            let (response, rid) = fixture.start().await;
+            let (status, _, _) = fixture
+                .worker_call(
+                    Method::POST,
+                    &format!("requests/{rid}/chunks"),
+                    Some(json!({ "chunks": [
+                        {"choices": [{"delta": {"content": "partial"}}],
+                         "usage": {"prompt_tokens": 50_000, "completion_tokens": 0}}
+                    ]})),
+                )
+                .await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            let mut body = response.into_body().into_data_stream();
+            let first = body.next().await.unwrap().unwrap();
+            assert!(first.starts_with(b"data: "));
+            let committed = fixture.committed();
+            assert!(committed >= 50_000, "the prefix is paid: {committed}");
+            let paid_usd = committed as f64 / 1e6;
+
+            // The buyer disconnects before the worker finishes.
+            drop(body);
+            fixture.settled().await;
+            assert!((fixture.entry.earned_usd() - paid_usd).abs() < 1e-9);
+            assert_eq!(fixture.entry.pending_usd(), 0.0);
+
+            // The worker's late completion cannot settle it again.
+            let (status, _, _) = fixture
+                .worker_call(
+                    Method::POST,
+                    &format!("requests/{rid}/complete"),
+                    Some(json!({
+                        "event": {"usage": {"prompt_tokens": 250_000, "completion_tokens": 0}}
+                    })),
+                )
+                .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert!((fixture.entry.earned_usd() - paid_usd).abs() < 1e-9);
+            assert!(!fixture.entry.is_closed());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn repeated_paid_cancellations_close_the_endpoint_at_its_cap() {
+            let fixture = Fixture::new().await;
+            for _ in 0..5 {
+                let (response, rid) = fixture.start().await;
+                fixture
+                    .worker_call(
+                        Method::POST,
+                        &format!("requests/{rid}/chunks"),
+                        Some(json!({ "chunks": [
+                            {"usage": {"prompt_tokens": 50_000, "completion_tokens": 0}}
+                        ]})),
+                    )
+                    .await;
+                let mut body = response.into_body().into_data_stream();
+                body.next().await.unwrap().unwrap();
+                drop(body);
+                fixture.settled().await;
+            }
+            assert!((fixture.entry.earned_usd() - 0.25).abs() < 1e-9);
+            assert!(
+                fixture.entry.is_closed(),
+                "paid prefixes count toward the cap"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
         async fn read_per_token_stream_earns_what_the_session_committed() {
             let fixture = Fixture::new().await;
             let (response, rid) = fixture.start().await;
