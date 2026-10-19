@@ -570,3 +570,42 @@ async fn store_crud_is_scoped_to_the_funding_channel() {
     server.abort();
     let _ = server.await;
 }
+
+#[tokio::test]
+async fn logical_names_cannot_shadow_a_physical_store_id() {
+    let (driver, fixture, server) = fixture().await;
+    let owner = tenant("channelA");
+    create_and_write(&driver, &owner, json!("weather")).await;
+    let before = fixture.state.lock().unwrap().documents.len();
+    let error = driver
+        .create_document_store(
+            &owner,
+            CreateDocumentStoreRequest {
+                driver: DRIVER_ID.into(),
+                class: CLASS_ID.into(),
+                name: "fds-0123456789abcdef-weather".into(),
+                region: None,
+                reclaim_policy: ReclaimPolicy::Delete,
+                access: Default::default(),
+                driver_options: Value::Null,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("reserved"));
+    assert_eq!(fixture.state.lock().unwrap().documents.len(), before);
+    // The physical ID still names exactly the `weather` store.
+    let store = driver
+        .get_document_store(
+            &owner,
+            DocumentStoreRequest {
+                driver: DRIVER_ID.into(),
+                id: "fds-0123456789abcdef-weather".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.name, "weather");
+    server.abort();
+    let _ = server.await;
+}

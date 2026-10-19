@@ -781,6 +781,12 @@ fn reclaim_policy_name(policy: &ReclaimPolicy) -> &'static str {
 }
 
 fn validate_name(name: &str) -> Result<()> {
+    // The physical ID namespace stays reserved so references are unambiguous.
+    if name.starts_with(GATEWAY_PREFIX) {
+        return Err(DataError::InvalidRequest(format!(
+            "document store names may not begin with the reserved `{GATEWAY_PREFIX}` prefix"
+        )));
+    }
     if !(3..=42).contains(&name.len())
         || !name.as_bytes()[0].is_ascii_lowercase()
         || !name.as_bytes()[name.len() - 1].is_ascii_alphanumeric()
@@ -1126,10 +1132,11 @@ mod tests {
             driver.physical_id(&tenant, "weather").unwrap(),
             "fds-0123456789abcdef-weather"
         );
-        assert_eq!(
-            driver.physical_id_from_name(&tenant, "fds-weather"),
-            "fds-0123456789abcdef-fds-weather"
-        );
+        assert!(validate_name("fds-weather").is_err());
+        assert!(validate_name("fds-0123456789abcdef-weather").is_err());
+        assert!(validate_name("fdsweather").is_ok());
+        assert!(validate_name("weather-fds-").is_err());
+        assert!(validate_name("weather-fds-x").is_ok());
         assert!(
             driver
                 .physical_id(&tenant, "fds-fedcba9876543210-weather")

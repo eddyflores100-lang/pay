@@ -291,6 +291,13 @@ async fn create_binding(
                 },
             )
             .await?;
+        // A logical reference must resolve to the store that carries that name.
+        if !request.store_id.starts_with(driver.gateway_prefix()) && store.name != request.store_id
+        {
+            return Err(DataError::InvalidRequest(
+                "store reference resolved to a different document store".into(),
+            ));
+        }
         let generation = store.created_at.ok_or_else(|| {
             DataError::Provider("document store omitted its creation identity".into())
         })?;
