@@ -51,6 +51,11 @@ const JWKS_REFRESH_AFTER: Duration = Duration::from_secs(5 * 60);
 const JWKS_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// Beyond this age without a successful refetch the keys are not trusted.
 const JWKS_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+/// How long a revoked session is remembered: past the lifetime of any
+/// access token issued for it.
+const REVOKED_SESSION_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+/// Most revoked sessions remembered at once.
+const MAX_REVOKED_SESSIONS: usize = 4096;
 
 #[derive(Clone)]
 pub struct Config {
@@ -125,6 +130,7 @@ pub fn default_jwks_url(app_id: &str) -> String {
 pub struct Identity {
     /// `did:privy:…`, stable for the user in this app.
     pub user_id: String,
+    /// The Privy session (`sid`) the token belongs to; always present.
     pub session_id: Option<String>,
 }
 
@@ -244,6 +250,8 @@ pub struct Privy {
     retry_after: Duration,
     max_age: Duration,
     validation: jsonwebtoken::Validation,
+    /// Sessions signed out here, by `sid`, with when.
+    revoked: std::sync::Mutex<std::collections::HashMap<String, Instant>>,
 }
 
 impl Privy {
@@ -296,6 +304,7 @@ impl Privy {
             retry_after: JWKS_RETRY_AFTER,
             max_age: JWKS_MAX_AGE,
             validation,
+            revoked: Default::default(),
         })
     }
 
@@ -389,10 +398,43 @@ impl Privy {
         if !data.claims.sub.starts_with("did:privy:") {
             return Err("the token subject is not a Privy user".to_string());
         }
+        let session = data
+            .claims
+            .sid
+            .filter(|sid| !sid.trim().is_empty())
+            .ok_or_else(|| "the token carries no Privy session".to_string())?;
+        if self.is_revoked(&session) {
+            return Err("the Privy session was signed out".to_string());
+        }
         Ok(Identity {
             user_id: data.claims.sub,
-            session_id: data.claims.sid,
+            session_id: Some(session),
         })
+    }
+
+    /// Refuse further sign-ins with `session` for as long as its access
+    /// tokens can live.
+    pub fn revoke_session(&self, session: &str) {
+        let now = Instant::now();
+        let mut revoked = self.revoked.lock().unwrap_or_else(|p| p.into_inner());
+        revoked.retain(|_, at| now.saturating_duration_since(*at) <= REVOKED_SESSION_TTL);
+        if revoked.len() >= MAX_REVOKED_SESSIONS
+            && let Some(oldest) = revoked
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(sid, _)| sid.clone())
+        {
+            revoked.remove(&oldest);
+        }
+        revoked.insert(session.to_string(), now);
+    }
+
+    fn is_revoked(&self, session: &str) -> bool {
+        self.revoked
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(session)
+            .is_some_and(|at| at.elapsed() <= REVOKED_SESSION_TTL)
     }
 
     fn get(&self, path: &str) -> reqwest::RequestBuilder {
@@ -796,6 +838,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn tokens_need_a_live_privy_session() {
+        let app = FakeApp::new("http://unused");
+        let privy = Privy::new(app.cfg.clone()).unwrap();
+        let sessionless = app.token(json!({
+            "sub": USER, "aud": "app_test", "iss": ISSUER, "exp": unix() + 60
+        }));
+        assert!(privy.verify(&sessionless).is_err());
+        let blank = app.token(json!({
+            "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": " ", "exp": unix() + 60
+        }));
+        assert!(privy.verify(&blank).is_err());
+
+        let token = app.token_for(USER);
+        assert!(privy.verify(&token).is_ok());
+        privy.revoke_session("sess_1");
+        assert!(
+            privy.verify(&token).is_err(),
+            "a signed-out session is refused"
+        );
+        let other = app.token(json!({
+            "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": "sess_2", "exp": unix() + 60
+        }));
+        assert!(
+            privy.verify(&other).is_ok(),
+            "other sessions are unaffected"
+        );
+    }
+
+    #[test]
     fn jwks_keys_verify_by_kid_and_by_trial() {
         let app = FakeApp::new("http://unused");
         let mut cfg = app.cfg.clone();
@@ -812,7 +883,7 @@ pub(crate) mod tests {
             let key = jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()).unwrap();
             jsonwebtoken::encode(
                 &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256),
-                &json!({ "sub": USER, "aud": "app_test", "iss": ISSUER, "exp": unix() + 60 }),
+                &json!({ "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": "sess_1", "exp": unix() + 60 }),
                 &key,
             )
             .unwrap()
@@ -868,7 +939,7 @@ pub(crate) mod tests {
         let encoding = jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()).unwrap();
         let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
         header.kid = Some(kid.to_string());
-        let claims = json!({ "sub": user, "aud": "app_test", "iss": ISSUER, "exp": unix() + 600 });
+        let claims = json!({ "sub": user, "aud": "app_test", "iss": ISSUER, "sid": "sess_1", "exp": unix() + 600 });
         jsonwebtoken::encode(&header, &claims, &encoding).unwrap()
     }
 
