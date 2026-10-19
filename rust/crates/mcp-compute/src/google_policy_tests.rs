@@ -170,7 +170,9 @@ async fn serve_fixture(state: Arc<Mutex<FixtureState>>, request: Request) -> Res
         return Json(wallets).into_response();
     }
     if let Some(resource) = path.strip_prefix("/v2/") {
-        if resource == "projects/project/locations/-/functions" {
+        if resource == "projects/project/locations/-/functions"
+            || resource == "projects/project/locations/us-central1/functions"
+        {
             let functions = state
                 .listed_functions
                 .clone()
@@ -1041,4 +1043,135 @@ async fn disabled_policy_storage_is_legacy_compatible_but_explicit_sweeps_fail_c
         driver.reconcile_orphans(true).await,
         Err(ComputeError::Configuration(_))
     ));
+}
+
+#[tokio::test]
+async fn deployment_operations_require_the_funding_channel_lease() {
+    let fixture = Fixture::new(true).await;
+    let mut sibling = fixture.tenant();
+    sibling.channel_id = "sibling".into();
+    let operation = "projects/project/locations/us-central1/operations/deploy";
+    fixture.state.lock().unwrap().functions.insert(
+        operation.into(),
+        json!({
+            "name": operation,
+            "done": false,
+            "metadata": {"target": fixture.identity.resource_name}
+        }),
+    );
+    let invoke = || -> InvokeRequest {
+        serde_json::from_value(json!({
+            "id": fixture.identity.resource_name,
+            "method": "GET",
+            "path": "/summary"
+        }))
+        .unwrap()
+    };
+    let list = || ListRequest {
+        provider: DRIVER_ID.into(),
+        region: None,
+        page_size: 50,
+        page_token: None,
+    };
+
+    assert!(
+        fixture
+            .driver
+            .get(&sibling, fixture.request())
+            .await
+            .is_err()
+    );
+    assert!(fixture.driver.invoke(&sibling, invoke()).await.is_err());
+    assert!(fixture.driver.operation(&sibling, operation).await.is_err());
+    assert!(
+        fixture
+            .driver
+            .list(&sibling, list())
+            .await
+            .unwrap()
+            .deployments
+            .is_empty()
+    );
+    assert!(
+        fixture
+            .driver
+            .delete(&sibling, fixture.request())
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .service
+            .get(&sibling, &fixture.identity.hostname)
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .service
+            .set(&sibling, fixture.set_request(1))
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .service
+            .delete(
+                &sibling,
+                DeletePaymentPolicyRequest {
+                    hostname: fixture.identity.hostname.clone(),
+                    expected_version: 1,
+                },
+            )
+            .await
+            .is_err()
+    );
+    // Nothing above reached a mutation or retired the policy.
+    assert!(!fixture.stored().unwrap().retired);
+    assert!(
+        fixture
+            .state
+            .lock()
+            .unwrap()
+            .functions
+            .contains_key(&fixture.identity.resource_name)
+    );
+
+    let owner = fixture.tenant();
+    assert_eq!(
+        fixture
+            .driver
+            .get(&owner, fixture.request())
+            .await
+            .unwrap()
+            .id,
+        fixture.identity.resource_name
+    );
+    assert_eq!(
+        fixture
+            .driver
+            .list(&owner, list())
+            .await
+            .unwrap()
+            .deployments
+            .len(),
+        1
+    );
+    assert!(fixture.driver.operation(&owner, operation).await.is_ok());
+    assert_eq!(
+        fixture
+            .service
+            .get(&owner, &fixture.identity.hostname)
+            .await
+            .unwrap()
+            .version,
+        1
+    );
+    fixture
+        .driver
+        .delete(&owner, fixture.request())
+        .await
+        .unwrap();
+    // A deletion operation stays pollable after its target is gone.
+    assert!(fixture.driver.operation(&owner, operation).await.is_ok());
 }

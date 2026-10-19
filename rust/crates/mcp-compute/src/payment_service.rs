@@ -144,8 +144,10 @@ impl PaymentService {
     }
 
     pub async fn get(&self, tenant: &Tenant, hostname: &str) -> Result<PaymentPolicy> {
-        let deployment = self.google.payment_deployment(hostname, None).await?;
-        require_owner(tenant, &deployment)?;
+        let deployment = self
+            .google
+            .owned_payment_deployment(tenant, hostname)
+            .await?;
         let stored = self.load(&deployment).await?.ok_or_else(|| {
             ComputeError::InvalidRequest("deployment has no payment policy".into())
         })?;
@@ -161,9 +163,8 @@ impl PaymentService {
     ) -> Result<PaymentPolicy> {
         let deployment = self
             .google
-            .payment_deployment(&request.hostname, None)
+            .owned_payment_deployment(tenant, &request.hostname)
             .await?;
-        require_owner(tenant, &deployment)?;
         request.policy.validate(now()?)?;
         let stored = self.load(&deployment).await?;
         if stored.as_ref().is_some_and(|stored| stored.retired) {
@@ -209,9 +210,8 @@ impl PaymentService {
     ) -> Result<Option<PaymentPolicy>> {
         let deployment = self
             .google
-            .payment_deployment(&request.hostname, None)
+            .owned_payment_deployment(tenant, &request.hostname)
             .await?;
-        require_owner(tenant, &deployment)?;
         let Some(stored) = self.load(&deployment).await? else {
             return Ok(None);
         };
@@ -294,15 +294,6 @@ async fn resolve(
     }
 }
 
-fn require_owner(tenant: &Tenant, deployment: &DeploymentIdentity) -> Result<()> {
-    if tenant.key != deployment.owner_key {
-        return Err(ComputeError::InvalidRequest(
-            "deployment belongs to a different payer".into(),
-        ));
-    }
-    Ok(())
-}
-
 fn configuration(message: &str) -> ComputeError {
     ComputeError::Configuration(message.into())
 }
@@ -344,7 +335,7 @@ mod tests {
                 if path.starts_with("/v2/") {
                     return Json(json!({
                         "name": resource, "state": "ACTIVE", "createTime": "2026-01-01T00:00:00Z",
-                        "labels": {"pay-tenant": owner, "managed-by": "mcp-compute", "pay-exposure": "gateway"},
+                        "labels": {"pay-tenant": owner, "managed-by": "mcp-compute", "pay-exposure": "gateway", "pay-channel": crate::google::channel_lease_key("channel").unwrap()},
                         "serviceConfig": {"environmentVariables": {"PAY_INTERNAL_PUBLIC_PATHS": "[\"/summary\"]"}}
                     })).into_response();
                 }

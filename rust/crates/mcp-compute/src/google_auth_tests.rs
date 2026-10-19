@@ -115,7 +115,8 @@ impl Fixture {
                                     "state": "ACTIVE",
                                     "labels": {
                                         "managed-by": "mcp-compute",
-                                        "pay-tenant": TENANT
+                                        "pay-tenant": TENANT,
+                                        "pay-channel": crate::google::channel_lease_key("channel").unwrap()
                                     },
                                     "serviceConfig": {
                                         "uri": origin,
