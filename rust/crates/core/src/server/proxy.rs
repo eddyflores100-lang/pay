@@ -107,16 +107,24 @@ const RFC3986_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
 /// so browser payment-link and redirect flows can still inherit the endpoint's
 /// transport behavior even when the browser uses `GET` against a non-GET
 /// metered endpoint.
+///
+/// Endpoint selection mirrors the payment gate: literal paths win over
+/// `{param}` / `{*rest}` patterns, so a concrete request the gate matched
+/// against a pattern also inherits that endpoint's routing override.
 pub fn resolve_routing<'a>(api: &'a ApiSpec, path: &str) -> &'a RoutingConfig {
     let trimmed = path.trim_start_matches('/');
-    for ep in &api.endpoints {
-        if ep.path == trimmed
-            && let Some(ref r) = ep.routing
-        {
-            return r;
-        }
-    }
-    &api.routing
+    let literal = api.endpoints.iter().any(|ep| ep.path == trimmed);
+    api.endpoints
+        .iter()
+        .filter(|ep| {
+            if literal {
+                ep.path == trimmed
+            } else {
+                metering::path_matches(&ep.path, trimmed)
+            }
+        })
+        .find_map(|ep| ep.routing.as_ref())
+        .unwrap_or(&api.routing)
 }
 
 /// Does the endpoint's upstream auth digest the **request body** (an HMAC /
@@ -3073,6 +3081,127 @@ mod tests {
         });
 
         assert!(resolve_routing(&api, "/v1/shared").is_respond());
+    }
+
+    fn endpoint_with_routing(
+        path: &str,
+        routing: Option<RoutingConfig>,
+    ) -> pay_types::metering::Endpoint {
+        pay_types::metering::Endpoint {
+            method: pay_types::metering::HttpMethod::Post,
+            path: path.to_string(),
+            description: None,
+            resource: None,
+            routing,
+            metering: None,
+            subscription: None,
+        }
+    }
+
+    #[test]
+    fn resolve_routing_applies_parameterized_endpoint_override() {
+        let mut api = make_api("test");
+        api.endpoints.push(endpoint_with_routing(
+            "v1/projects/{projectId}/query",
+            Some(RoutingConfig::Respond {}),
+        ));
+        api.endpoints.push(endpoint_with_routing(
+            "v1/jobs/{*rest}",
+            Some(RoutingConfig::Respond {}),
+        ));
+        api.endpoints.push(endpoint_with_routing(
+            "v1beta/models/{modelId}:generate",
+            Some(RoutingConfig::Respond {}),
+        ));
+
+        assert!(resolve_routing(&api, "/v1/projects/acme/query").is_respond());
+        assert!(resolve_routing(&api, "/v1/jobs/42/logs").is_respond());
+        assert!(resolve_routing(&api, "/v1beta/models/flash:generate").is_respond());
+        // Near misses keep the API-level routing.
+        assert!(resolve_routing(&api, "/v1/projects/acme/other").is_proxy());
+        assert!(resolve_routing(&api, "/v1/jobs").is_proxy());
+        assert!(resolve_routing(&api, "/v1beta/models/flash:stream").is_proxy());
+    }
+
+    #[test]
+    fn resolve_routing_prefers_literal_endpoint_over_pattern() {
+        let mut api = make_api("test");
+        api.endpoints.push(endpoint_with_routing(
+            "v1/projects/{projectId}/query",
+            Some(RoutingConfig::Respond {}),
+        ));
+        api.endpoints
+            .push(endpoint_with_routing("v1/projects/public/query", None));
+
+        // The gate selects the literal endpoint, which has no override.
+        assert!(resolve_routing(&api, "/v1/projects/public/query").is_proxy());
+        assert!(resolve_routing(&api, "/v1/projects/acme/query").is_respond());
+    }
+
+    #[tokio::test]
+    async fn forward_request_uses_parameterized_override_upstream_and_credential() {
+        async fn upstream(label: &'static str) -> String {
+            let app = axum::Router::new().fallback(move |req: axum::extract::Request| async move {
+                let key = req
+                    .headers()
+                    .get("x-api-key")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                axum::Json(serde_json::json!({"origin": label, "api_key": key}))
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            url
+        }
+        fn route(url: String, env: &str) -> RoutingConfig {
+            RoutingConfig::Proxy {
+                url,
+                path_rewrites: vec![],
+                auth: Some(Box::new(AuthConfig::Header {
+                    key: "x-api-key".to_string(),
+                    prefix: None,
+                    value_from_env: env.to_string(),
+                })),
+            }
+        }
+        unsafe {
+            std::env::set_var("_TEST_ROUTE_TOP_KEY", "top-level-secret");
+            std::env::set_var("_TEST_ROUTE_EP_KEY", "endpoint-secret");
+        }
+        let mut api = make_api("test");
+        api.routing = route(upstream("top-level").await, "_TEST_ROUTE_TOP_KEY");
+        api.endpoints.push(endpoint_with_routing(
+            "v1/projects/{projectId}/query",
+            Some(route(upstream("endpoint").await, "_TEST_ROUTE_EP_KEY")),
+        ));
+
+        let observe = |path: &'static str| {
+            let api = api.clone();
+            async move {
+                let response = forward_request(
+                    &api,
+                    Method::POST,
+                    &Uri::from_static(path),
+                    &HeaderMap::new(),
+                    Bytes::from_static(b"{}"),
+                )
+                .await
+                .unwrap();
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+            }
+        };
+
+        let paid = observe("/v1/projects/acme/query?sql=select%201").await;
+        assert_eq!(paid["origin"], "endpoint");
+        assert_eq!(paid["api_key"], "endpoint-secret");
+        let other = observe("/v1/other").await;
+        assert_eq!(other["origin"], "top-level");
+        assert_eq!(other["api_key"], "top-level-secret");
     }
 
     // ── forward_request with Respond routing ─────────────────────────────

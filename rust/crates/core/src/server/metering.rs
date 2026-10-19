@@ -104,7 +104,7 @@ pub fn find_endpoint_by_path<'a>(api: &'a ApiSpec, path: &str) -> Option<&'a End
 
 /// Match a path pattern like "v1beta/models/{modelsId}:generateContent"
 /// against a concrete path like "v1beta/models/gemini-2.0-flash:generateContent".
-fn path_matches(pattern: &str, path: &str) -> bool {
+pub(crate) fn path_matches(pattern: &str, path: &str) -> bool {
     let pattern_parts: Vec<&str> = pattern.split('/').collect();
     let path_parts: Vec<&str> = path.split('/').collect();
 
