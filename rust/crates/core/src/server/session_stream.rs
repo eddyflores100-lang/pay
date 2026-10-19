@@ -251,7 +251,7 @@ impl DelegatedSessionStreamMeter {
     }
 
     fn finish(&mut self, is_sse: bool) -> MeteringResult<Option<SessionGateDecision>> {
-        if !is_sse && self.accumulator.finish_ndjson()? {
+        if self.accumulator.finish_stream(is_sse)? {
             self.current = self.accumulator.observation();
         }
         if !self.accumulator.has_observation() || self.authorization_exhausted {
@@ -408,7 +408,7 @@ impl SessionStreamMeter {
     }
 
     pub fn finish(&mut self, is_sse: bool) -> MeteringResult<Option<SessionGateDecision>> {
-        if !is_sse && self.accumulator.finish_ndjson()? {
+        if self.accumulator.finish_stream(is_sse)? {
             self.current = self.accumulator.observation();
         }
         if !self.accumulator.has_observation() {
@@ -571,7 +571,7 @@ impl StreamUsageAccumulator {
         }
 
         if is_sse {
-            changed |= self.observe_sse_chunk(chunk);
+            changed |= self.observe_sse_chunk(chunk)?;
         } else {
             changed |= self.observe_ndjson_chunk(chunk)?;
             if observes_unit(&self.spec, BillingUnit::Characters) {
@@ -586,11 +586,12 @@ impl StreamUsageAccumulator {
         Ok(changed)
     }
 
-    fn observe_sse_chunk(&mut self, chunk: &[u8]) -> bool {
-        let Ok(events) = self.sse.push_chunk(chunk) else {
-            return false;
-        };
+    fn observe_sse_chunk(&mut self, chunk: &[u8]) -> MeteringResult<bool> {
+        let events = self.sse.push_chunk(chunk)?;
+        Ok(self.observe_sse_events(events))
+    }
 
+    fn observe_sse_events(&mut self, events: impl IntoIterator<Item = SseUsageEvent>) -> bool {
         let mut changed = false;
         for event in events {
             let Some(data) = event.data else {
@@ -607,6 +608,18 @@ impl StreamUsageAccumulator {
         }
 
         changed
+    }
+
+    /// Flush decoder state at end of stream. Returns whether usage changed.
+    fn finish_stream(&mut self, is_sse: bool) -> MeteringResult<bool> {
+        let changed = if is_sse {
+            let event = self.sse.finish()?;
+            self.observe_sse_events(event)
+        } else {
+            self.finish_ndjson()?
+        };
+        self.observed |= changed;
+        Ok(changed)
     }
 
     fn observe_ndjson_chunk(&mut self, chunk: &[u8]) -> MeteringResult<bool> {
@@ -701,6 +714,8 @@ impl StreamUsageAccumulator {
 
 #[derive(Debug, Clone, Default)]
 struct SseUsageDecoder {
+    /// Undecoded bytes: an incomplete UTF-8 sequence or a trailing `\r`.
+    pending: Vec<u8>,
     buffer: String,
 }
 
@@ -776,10 +791,24 @@ fn count_stream_utf8_chars(tail: &mut Vec<u8>, chunk: &[u8]) -> MeteringResult<u
 }
 
 impl SseUsageDecoder {
-    fn push_chunk(&mut self, chunk: &[u8]) -> Result<Vec<SseUsageEvent>, std::str::Utf8Error> {
-        let text = std::str::from_utf8(chunk)?;
-        self.buffer
-            .push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+    fn push_chunk(&mut self, chunk: &[u8]) -> MeteringResult<Vec<SseUsageEvent>> {
+        self.pending.extend_from_slice(chunk);
+        let mut valid = match std::str::from_utf8(&self.pending) {
+            Ok(_) => self.pending.len(),
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            Err(error) => {
+                return Err(
+                    crate::server::session_metering::SessionMeteringError::InvalidStream(
+                        error.to_string(),
+                    ),
+                );
+            }
+        };
+        // A `\r` may be the first half of a `\r\n` split across chunks.
+        if valid > 0 && self.pending[valid - 1] == b'\r' {
+            valid -= 1;
+        }
+        self.decode(valid);
 
         let mut events = vec![];
         while let Some(index) = self.buffer.find("\n\n") {
@@ -788,6 +817,29 @@ impl SseUsageDecoder {
             events.push(parse_sse_event(&block));
         }
         Ok(events)
+    }
+
+    /// Parse a final event that was not terminated by a blank line. Released
+    /// bytes are always metered, so a stream ending mid-character is invalid.
+    fn finish(&mut self) -> MeteringResult<Option<SseUsageEvent>> {
+        if std::str::from_utf8(&self.pending).is_err() {
+            return Err(
+                crate::server::session_metering::SessionMeteringError::InvalidStream(
+                    "SSE stream ended inside a UTF-8 character".to_string(),
+                ),
+            );
+        }
+        self.decode(self.pending.len());
+        let block = std::mem::take(&mut self.buffer);
+        let block = block.trim_matches('\n');
+        Ok((!block.is_empty()).then(|| parse_sse_event(block)))
+    }
+
+    fn decode(&mut self, len: usize) {
+        let text = std::str::from_utf8(&self.pending[..len]).expect("validated UTF-8 prefix");
+        self.buffer
+            .push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+        self.pending.drain(..len);
     }
 }
 
@@ -1657,5 +1709,232 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             metered.next().await.is_none(),
             "a clamped usage-only reprice must complete cleanly"
         );
+    }
+
+    /// A delegated (operator-signed) stream meter over a funded test channel.
+    async fn delegated_test_meter(
+        dimensions: Vec<MeterDimension>,
+        label: &str,
+    ) -> (Arc<SessionMpp>, String, DelegatedSessionStreamMeter) {
+        use ed25519_dalek::SigningKey;
+
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let mut operator_keypair = [0_u8; 64];
+        operator_keypair[..32].copy_from_slice(signing_key.as_bytes());
+        operator_keypair[32..].copy_from_slice(signing_key.verifying_key().as_bytes());
+        let operator: Arc<dyn TransactionSigner> =
+            Arc::new(MemorySigner::from_bytes(&operator_keypair).unwrap());
+        let store: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::new());
+        let session = Arc::new(
+            SessionMpp::new_with_channel_store(
+                SessionConfig {
+                    operator: operator.pubkey().to_string(),
+                    recipient: solana_pubkey::Pubkey::new_unique().to_string(),
+                    suggested_deposit: Some(1_000_000),
+                    currency: solana_pubkey::Pubkey::new_unique().to_string(),
+                    network: "localnet".to_string(),
+                    min_voucher_delta: 1,
+                    voucher_signer: VoucherSigner::Operator,
+                    ..SessionConfig::default()
+                },
+                label,
+                Arc::clone(&store),
+            )
+            .with_blockhash_cache(stream_test_blockhash_cache())
+            .with_payment_channel_signer(Arc::clone(&operator)),
+        );
+        let challenge = session.challenge(None).unwrap();
+        let channel_id = solana_pubkey::Pubkey::new_unique().to_string();
+        store
+            .put_channel(
+                &channel_id,
+                test_channel_state(
+                    &channel_id,
+                    1_000_000,
+                    operator.pubkey().to_string(),
+                    "operator",
+                    &challenge.id,
+                    solana_pubkey::Pubkey::new_unique().to_string(),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+        let reservation = session
+            .reserve_delegated_capacity(&channel_id, 100_000)
+            .await
+            .unwrap()
+            .expect("session capacity should be available");
+        let forward = SessionForward::delegated(
+            session.clone(),
+            channel_id.clone(),
+            0,
+            crate::server::metering::UptoSettlementPlan {
+                metering: metering(dimensions),
+                variant_hint: None,
+                request_properties: RequestProperties::default(),
+                ceiling_usd: 0.1,
+                inferred_usage: None,
+            },
+            (100_000, 1_000_000),
+            solana_pubkey::Pubkey::new_unique().to_string(),
+            reservation,
+        );
+        let meter = DelegatedSessionStreamMeter::from_forward(forward).unwrap();
+        (session, channel_id, meter)
+    }
+
+    fn token_dimension(direction: MeterDirection, path: &str) -> MeterDimension {
+        MeterDimension {
+            direction,
+            unit: BillingUnit::Tokens,
+            scale: 1,
+            period: None,
+            tiers: vec![PriceTier {
+                up_to: None,
+                price_usd: 0.000001,
+                condition: None,
+                notes: None,
+                splits: vec![],
+            }],
+            meter: Some(pay_types::metering::UsageMeter {
+                source: pay_types::metering::UsageMeterSource::ResponseJson,
+                path: Some(path.to_string()),
+                header: None,
+            }),
+        }
+    }
+
+    async fn drain_delegated(
+        chunks: Vec<Vec<u8>>,
+        meter: DelegatedSessionStreamMeter,
+    ) -> Result<Vec<u8>, BoxError> {
+        let upstream = futures_util::stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<_, std::io::Error>(Bytes::from(chunk))),
+        );
+        let metered = meter_delegated_response_stream(upstream, meter, true);
+        futures_util::pin_mut!(metered);
+        let mut served = Vec::new();
+        while let Some(chunk) = metered.next().await {
+            served.extend_from_slice(&chunk?);
+        }
+        Ok(served)
+    }
+
+    #[tokio::test]
+    async fn delegated_sse_meters_events_with_utf8_split_across_chunks() {
+        let event = b"data: {\"choices\":[{\"delta\":{\"content\":\"\xC3\xA9\"}}],\"usage\":{\"completion_tokens\":5}}\n\n";
+        let split = event.iter().position(|byte| *byte == 0xC3).unwrap() + 1;
+        let (session, channel_id, meter) = delegated_test_meter(
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )],
+            "sse-utf8-split",
+        )
+        .await;
+
+        let served = drain_delegated(
+            vec![event[..split].to_vec(), event[split..].to_vec()],
+            meter,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(served, event);
+        assert_eq!(session.committed_watermark(&channel_id), Some(5));
+    }
+
+    #[tokio::test]
+    async fn delegated_sse_meters_unsplit_utf8_event() {
+        let event = "data: {\"choices\":[{\"delta\":{\"content\":\"é\"}}],\"usage\":{\"completion_tokens\":5}}\n\n";
+        let (session, channel_id, meter) = delegated_test_meter(
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )],
+            "sse-utf8-whole",
+        )
+        .await;
+
+        drain_delegated(vec![event.as_bytes().to_vec()], meter)
+            .await
+            .unwrap();
+
+        assert_eq!(session.committed_watermark(&channel_id), Some(5));
+    }
+
+    #[test]
+    fn sse_decoder_handles_every_utf8_and_crlf_split_point() {
+        let stream = "data: {\"t\":\"a€😀\"}\r\n\r\ndata: {\"t\":\"z\"}\r\n\r\n".as_bytes();
+        for split in 0..=stream.len() {
+            let mut decoder = SseUsageDecoder::default();
+            let mut events = decoder.push_chunk(&stream[..split]).unwrap();
+            events.extend(decoder.push_chunk(&stream[split..]).unwrap());
+            assert!(decoder.finish().unwrap().is_none(), "split {split}");
+            let data: Vec<_> = events.into_iter().filter_map(|event| event.data).collect();
+            assert_eq!(
+                data,
+                vec!["{\"t\":\"a€😀\"}", "{\"t\":\"z\"}"],
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn sse_decoder_rejects_malformed_utf8() {
+        let mut decoder = SseUsageDecoder::default();
+        assert!(decoder.push_chunk(b"data: \xFF\n\n").is_err());
+    }
+
+    #[test]
+    fn sse_decoder_rejects_stream_ending_inside_a_character() {
+        let mut decoder = SseUsageDecoder::default();
+        assert!(
+            decoder
+                .push_chunk(b"data: {\"t\":\"\xE2\x82")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(decoder.finish().is_err());
+    }
+
+    #[test]
+    fn sse_decoder_flushes_final_event_without_blank_line() {
+        let mut decoder = SseUsageDecoder::default();
+        assert!(
+            decoder
+                .push_chunk(b"data: {\"usage\":{\"completion_tokens\":7}}\n")
+                .unwrap()
+                .is_empty()
+        );
+        let event = decoder.finish().unwrap().expect("final event");
+        assert_eq!(
+            event.data.as_deref(),
+            Some("{\"usage\":{\"completion_tokens\":7}}")
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_sse_meters_final_event_without_blank_line() {
+        let (session, channel_id, meter) = delegated_test_meter(
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )],
+            "sse-final-event",
+        )
+        .await;
+
+        drain_delegated(
+            vec![b"data: {\"choices\":[],\"usage\":{\"completion_tokens\":7}}".to_vec()],
+            meter,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(session.committed_watermark(&channel_id), Some(7));
     }
 }
