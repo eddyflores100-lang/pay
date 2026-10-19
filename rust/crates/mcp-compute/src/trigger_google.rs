@@ -526,23 +526,30 @@ impl TriggerDriver for GoogleTriggerDriver {
             self.config.scheduler_api_base
         );
         let (status, value) = self.request(Method::PATCH, url, Some(&body)).await?;
-        let value = if status == StatusCode::NOT_FOUND {
-            self.require(
-                Method::POST,
-                format!(
-                    "{}/v1/projects/{}/locations/{region}/jobs",
-                    self.config.scheduler_api_base, self.config.project
-                ),
-                Some(&body),
-            )
-            .await?
+        let (value, created) = if status == StatusCode::NOT_FOUND {
+            let value = self
+                .require(
+                    Method::POST,
+                    format!(
+                        "{}/v1/projects/{}/locations/{region}/jobs",
+                        self.config.scheduler_api_base, self.config.project
+                    ),
+                    Some(&body),
+                )
+                .await?;
+            (value, true)
         } else if status.is_success() {
-            value
+            (value, false)
         } else {
             return Err(TriggerError::Provider(format!(
                 "Google API returned {status}: {value}"
             )));
         };
+        // Only a new Scheduler job is a funding event; updates keep the
+        // remaining budget and expiry of the existing incarnation.
+        if !created {
+            return trigger_from_value(&value, region);
+        }
         if let Err(error) = self.fund_budget(&resource, &channel).await {
             let _ = self
                 .request(
@@ -1036,6 +1043,10 @@ fn provider_error(status: StatusCode, bytes: &[u8]) -> TriggerError {
 #[cfg(test)]
 #[path = "google_auth_tests.rs"]
 mod auth_tests;
+
+#[cfg(test)]
+#[path = "trigger_google_tests.rs"]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
