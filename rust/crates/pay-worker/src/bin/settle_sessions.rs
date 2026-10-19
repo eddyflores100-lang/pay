@@ -5482,6 +5482,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_seal_landed_by_another_crank_leaves_only_the_payout() {
+        use pay_kit::generated::payment_channels::generated::instructions::{
+            DISTRIBUTE_DISCRIMINATOR, SEAL_DISCRIMINATOR,
+        };
+        let (mut state, mut onchain, operator) = batch_closing_fixture();
+        state.cumulative = 100;
+        state.freeze_watermark_at(100);
+        let past = onchain.close_deadline();
+        let kinds = |instructions: &[solana_instruction::Instruction]| {
+            instructions
+                .iter()
+                .filter(|ix| {
+                    ix.program_id
+                        == payment_channels::to_address(&payment_channels::default_program_id())
+                })
+                .map(|ix| ix.data[0])
+                .collect::<Vec<_>>()
+        };
+
+        // The pass that reads Closing past grace pairs seal with distribute.
+        let first = reconcile_closing_batch(state.clone(), &onchain, &operator, past)
+            .await
+            .unwrap()
+            .candidate
+            .unwrap();
+        assert_eq!(
+            kinds(&first.instructions),
+            vec![SEAL_DISCRIMINATOR, DISTRIBUTE_DISCRIMINATOR]
+        );
+
+        // A permissionless seal lands first, so that transaction fails. The
+        // next pass reads Sealed and submits distribute alone, finishing the
+        // record only once it confirms.
+        onchain.channel.status = STATUS_SEALED;
+        let retry = reconcile_closing_batch(state.clone(), &onchain, &operator, past)
+            .await
+            .unwrap()
+            .candidate
+            .unwrap();
+        assert_eq!(kinds(&retry.instructions), vec![DISTRIBUTE_DISCRIMINATOR]);
+        assert!(matches!(
+            retry.store_action,
+            BatchStoreAction::MarkFinalized
+        ));
+        // Session closes plan the same way: nothing precedes the distribute.
+        assert!(
+            close_settlement_instructions(
+                &state,
+                &onchain,
+                past,
+                &operator,
+                &payment_channels::default_program_id()
+            )
+            .unwrap()
+            .unwrap()
+            .is_empty()
+        );
+
+        // Distributed but not yet reclaimable: nothing to send.
+        onchain.channel.status = STATUS_DISTRIBUTED;
+        let done = reconcile_closing_batch(state, &onchain, &operator, past)
+            .await
+            .unwrap();
+        assert!(done.candidate.is_none());
+        assert!(!done.delete_absent);
+    }
+
+    #[tokio::test]
     async fn post_grace_batch_seal_refuses_to_drop_accepted_vouchers() {
         let (state, onchain, operator) = batch_closing_fixture();
         let store = pay_kit::core::store::MemoryChannelStore::new();
