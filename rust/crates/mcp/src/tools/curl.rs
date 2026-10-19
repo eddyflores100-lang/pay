@@ -59,11 +59,37 @@ impl SessionCache {
 /// by the configured HTTP method and path. Including the method avoids the
 /// server's session-credential path fallback sharing a channel with another
 /// operation that happens to use the same path.
-fn session_cache_key(method: &str, resource_url: &str) -> Result<String, pay_core::Error> {
+fn session_cache_key(
+    payer: &str,
+    method: &str,
+    resource_url: &str,
+) -> Result<String, pay_core::Error> {
     let origin = pay_core::session::canonical_session_origin(resource_url)?;
     let url = reqwest::Url::parse(resource_url)
         .map_err(|error| pay_core::Error::Mpp(format!("invalid MPP session URL: {error}")))?;
-    Ok(format!("{method} {origin}{}", url.path()))
+    Ok(format!("{payer} {method} {origin}{}", url.path()))
+}
+
+/// The wallet a call pays from, partitioning reusable session credentials so
+/// one payer's authorization is never attached to another payer's request.
+fn session_payer(
+    store: &dyn pay_core::accounts::AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+) -> String {
+    let network = network_override.unwrap_or(pay_core::accounts::MAINNET_NETWORK);
+    let Ok(accounts) = store.load() else {
+        return String::new();
+    };
+    let account = match account_override {
+        Some(name) => accounts.named_account_for_network(network, name),
+        None => accounts
+            .account_for_network(network)
+            .map(|(_, account)| account),
+    };
+    account
+        .and_then(|account| account.pubkey.clone())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1132,7 +1158,12 @@ fn do_paid_fetch(
         }
         _ => extra_headers.to_vec(),
     };
-    let session_key = session_cache_key(method, url).ok();
+    let payer = session_payer(
+        store,
+        network_override.as_deref(),
+        account_override.as_deref(),
+    );
+    let session_key = session_cache_key(&payer, method, url).ok();
     let cached_session = session_key.as_deref().and_then(|key| {
         (!initial_headers
             .iter()
@@ -2114,13 +2145,59 @@ mod tests {
     }
 
     #[test]
+    fn session_cache_key_isolated_by_payer() {
+        let alpha = session_cache_key("alpha", "POST", "https://api.example.com/v1").unwrap();
+        let beta = session_cache_key("beta", "POST", "https://api.example.com/v1").unwrap();
+        assert_ne!(alpha, beta);
+
+        let cache = SessionCache::default();
+        cache.store(alpha.clone(), "Payment alpha".to_string());
+        assert_eq!(cache.authorization(&beta), None);
+        assert_eq!(
+            cache.authorization(&alpha).as_deref(),
+            Some("Payment alpha")
+        );
+    }
+
+    #[test]
+    fn session_payer_is_the_selected_account_pubkey() {
+        let mut file = pay_core::accounts::AccountsFile::default();
+        for (name, pubkey) in [("a", "PubkeyA"), ("b", "PubkeyB")] {
+            file.upsert(
+                "mainnet",
+                name,
+                pay_core::accounts::Account {
+                    backend: pay_core::accounts::BackendKind::Ephemeral,
+                    provider: None,
+                    active: name == "a",
+                    auth_required: Some(false),
+                    pubkey: Some(pubkey.to_string()),
+                    vault: None,
+                    account: None,
+                    path: None,
+                    secret_key_b58: None,
+                    created_at: None,
+                    subscriptions: Default::default(),
+                },
+            );
+        }
+        let store = pay_core::accounts::MemoryAccountsStore::with_file(file);
+        assert_eq!(session_payer(&store, Some("mainnet"), Some("b")), "PubkeyB");
+        assert_eq!(session_payer(&store, None, None), "PubkeyA");
+        assert_eq!(session_payer(&store, Some("devnet"), None), "");
+    }
+
+    #[test]
     fn session_cache_key_isolated_by_method_and_endpoint() {
-        let first = session_cache_key("POST", "https://api.example.com/v1/models?model=a").unwrap();
+        let first = session_cache_key("payer", "POST", "https://api.example.com/v1/models?model=a")
+            .unwrap();
         let same_endpoint =
-            session_cache_key("POST", "https://api.example.com/v1/models?model=b").unwrap();
+            session_cache_key("payer", "POST", "https://api.example.com/v1/models?model=b")
+                .unwrap();
         let other_endpoint =
-            session_cache_key("POST", "https://api.example.com/v1/images").unwrap();
-        let other_method = session_cache_key("GET", "https://api.example.com/v1/models").unwrap();
+            session_cache_key("payer", "POST", "https://api.example.com/v1/images").unwrap();
+        let other_method =
+            session_cache_key("payer", "GET", "https://api.example.com/v1/models").unwrap();
 
         assert_eq!(first, same_endpoint);
         assert_ne!(first, other_endpoint);
