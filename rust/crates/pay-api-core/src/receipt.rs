@@ -20,7 +20,9 @@ use crate::channel_state::{ChannelState, ChannelStatus, fetch_channel};
 use crate::error::{Error, Result};
 use crate::rpc::RpcClient;
 use crate::stablecoin::Stablecoin;
-use crate::subscription_state::{fetch_recurring_delegation, period_label};
+use crate::subscription_state::{
+    SubscriptionDelegationState, fetch_subscription_delegation, period_label,
+};
 use crate::token_metadata::{TokenMetadata, resolve_mints};
 
 /// Canonical SPL memo program v2.
@@ -96,17 +98,18 @@ pub async fn build_receipt(
     }
 
     if matches!(receipt.intent.kind, ReceiptIntentKind::MppSubscription) {
-        // Try to find the RecurringDelegation PDA in the instruction's
-        // accounts list and decode period_hours / amount / start / expiry.
-        let candidates = session_account_candidates(rpc_value);
-        if !candidates.is_empty()
-            && let Ok(Some(state)) = fetch_recurring_delegation(rpc, rpc_url, &candidates).await
+        // Decode the SubscriptionDelegation the instruction names by role.
+        if let Some((subscription, plan)) =
+            subscription_delegation_accounts(rpc_value, receipt.intent.program_id.as_deref())
+            && let Ok(Some(state)) =
+                fetch_subscription_delegation(rpc, rpc_url, &subscription, &plan).await
         {
-            let mint = state.mint.to_string();
-            if !metadata.contains_key(&mint) {
+            if let Some(mint) = state.mint.map(|mint| mint.to_string())
+                && !metadata.contains_key(&mint)
+            {
                 metadata.extend(resolve_mints(rpc, rpc_url, network, stablecoins, &[mint]).await);
             }
-            attach_recurring_delegation_state(&mut receipt, &state);
+            attach_subscription_delegation_state(&mut receipt, &state);
         }
         if let Some(ref mut subscription) = receipt.subscription {
             attach_subscription_metadata(subscription, &metadata);
@@ -312,22 +315,22 @@ fn attach_channel_state(receipt: &mut Receipt, channel: &ChannelState) {
 }
 
 /// Fill in subscription fields that can only be read from the on-chain
-/// RecurringDelegation account: subscriber, per-period amount, period length
-/// and expiry. Mirrors the channel-state pattern so the skeleton stays
-/// usable without the RPC round-trip.
-fn attach_recurring_delegation_state(
+/// SubscriptionDelegation account. Mirrors the channel-state pattern so the
+/// skeleton stays usable without the RPC round-trip.
+fn attach_subscription_delegation_state(
     receipt: &mut Receipt,
-    state: &crate::subscription_state::RecurringDelegationState,
+    state: &SubscriptionDelegationState,
 ) {
     let Some(subscription) = receipt.subscription.as_mut() else {
         return;
     };
     subscription.subscription_id = Some(state.address.clone());
+    subscription.plan = Some(state.plan.to_string());
     if subscription.subscriber.is_none() {
         subscription.subscriber = Some(state.subscriber.to_string());
     }
 
-    let period_hours = state.period_length_s / 3600;
+    let period_hours = state.period_hours;
     if period_hours > 0 {
         subscription.period_hours = Some(period_hours);
         subscription.period_label = Some(period_label(period_hours));
@@ -337,15 +340,18 @@ fn attach_recurring_delegation_state(
         subscription.period_end_ts = Some(
             state
                 .current_period_start_ts
-                .saturating_add(state.period_length_s as i64),
+                .saturating_add(period_hours.saturating_mul(3600).min(i64::MAX as u64) as i64),
         );
     }
-    if state.expiry_ts > 0 {
-        subscription.expires_at_ts = Some(state.expiry_ts);
+    if state.expires_at_ts > 0 {
+        subscription.expires_at_ts = Some(state.expires_at_ts);
     }
-    if subscription.period_amount.is_none() && state.amount_per_period > 0 {
+    if subscription.period_amount.is_none()
+        && state.amount_per_period > 0
+        && let Some(mint) = state.mint
+    {
         subscription.period_amount = Some(ReceiptAmount {
-            asset: state.mint.to_string(),
+            asset: mint.to_string(),
             symbol: None,
             name: None,
             logo_uri: None,
@@ -354,6 +360,52 @@ fn attach_recurring_delegation_state(
             ui_amount: state.amount_per_period as f64,
         });
     }
+}
+
+/// Account positions of `(subscriptionPda, planPda)` per subscriptions-program
+/// lifecycle instruction.
+fn subscription_account_roles(discriminator: u8) -> Option<(usize, usize)> {
+    match discriminator {
+        10 => Some((0, 1)), // transferSubscription
+        11 => Some((3, 2)), // subscribe
+        12 => Some((2, 1)), // cancelSubscription
+        _ => None,
+    }
+}
+
+/// The `(subscription, plan)` accounts of the first top-level subscription
+/// lifecycle instruction for `program_id`.
+fn subscription_delegation_accounts(
+    rpc_value: &Value,
+    program_id: Option<&str>,
+) -> Option<(String, String)> {
+    let program_id = program_id?;
+    if program_id != SUBSCRIPTIONS_PROGRAM {
+        return None;
+    }
+    let top = rpc_value
+        .pointer("/transaction/message/instructions")
+        .and_then(Value::as_array)?;
+    for ix in top {
+        if ix.get("programId").and_then(Value::as_str) != Some(program_id) {
+            continue;
+        }
+        let Some((subscription_index, plan_index)) = ix
+            .get("data")
+            .and_then(Value::as_str)
+            .and_then(first_data_byte)
+            .and_then(subscription_account_roles)
+        else {
+            continue;
+        };
+        let accounts = ix.get("accounts").and_then(Value::as_array)?;
+        let account = |index: usize| accounts.get(index).and_then(Value::as_str);
+        return Some((
+            account(subscription_index)?.to_string(),
+            account(plan_index)?.to_string(),
+        ));
+    }
+    None
 }
 
 fn attach_subscription_metadata(
@@ -1922,7 +1974,7 @@ mod tests {
     }
 
     #[test]
-    fn recurring_state_amount_uses_mint_decimals() {
+    fn delegation_state_amount_uses_mint_decimals() {
         let mint = Pubkey::new_unique();
         let mut subscription = ReceiptSubscription {
             action: "cancel".to_string(),
@@ -1939,15 +1991,15 @@ mod tests {
             expires_at_ts: None,
             events: Vec::new(),
         };
-        let state = crate::subscription_state::RecurringDelegationState {
+        let state = SubscriptionDelegationState {
             address: Pubkey::new_unique().to_string(),
             subscriber: Pubkey::new_unique(),
-            puller: Pubkey::new_unique(),
-            mint,
-            current_period_start_ts: 0,
-            period_length_s: 0,
-            expiry_ts: 0,
+            plan: Pubkey::new_unique(),
+            mint: Some(mint),
             amount_per_period: 5_000_000,
+            period_hours: 0,
+            current_period_start_ts: 0,
+            expires_at_ts: 0,
         };
         let mut receipt = parse(json!({
             "slot": 1,
@@ -1955,7 +2007,7 @@ mod tests {
             "transaction": {"message": {"accountKeys": ["payer"], "instructions": []}}
         }));
         receipt.subscription = Some(subscription.clone());
-        attach_recurring_delegation_state(&mut receipt, &state);
+        attach_subscription_delegation_state(&mut receipt, &state);
         subscription = receipt.subscription.take().unwrap();
 
         let metadata = HashMap::from([(
@@ -1971,6 +2023,177 @@ mod tests {
         let amount = subscription.period_amount.unwrap();
         assert_eq!(amount.decimals, 6);
         assert_eq!(amount.ui_amount, 5.0);
+    }
+
+    mod subscription_enrichment {
+        use super::*;
+        use crate::subscription_state::tests::{
+            plan_bytes, subscription_delegation_bytes, subscription_pda, subscriptions_program,
+        };
+        use crate::test_rpc::StubRpc;
+
+        pub(crate) struct Fixture {
+            pub(crate) subscriber: Pubkey,
+            pub(crate) plan: Pubkey,
+            pub(crate) subscription: Pubkey,
+            pub(crate) mint: Pubkey,
+        }
+
+        impl Fixture {
+            pub(crate) fn new(program: &Pubkey) -> Self {
+                let subscriber = Pubkey::new_unique();
+                let plan = Pubkey::new_unique();
+                Self {
+                    subscription: subscription_pda(program, &plan, &subscriber),
+                    subscriber,
+                    plan,
+                    mint: Pubkey::new_unique(),
+                }
+            }
+
+            pub(crate) fn install(&self, rpc: &StubRpc, owner: &str) {
+                rpc.set_account(
+                    &self.subscription.to_string(),
+                    owner,
+                    subscription_delegation_bytes(
+                        &self.subscriber,
+                        &self.plan,
+                        10_000_000,
+                        720,
+                        1_700_000_000,
+                        1_800_000_000,
+                    ),
+                );
+                rpc.set_account(
+                    &self.plan.to_string(),
+                    owner,
+                    plan_bytes(&Pubkey::new_unique(), &self.mint),
+                );
+            }
+        }
+
+        /// A subscriptions-program instruction with `accounts` in order.
+        pub(crate) fn tx(program: &str, disc: u8, accounts: &[String]) -> Value {
+            json!({
+                "slot": 10,
+                "blockTime": 1_700_000_100_i64,
+                "meta": { "err": null, "fee": 5000_u64, "innerInstructions": [] },
+                "transaction": { "message": {
+                    "accountKeys": [{"pubkey": "Op111111111111111111111111111111111111111"}],
+                    "instructions": [{
+                        "programId": program,
+                        "accounts": accounts,
+                        "data": bs58::encode([disc]).into_string()
+                    }]
+                }}
+            })
+        }
+
+        pub(crate) async fn build(rpc: &StubRpc, value: &Value) -> Receipt {
+            build_receipt(
+                &RpcClient::new(std::time::Duration::from_secs(5)).unwrap(),
+                &rpc.url,
+                "sig",
+                Network::Sandbox,
+                value,
+                &[],
+            )
+            .await
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn cancel_enriches_from_the_delegation_at_its_role_not_the_plan() {
+            let rpc = StubRpc::start().await;
+            let f = Fixture::new(&subscriptions_program());
+            f.install(&rpc, SUBSCRIPTIONS_PROGRAM);
+            // cancelSubscription: [subscriber, planPda, subscriptionPda, ...].
+            let value = tx(
+                SUBSCRIPTIONS_PROGRAM,
+                12,
+                &[
+                    f.subscriber.to_string(),
+                    f.plan.to_string(),
+                    f.subscription.to_string(),
+                ],
+            );
+            let subscription = build(&rpc, &value).await.subscription.unwrap();
+            assert_eq!(
+                subscription.subscription_id,
+                Some(f.subscription.to_string())
+            );
+            assert_eq!(subscription.plan, Some(f.plan.to_string()));
+            assert_eq!(subscription.subscriber, Some(f.subscriber.to_string()));
+            assert_eq!(subscription.period_hours, Some(720));
+            assert_eq!(subscription.period_start_ts, Some(1_700_000_000));
+            assert_eq!(subscription.period_end_ts, Some(1_700_000_000 + 720 * 3600));
+            assert_eq!(subscription.expires_at_ts, Some(1_800_000_000));
+            let amount = subscription.period_amount.unwrap();
+            assert_eq!(amount.asset, f.mint.to_string());
+            assert_eq!(amount.raw_amount, "10000000");
+            assert_eq!(
+                rpc.requests(),
+                vec![vec![f.subscription.to_string(), f.plan.to_string()]]
+            );
+        }
+
+        #[tokio::test]
+        async fn plan_account_is_never_published_as_the_subscription() {
+            let rpc = StubRpc::start().await;
+            let f = Fixture::new(&subscriptions_program());
+            f.install(&rpc, SUBSCRIPTIONS_PROGRAM);
+            // The plan PDA sits where the subscription PDA belongs.
+            let value = tx(
+                SUBSCRIPTIONS_PROGRAM,
+                12,
+                &[
+                    f.subscriber.to_string(),
+                    f.plan.to_string(),
+                    f.plan.to_string(),
+                ],
+            );
+            let subscription = build(&rpc, &value).await.subscription.unwrap();
+            assert_eq!(subscription.subscription_id, None);
+            assert_eq!(subscription.period_hours, None);
+            assert_eq!(subscription.expires_at_ts, None);
+            assert!(subscription.period_amount.is_none());
+        }
+
+        #[tokio::test]
+        async fn delegation_for_another_plan_is_not_attached() {
+            let rpc = StubRpc::start().await;
+            let f = Fixture::new(&subscriptions_program());
+            f.install(&rpc, SUBSCRIPTIONS_PROGRAM);
+            let other_plan = Pubkey::new_unique();
+            rpc.set_account(
+                &other_plan.to_string(),
+                SUBSCRIPTIONS_PROGRAM,
+                plan_bytes(&Pubkey::new_unique(), &f.mint),
+            );
+            let value = tx(
+                SUBSCRIPTIONS_PROGRAM,
+                12,
+                &[
+                    f.subscriber.to_string(),
+                    other_plan.to_string(),
+                    f.subscription.to_string(),
+                ],
+            );
+            let subscription = build(&rpc, &value).await.subscription.unwrap();
+            assert_eq!(subscription.subscription_id, None);
+        }
+
+        #[tokio::test]
+        async fn admin_instructions_skip_delegation_lookup() {
+            let rpc = StubRpc::start().await;
+            let f = Fixture::new(&subscriptions_program());
+            f.install(&rpc, SUBSCRIPTIONS_PROGRAM);
+            // createPlan names the plan but no delegation.
+            let value = tx(SUBSCRIPTIONS_PROGRAM, 7, &[f.plan.to_string()]);
+            let subscription = build(&rpc, &value).await.subscription.unwrap();
+            assert_eq!(subscription.subscription_id, None);
+            assert!(rpc.requests().is_empty());
+        }
     }
 
     #[test]

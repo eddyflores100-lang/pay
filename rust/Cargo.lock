@@ -5070,6 +5070,7 @@ dependencies = [
 name = "pay-api-core"
 version = "0.30.0"
 dependencies = [
+ "axum",
  "base64 0.22.1",
  "bincode",
  "blake3",
