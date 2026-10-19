@@ -16,7 +16,7 @@ use pay_api_types::{
 };
 use serde_json::Value;
 
-use crate::channel_state::{ChannelState, ChannelStatus, fetch_channel};
+use crate::channel_state::{ChannelState, fetch_channel};
 use crate::error::{Error, Result};
 use crate::rpc::RpcClient;
 use crate::stablecoin::Stablecoin;
@@ -359,14 +359,9 @@ fn attach_channel_state(receipt: &mut Receipt, channel: &ChannelState) {
         return;
     };
     session.channel = Some(channel.address.clone());
-    session.channel_status = Some(match channel.status {
-        ChannelStatus::Open => WireChannelStatus::Open,
-        ChannelStatus::Closing => WireChannelStatus::Closing,
-        ChannelStatus::Sealed => WireChannelStatus::Sealed,
-        ChannelStatus::Unknown => WireChannelStatus::Unknown,
-    });
-    // The on-chain Channel struct is authoritative for payer / payee when the
-    // account is still open.
+    // The live account may be newer than this transaction, so only its
+    // immutable parties are attached; `channel_status` stays the one implied
+    // by the transaction's own action.
     session.payer = Some(channel.payer.to_string());
     session.payee = Some(channel.payee.to_string());
 }
@@ -374,10 +369,15 @@ fn attach_channel_state(receipt: &mut Receipt, channel: &ChannelState) {
 /// Fill in subscription fields that can only be read from the on-chain
 /// SubscriptionDelegation account. Mirrors the channel-state pattern so the
 /// skeleton stays usable without the RPC round-trip.
+///
+/// The account is read live, so its period and expiry are only attached
+/// while the transaction still falls inside the live current period; once
+/// the subscription has moved on they describe a later state.
 fn attach_subscription_delegation_state(
     receipt: &mut Receipt,
     state: &SubscriptionDelegationState,
 ) {
+    let block_time = receipt.block_time;
     let Some(subscription) = receipt.subscription.as_mut() else {
         return;
     };
@@ -392,16 +392,17 @@ fn attach_subscription_delegation_state(
         subscription.period_hours = Some(period_hours);
         subscription.period_label = Some(period_label(period_hours));
     }
-    if state.current_period_start_ts > 0 {
-        subscription.period_start_ts = Some(state.current_period_start_ts);
-        subscription.period_end_ts = Some(
-            state
-                .current_period_start_ts
-                .saturating_add(period_hours.saturating_mul(3600).min(i64::MAX as u64) as i64),
-        );
-    }
-    if state.expires_at_ts > 0 {
-        subscription.expires_at_ts = Some(state.expires_at_ts);
+    let period_start = state.current_period_start_ts;
+    let period_end =
+        period_start.saturating_add(period_hours.saturating_mul(3600).min(i64::MAX as u64) as i64);
+    let in_live_period = period_start > 0
+        && block_time.is_some_and(|time| period_start <= time && time < period_end);
+    if in_live_period {
+        subscription.period_start_ts = Some(period_start);
+        subscription.period_end_ts = Some(period_end);
+        if state.expires_at_ts > 0 && subscription.status == SubscriptionStatus::Cancelled {
+            subscription.expires_at_ts = Some(state.expires_at_ts);
+        }
     }
     if subscription.period_amount.is_none()
         && state.amount_per_period > 0
@@ -2201,6 +2202,49 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn advanced_subscription_state_is_not_bound_to_an_older_renewal() {
+            let rpc = StubRpc::start().await;
+            let f = Fixture::new(&subscriptions_program());
+            f.install(&rpc, SUBSCRIPTIONS_PROGRAM);
+            // transferSubscription: [subscriptionPda, planPda, ...].
+            let mut value = tx(
+                SUBSCRIPTIONS_PROGRAM,
+                10,
+                &[f.subscription.to_string(), f.plan.to_string()],
+            );
+            for (block_time, attached) in [
+                (1_700_000_000 - 30 * 24 * 3600, false),
+                (1_700_000_000 - 1, false),
+                (1_700_000_000, true),
+                (1_700_000_000 + 720 * 3600 - 1, true),
+                (1_700_000_000 + 720 * 3600, false),
+            ] {
+                value["blockTime"] = json!(block_time);
+                let subscription = build(&rpc, &value).await.subscription.unwrap();
+                assert_eq!(
+                    subscription.subscription_id,
+                    Some(f.subscription.to_string())
+                );
+                assert_eq!(subscription.period_hours, Some(720));
+                assert_eq!(
+                    subscription.period_start_ts.is_some(),
+                    attached,
+                    "{block_time}"
+                );
+                assert_eq!(
+                    subscription.period_end_ts.is_some(),
+                    attached,
+                    "{block_time}"
+                );
+                // Expiry only describes a cancellation.
+                assert_eq!(subscription.expires_at_ts, None);
+            }
+            value.as_object_mut().unwrap().remove("blockTime");
+            let subscription = build(&rpc, &value).await.subscription.unwrap();
+            assert_eq!(subscription.period_start_ts, None);
+        }
+
+        #[tokio::test]
         async fn plan_account_is_never_published_as_the_subscription() {
             let rpc = StubRpc::start().await;
             let f = Fixture::new(&subscriptions_program());
@@ -2713,6 +2757,49 @@ mod tests {
                 assert!(receipt.total.is_none(), "{kind}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn live_channel_status_does_not_overwrite_the_transaction_action() {
+        let rpc = crate::test_rpc::StubRpc::start().await;
+        let payer = Pubkey::new_unique();
+        let payee = Pubkey::new_unique();
+        let mut data = vec![0u8; 256];
+        data[3] = 1; // Sealed since.
+        data[88..120].copy_from_slice(payer.as_ref());
+        data[120..152].copy_from_slice(payee.as_ref());
+        rpc.set_account("ChannelPDA", PAYMENT_CHANNELS_PROGRAM, data);
+        let value = json!({
+            "slot": 100,
+            "blockTime": 1_700_000_000_i64,
+            "meta": {"err": null, "fee": 5000_u64, "innerInstructions": [{
+                "index": 0,
+                "instructions": [token_transfer("PayerWallet", "ChannelATA", "M", "5", 6)]
+            }]},
+            "transaction": {"message": {
+                "accountKeys": [{"pubkey": "OperatorWallet", "signer": true}],
+                "instructions": [{
+                    "programId": PAYMENT_CHANNELS_PROGRAM,
+                    "accounts": ["OperatorWallet", "ChannelPDA"],
+                    "data": bs58::encode([1u8]).into_string()
+                }]
+            }}
+        });
+        let receipt = build_receipt(
+            &RpcClient::new(std::time::Duration::from_secs(5)).unwrap(),
+            &rpc.url,
+            "sig",
+            Network::Sandbox,
+            &value,
+            &[],
+        )
+        .await
+        .unwrap();
+        let session = receipt.session.unwrap();
+        assert_eq!(session.channel.as_deref(), Some("ChannelPDA"));
+        assert_eq!(session.channel_status, Some(WireChannelStatus::Open));
+        assert_eq!(session.payer, Some(payer.to_string()));
+        assert_eq!(session.payee, Some(payee.to_string()));
     }
 
     // ── Plain transfer / SOL / Token-2022 ─────────────────────────────────
