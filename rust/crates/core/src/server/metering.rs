@@ -434,9 +434,11 @@ pub fn upto_actual_amount_from_response(
     };
 
     let units_per_usd = max_amount as f64 / plan.ceiling_usd;
+    // Positive served usage never rounds down to a free settlement.
+    let base_units = ((usd * units_per_usd).round() as u64).max(u64::from(usd > 0.0));
     Ok(UptoActualAmount {
         usd,
-        base_units: ((usd * units_per_usd).round() as u64).min(max_amount),
+        base_units: base_units.min(max_amount),
     })
 }
 
@@ -520,7 +522,7 @@ fn extract_and_price_usage(
             .find_map(|json| extract(Some(json)).ok())
             .map(Ok)
             .unwrap_or_else(|| extract(None))?;
-        total += quantity as f64 / dim.scale.max(1) as f64 * price;
+        total += quantity / dim.scale.max(1) as f64 * price;
     }
     Ok(total)
 }
@@ -651,6 +653,20 @@ fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
     value.saturating_add(divisor.saturating_sub(1)) / divisor.max(1)
 }
 
+/// Units billed in whole counts; a fractional quantity for these is invalid
+/// rather than rounded (a `0.49` request must not price as zero).
+fn is_count_unit(unit: BillingUnit) -> bool {
+    !matches!(
+        unit,
+        BillingUnit::Minutes
+            | BillingUnit::Hours
+            | BillingUnit::Seconds
+            | BillingUnit::Gibibytes
+            | BillingUnit::Tebibytes
+            | BillingUnit::Vcpu
+    )
+}
+
 fn extract_dimension_quantity(
     dim: &MeterDimension,
     preset: Option<&str>,
@@ -658,12 +674,30 @@ fn extract_dimension_quantity(
     headers: &HeaderMap,
     json: Option<&serde_json::Value>,
     inferred_usage: Option<&crate::InferenceUsage>,
-) -> Result<u64, UptoUsageError> {
+) -> Result<f64, UptoUsageError> {
+    let quantity = extract_raw_quantity(dim, preset, props, headers, json, inferred_usage)?;
+    if is_count_unit(dim.unit) && quantity.fract() != 0.0 {
+        return Err(UptoUsageError::InvalidUsage(format!(
+            "fractional usage {quantity} for {:?} {:?}",
+            dim.direction, dim.unit
+        )));
+    }
+    Ok(quantity)
+}
+
+fn extract_raw_quantity(
+    dim: &MeterDimension,
+    preset: Option<&str>,
+    props: &RequestProperties,
+    headers: &HeaderMap,
+    json: Option<&serde_json::Value>,
+    inferred_usage: Option<&crate::InferenceUsage>,
+) -> Result<f64, UptoUsageError> {
     // Observer token counts take precedence for token dimensions.
     if let Some(usage) = inferred_usage
         && let Some(quantity) = inferred_quantity_for_dim(usage, dim, props)
     {
-        return Ok(quantity);
+        return Ok(quantity as f64);
     }
     // A response-header meter is already explicit and does not require
     // buffering a JSON body. Endpoint presets only disambiguate inherited
@@ -702,15 +736,20 @@ fn extract_dimension_quantity(
                 dim.direction
             ))
         })?;
-        return Ok(ceil_div_u64(tokens, per_unit));
+        return Ok(ceil_div_u64(tokens, per_unit) as f64);
     }
 
     if dim.unit == BillingUnit::Tokens {
         let json =
             json.ok_or_else(|| UptoUsageError::MissingUsage("response body unavailable".into()))?;
-        return provider_token_quantity(json, dim.direction).ok_or_else(|| {
-            UptoUsageError::MissingUsage(format!("no token usage for {:?} tokens", dim.direction))
-        });
+        return provider_token_quantity(json, dim.direction)
+            .map(|tokens| tokens as f64)
+            .ok_or_else(|| {
+                UptoUsageError::MissingUsage(format!(
+                    "no token usage for {:?} tokens",
+                    dim.direction
+                ))
+            });
     }
 
     if let Some(path) = preset_json_path(preset, dim) {
@@ -720,7 +759,7 @@ fn extract_dimension_quantity(
     }
 
     if matches!(dim.direction, MeterDirection::Usage) && matches!(dim.unit, BillingUnit::Requests) {
-        return Ok(1);
+        return Ok(1.0);
     }
 
     Err(UptoUsageError::MissingUsage(format!(
@@ -744,7 +783,7 @@ fn extract_from_meter(
     meter: &UsageMeter,
     headers: &HeaderMap,
     json: Option<&serde_json::Value>,
-) -> Result<u64, UptoUsageError> {
+) -> Result<f64, UptoUsageError> {
     match meter.source {
         UsageMeterSource::ResponseJson => {
             let json = json
@@ -800,17 +839,17 @@ fn preset_json_path(preset: Option<&str>, dim: &MeterDimension) -> Option<&'stat
     None
 }
 
-fn extract_from_json_pointer(json: &serde_json::Value, path: &str) -> Result<u64, UptoUsageError> {
+fn extract_from_json_pointer(json: &serde_json::Value, path: &str) -> Result<f64, UptoUsageError> {
     let value = json
         .pointer(path)
         .ok_or_else(|| UptoUsageError::MissingUsage(format!("json path `{path}`")))?;
     match value {
         serde_json::Value::Number(n) => {
             if let Some(v) = n.as_u64() {
-                Ok(v)
+                Ok(v as f64)
             } else if let Some(v) = n.as_f64() {
                 if v.is_finite() && v >= 0.0 {
-                    Ok(v.round() as u64)
+                    Ok(v)
                 } else {
                     Err(UptoUsageError::InvalidUsage(format!(
                         "json path `{path}` is negative or non-finite"
@@ -829,16 +868,16 @@ fn extract_from_json_pointer(json: &serde_json::Value, path: &str) -> Result<u64
     }
 }
 
-fn parse_usage_quantity(value: &str) -> Result<u64, UptoUsageError> {
+fn parse_usage_quantity(value: &str) -> Result<f64, UptoUsageError> {
     let trimmed = value.trim();
     if let Ok(v) = trimmed.parse::<u64>() {
-        return Ok(v);
+        return Ok(v as f64);
     }
     let v = trimmed
         .parse::<f64>()
         .map_err(|e| UptoUsageError::InvalidUsage(e.to_string()))?;
     if v.is_finite() && v >= 0.0 {
-        Ok(v.round() as u64)
+        Ok(v)
     } else {
         Err(UptoUsageError::InvalidUsage(
             "usage value is negative or non-finite".to_string(),
@@ -3223,5 +3262,122 @@ mod tests {
         }
         let flat = yaml_metering(&format!("variants:\n{}", request_variant("small", 0.01)));
         assert!(resolve_fixed_price(&flat, &RequestProperties::default(), None).is_ok());
+    }
+
+    fn fractional_plan(
+        unit: BillingUnit,
+        meter: UsageMeter,
+        policy: MissingUsagePolicy,
+    ) -> UptoSettlementPlan {
+        settlement_plan(
+            upto_metering(
+                vec![usage_dim(MeterDirection::Usage, unit, 1, 1.0, Some(meter))],
+                Some(pay_types::metering::UptoMetering {
+                    max_usd: Some(1.0),
+                    missing_usage: policy,
+                    ..Default::default()
+                }),
+            ),
+            1.0,
+        )
+    }
+
+    #[test]
+    fn fractional_count_usage_is_invalid_not_rounded_to_zero() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-usage-units", HeaderValue::from_static("0.49"));
+        for (meter, headers, body) in [
+            (
+                response_json("/usage/units"),
+                HeaderMap::new(),
+                Some(br#"{"usage":{"units":0.49}}"#.as_slice()),
+            ),
+            (
+                response_json("/usage/units"),
+                HeaderMap::new(),
+                Some(br#"{"usage":{"units":"0.49"}}"#.as_slice()),
+            ),
+            (response_header("x-usage-units"), headers, None),
+        ] {
+            let error = upto_actual_amount_from_response(
+                &fractional_plan(
+                    BillingUnit::Requests,
+                    meter.clone(),
+                    MissingUsagePolicy::Error,
+                ),
+                1_000_000,
+                &headers,
+                body,
+            );
+            assert_eq!(error, Err(UptoUsageError::MissingUsagePolicyError));
+            // Other policies apply instead of a silent zero.
+            let ceiling = upto_actual_amount_from_response(
+                &fractional_plan(BillingUnit::Requests, meter, MissingUsagePolicy::Ceiling),
+                1_000_000,
+                &headers,
+                body,
+            )
+            .unwrap();
+            assert_eq!(ceiling.base_units, 1_000_000);
+        }
+    }
+
+    #[test]
+    fn fractional_continuous_usage_is_priced_exactly() {
+        let actual = upto_actual_amount_from_response(
+            &fractional_plan(
+                BillingUnit::Seconds,
+                response_json("/usage/seconds"),
+                MissingUsagePolicy::Error,
+            ),
+            1_000_000,
+            &HeaderMap::new(),
+            Some(br#"{"usage":{"seconds":0.49}}"#),
+        )
+        .unwrap();
+        assert!((actual.usd - 0.49).abs() < 1e-12);
+        assert_eq!(actual.base_units, 490_000);
+
+        // Whole counts still settle normally.
+        let whole = upto_actual_amount_from_response(
+            &fractional_plan(
+                BillingUnit::Requests,
+                response_json("/usage/units"),
+                MissingUsagePolicy::Error,
+            ),
+            1_000_000,
+            &HeaderMap::new(),
+            Some(br#"{"usage":{"units":2.0}}"#),
+        )
+        .unwrap();
+        assert_eq!(whole.usd, 1.0);
+    }
+
+    #[test]
+    fn positive_usage_settles_at_least_one_base_unit() {
+        let actual = upto_actual_amount_from_response(
+            &fractional_plan(
+                BillingUnit::Seconds,
+                response_json("/usage/seconds"),
+                MissingUsagePolicy::Error,
+            ),
+            1_000_000,
+            &HeaderMap::new(),
+            Some(br#"{"usage":{"seconds":0.0000001}}"#),
+        )
+        .unwrap();
+        assert_eq!(actual.base_units, 1);
+        let zero = upto_actual_amount_from_response(
+            &fractional_plan(
+                BillingUnit::Seconds,
+                response_json("/usage/seconds"),
+                MissingUsagePolicy::Error,
+            ),
+            1_000_000,
+            &HeaderMap::new(),
+            Some(br#"{"usage":{"seconds":0}}"#),
+        )
+        .unwrap();
+        assert_eq!(zero.base_units, 0);
     }
 }
