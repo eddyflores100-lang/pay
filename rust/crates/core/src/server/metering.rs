@@ -522,11 +522,12 @@ fn extract_and_price_usage(
             extract_dimension_quantity(dim, preset, &priced_props, headers, json, inferred_usage)
         };
         // Stream usage is cumulative, not additive. Providers may report input
-        // and output in different events; use the last observation of each.
+        // and output in different events; a later lower record never lowers
+        // the served quantity, so use the highest observation of each.
         let quantity = json
             .iter()
-            .rev()
-            .find_map(|json| extract(Some(json)).ok())
+            .filter_map(|json| extract(Some(json)).ok())
+            .max_by(f64::total_cmp)
             .map(Ok)
             .unwrap_or_else(|| extract(None))?;
         total += quantity / dim.scale.max(1) as f64 * price;
@@ -2516,6 +2517,60 @@ mod tests {
         assert_eq!(usd_to_base_units(1.0, 1_000_000.0, 20_000), 20_000);
         assert_eq!(usd_to_base_units(f64::NAN, 1_000_000.0, 20_000), 0);
         assert_eq!(usd_to_base_units(-1.0, 1_000_000.0, 20_000), 0);
+    }
+
+    fn sse_output_amount(body: &[u8]) -> u64 {
+        let metering = upto_metering(
+            vec![usage_dim(
+                MeterDirection::Output,
+                BillingUnit::Tokens,
+                1_000_000,
+                1.0,
+                Some(response_json("/usage/completion_tokens")),
+            )],
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(1.0),
+                missing_usage: MissingUsagePolicy::Error,
+                ..Default::default()
+            }),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            "text/event-stream".parse().unwrap(),
+        );
+        upto_actual_amount_from_response(
+            &settlement_plan(metering, 1.0),
+            1_000_000,
+            &headers,
+            Some(body),
+        )
+        .unwrap()
+        .base_units
+    }
+
+    #[test]
+    fn decreasing_cumulative_sse_usage_never_lowers_settlement() {
+        assert_eq!(
+            sse_output_amount(
+                b"data: {\"usage\":{\"completion_tokens\":1000}}\n\ndata: {\"usage\":{\"completion_tokens\":1}}\n\n"
+            ),
+            1_000
+        );
+    }
+
+    #[test]
+    fn increasing_cumulative_sse_usage_settles_the_final_total() {
+        assert_eq!(
+            sse_output_amount(
+                b"data: {\"usage\":{\"completion_tokens\":1}}\n\ndata: {\"usage\":{\"completion_tokens\":1000}}\n\n"
+            ),
+            1_000
+        );
+        assert_eq!(
+            sse_output_amount(b"data: {\"usage\":{\"completion_tokens\":1000}}\n\n"),
+            1_000
+        );
     }
 
     #[test]
