@@ -52,14 +52,29 @@ fn dollars(minor: u64) -> String {
     }
 }
 
+/// A recorded amount and the ledger day it was charged to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recorded {
+    pub day: u64,
+    pub total: u64,
+}
+
 /// What a subject has spent today.
 pub trait SpendLedger: Send + Sync {
     fn spent_today(&self, subject: &str) -> u64;
     /// Atomically check `cap` and reserve `amount` for today. Returns the
-    /// resulting total, or that same would-be total when it exceeds the cap.
-    fn check_and_record(&self, subject: &str, amount: u64, cap: Option<u64>) -> Result<u64, u64>;
-    /// Release a prior reservation that did not result in a signature.
-    fn release(&self, subject: &str, amount: u64);
+    /// day charged and resulting total, or the would-be total when it
+    /// exceeds the cap.
+    fn check_and_record(
+        &self,
+        subject: &str,
+        amount: u64,
+        cap: Option<u64>,
+    ) -> Result<Recorded, u64>;
+    /// Release a reservation charged to `day` that did not result in a
+    /// signature. A reservation from an earlier day no longer counts against
+    /// any cap and is left alone.
+    fn release(&self, subject: &str, day: u64, amount: u64);
 }
 
 /// Day counter, so a ledger can be driven in tests.
@@ -106,7 +121,12 @@ impl SpendLedger for MemoryLedger {
         }
     }
 
-    fn check_and_record(&self, subject: &str, amount: u64, cap: Option<u64>) -> Result<u64, u64> {
+    fn check_and_record(
+        &self,
+        subject: &str,
+        amount: u64,
+        cap: Option<u64>,
+    ) -> Result<Recorded, u64> {
         let today = (self.clock)();
         let mut totals = self.totals.lock().unwrap();
         let entry = totals.entry(subject.to_string()).or_insert((today, 0));
@@ -118,14 +138,16 @@ impl SpendLedger for MemoryLedger {
             return Err(next);
         }
         entry.1 = next;
-        Ok(next)
+        Ok(Recorded {
+            day: today,
+            total: next,
+        })
     }
 
-    fn release(&self, subject: &str, amount: u64) {
-        let today = (self.clock)();
+    fn release(&self, subject: &str, day: u64, amount: u64) {
         let mut totals = self.totals.lock().unwrap();
-        if let Some((day, total)) = totals.get_mut(subject)
-            && *day == today
+        if let Some((current, total)) = totals.get_mut(subject)
+            && *current == day
         {
             *total = total.saturating_sub(amount);
         }
@@ -141,8 +163,15 @@ pub struct PolicyGate {
     holds: Option<Holds>,
 }
 
-/// Amounts a gate recorded for one signing operation.
-type Holds = Arc<Mutex<Vec<u64>>>;
+/// Reservations a gate recorded for one signing operation.
+type Holds = Arc<Mutex<Vec<Reserved>>>;
+
+/// One reservation: what to release if no signature follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reserved {
+    pub day: u64,
+    pub amount: u64,
+}
 
 impl PolicyGate {
     pub fn new(
@@ -164,10 +193,12 @@ impl PolicyGate {
     }
 }
 
-impl AuthGate for PolicyGate {
-    fn authenticate(&self, intent: &AuthIntent) -> pay_keystore::Result<()> {
+impl PolicyGate {
+    /// Check `intent` against the policy and record it. Returns what was
+    /// reserved, or `None` for intents that move no money.
+    pub fn reserve(&self, intent: &AuthIntent) -> pay_keystore::Result<Option<Reserved>> {
         if !intent.moves_money() {
-            return Ok(());
+            return Ok(None);
         }
         let denied = |why: String| pay_keystore::Error::AuthDenied(why);
         if intent.is_recurring() {
@@ -192,19 +223,30 @@ impl AuthGate for PolicyGate {
                 dollars(ceiling)
             )));
         }
-        if let Err(next) =
-            self.ledger
-                .check_and_record(&self.subject, amount, self.policy.daily_cap)
+        match self
+            .ledger
+            .check_and_record(&self.subject, amount, self.policy.daily_cap)
         {
-            return Err(denied(format!(
+            Ok(recorded) => Ok(Some(Reserved {
+                day: recorded.day,
+                amount,
+            })),
+            Err(next) => Err(denied(format!(
                 "{} would take today's spend to {} against a daily cap of {}",
                 dollars(amount),
                 dollars(next),
                 dollars(self.policy.daily_cap.expect("cap was checked"))
-            )));
+            ))),
         }
-        if let Some(holds) = &self.holds {
-            holds.lock().unwrap().push(amount);
+    }
+}
+
+impl AuthGate for PolicyGate {
+    fn authenticate(&self, intent: &AuthIntent) -> pay_keystore::Result<()> {
+        if let Some(reserved) = self.reserve(intent)?
+            && let Some(holds) = &self.holds
+        {
+            holds.lock().unwrap().push(reserved);
         }
         Ok(())
     }
@@ -258,8 +300,8 @@ impl ApprovalPolicy for PolicyApproval {
         let gate = self.chain(self.policy_gate().holding(holds.clone()), peer);
         let (subject, ledger) = (self.subject.clone(), self.ledger.clone());
         let hold = ApprovalHold::new(move || {
-            for amount in std::mem::take(&mut *holds.lock().unwrap()) {
-                ledger.release(&subject, amount);
+            for reserved in std::mem::take(&mut *holds.lock().unwrap()) {
+                ledger.release(&subject, reserved.day, reserved.amount);
             }
         });
         (gate, hold)
@@ -510,5 +552,48 @@ mod tests {
             Err(pay_core::Error::Mpp("failed".to_string()))
         });
         assert_eq!(ledger.spent_today("tenant"), 0);
+    }
+
+    #[test]
+    fn a_prior_day_release_never_reduces_the_new_day_total() {
+        let day = Arc::new(AtomicU64::new(100));
+        let ledger = ledger_at(day.clone());
+        let policy = SpendPolicy::dollars(10.0, 10.0);
+        let gate = PolicyGate::new("sub", policy, ledger.clone());
+
+        let failed = gate.reserve(&payment("$6")).unwrap().unwrap();
+        assert_eq!(failed.day, 100);
+        day.store(101, Ordering::SeqCst);
+        gate.reserve(&payment("$6")).unwrap().unwrap();
+        assert_eq!(ledger.spent_today("sub"), 60_000);
+
+        // The day-100 request fails after midnight.
+        ledger.release("sub", failed.day, failed.amount);
+        assert_eq!(ledger.spent_today("sub"), 60_000);
+        assert!(gate.reserve(&payment("$6")).is_err(), "cap still holds");
+
+        // Same-day release still works.
+        let same_day = gate.reserve(&payment("$4")).unwrap().unwrap();
+        ledger.release("sub", same_day.day, same_day.amount);
+        assert_eq!(ledger.spent_today("sub"), 60_000);
+    }
+
+    #[test]
+    fn approval_hold_across_midnight_leaves_the_new_day_alone() {
+        let day = Arc::new(AtomicU64::new(100));
+        let ledger = ledger_at(day.clone());
+        let approval = PolicyApproval {
+            subject: "sub".to_string(),
+            policy: SpendPolicy::dollars(10.0, 10.0),
+            ledger: ledger.clone(),
+        };
+        let (gate, hold) = approval.gate_with_hold(None);
+        gate.unwrap().authenticate(&payment("$6")).unwrap();
+        day.store(101, Ordering::SeqCst);
+        PolicyGate::new("sub", approval.policy, ledger.clone())
+            .authenticate(&payment("$6"))
+            .unwrap();
+        drop(hold);
+        assert_eq!(ledger.spent_today("sub"), 60_000);
     }
 }

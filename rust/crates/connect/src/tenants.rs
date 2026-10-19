@@ -15,10 +15,12 @@ use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
 use pay_core::accounts::{Account, AccountsFile, AccountsStore, BackendKind, MAINNET_NETWORK};
-use pay_core::keystore::{AuthGate, AuthIntent, USD_MINOR_UNITS_PER_DOLLAR};
+use pay_core::keystore::{AuthIntent, USD_MINOR_UNITS_PER_DOLLAR};
 use pay_core::remote::{CredentialSource, Credentials, MemoryCredentials};
 use pay_mcp::context::{CallScope, PayContext};
-use pay_mcp::policy::{MemoryLedger, PolicyApproval, PolicyGate, SpendLedger, SpendPolicy};
+use pay_mcp::policy::{
+    MemoryLedger, PolicyApproval, PolicyGate, Reserved, SpendLedger, SpendPolicy,
+};
 use rmcp::service::{RequestContext, RoleServer};
 
 use crate::mcp::Tenant;
@@ -142,7 +144,7 @@ pub struct TenantRegistry {
 /// provider actually returns a signature.
 pub struct SpendReservation {
     subject: String,
-    amount: u64,
+    reserved: Option<Reserved>,
     ledger: Arc<dyn SpendLedger>,
     committed: bool,
 }
@@ -155,8 +157,11 @@ impl SpendReservation {
 
 impl Drop for SpendReservation {
     fn drop(&mut self) {
-        if !self.committed {
-            self.ledger.release(&self.subject, self.amount);
+        if !self.committed
+            && let Some(reserved) = self.reserved
+        {
+            self.ledger
+                .release(&self.subject, reserved.day, reserved.amount);
         }
     }
 }
@@ -198,8 +203,8 @@ impl TenantRegistry {
         let fraction = amount_minor % USD_MINOR_UNITS_PER_DOLLAR;
         let amount = format!("${whole}.{fraction:04}");
         let key = tenant.ledger_key();
-        PolicyGate::new(&key, tenant.policy, self.ledger.clone())
-            .authenticate(&AuthIntent::authorize_payment_details(
+        let reserved = PolicyGate::new(&key, tenant.policy, self.ledger.clone())
+            .reserve(&AuthIntent::authorize_payment_details(
                 &amount,
                 "hosted CLI transaction",
                 "connect.pay.sh",
@@ -207,7 +212,7 @@ impl TenantRegistry {
             .map_err(|error| error.to_string())?;
         Ok(SpendReservation {
             subject: key,
-            amount: amount_minor,
+            reserved,
             ledger: self.ledger.clone(),
             committed: false,
         })
@@ -838,6 +843,39 @@ mod tests {
             .unwrap()
             .commit();
         assert_eq!(ledger.spent_today(&tenant.ledger_key()), 10_000);
+    }
+
+    #[test]
+    fn a_prior_day_failed_reservation_does_not_erase_new_day_spend() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let day = Arc::new(AtomicU64::new(100));
+        let clock_day = day.clone();
+        let ledger = Arc::new(MemoryLedger::with_clock(Arc::new(move || {
+            clock_day.load(Ordering::SeqCst)
+        })));
+        let registry = TenantRegistry::with_ledger(ledger.clone());
+        let mut tenant = record("sub_1");
+        tenant.policy = SpendPolicy {
+            per_call_ceiling: Some(100_000),
+            daily_cap: Some(100_000),
+        };
+
+        let failed = registry.reserve_cli_transaction(&tenant, 60_000).unwrap();
+        day.store(101, Ordering::SeqCst);
+        registry
+            .reserve_cli_transaction(&tenant, 60_000)
+            .unwrap()
+            .commit();
+        drop(failed);
+        assert_eq!(ledger.spent_today(&tenant.ledger_key()), 60_000);
+        assert!(
+            registry.reserve_cli_transaction(&tenant, 100_000).is_err(),
+            "the committed day-101 spend still counts against the cap"
+        );
+        registry
+            .reserve_cli_transaction(&tenant, 40_000)
+            .unwrap()
+            .commit();
     }
 
     #[tokio::test]
