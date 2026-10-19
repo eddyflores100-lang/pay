@@ -12,6 +12,8 @@ pub const CAPABILITY_HEADER: &str = "x-pay-data-capability";
 pub const INTERNAL_PROOF_HEADER: &str = "x-pay-data-binding-proof";
 const MAX_BINDING_SECONDS: u32 = 30 * 24 * 60 * 60;
 const DEFAULT_BINDING_SECONDS: u32 = 24 * 60 * 60;
+/// Version 1 capabilities carried no store generation and are rejected.
+const CAPABILITY_VERSION: u8 = 2;
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
@@ -66,6 +68,8 @@ pub struct Capability {
     pub tenant: String,
     pub driver: String,
     pub store_id: String,
+    /// Provider creation identity of the bound store incarnation.
+    pub generation: String,
     workload_id: String,
     pub read: bool,
     pub write: bool,
@@ -98,7 +102,12 @@ impl BindingIssuer {
         }
     }
 
-    pub fn issue(&self, tenant: String, request: &CreateBindingRequest) -> Result<IssuedBinding> {
+    pub fn issue(
+        &self,
+        tenant: String,
+        generation: String,
+        request: &CreateBindingRequest,
+    ) -> Result<IssuedBinding> {
         if !request.read && !request.write {
             return Err(DataError::InvalidRequest(
                 "binding must grant read, write, or both".into(),
@@ -112,11 +121,17 @@ impl BindingIssuer {
             )));
         }
         let expires_at = now_seconds()?.saturating_add(u64::from(lease));
+        if generation.is_empty() {
+            return Err(DataError::InvalidRequest(
+                "binding requires a store creation identity".into(),
+            ));
+        }
         let capability = Capability {
-            version: 1,
+            version: CAPABILITY_VERSION,
             tenant,
             driver: request.driver.clone(),
             store_id: request.store_id.clone(),
+            generation,
             workload_id: request.workload_id.clone(),
             read: request.read,
             write: request.write,
@@ -151,7 +166,7 @@ impl BindingIssuer {
                 .decode(encoded)
                 .map_err(|_| DataError::InvalidRequest("invalid data capability".into()))?,
         )?;
-        if capability.version != 1
+        if capability.version != CAPABILITY_VERSION
             || capability.store_id != store_id
             || capability.expires_at < now_seconds()?
         {
@@ -204,7 +219,21 @@ mod tests {
             write: true,
             lease_seconds: Some(300),
         };
-        let binding = issuer.issue("0123456789abcdef".into(), &request).unwrap();
+        let binding = issuer
+            .issue("0123456789abcdef".into(), "created-1".into(), &request)
+            .unwrap();
+        assert_eq!(
+            issuer
+                .verify(&binding.capability, "fds-0123456789abcdef-weather")
+                .unwrap()
+                .generation,
+            "created-1"
+        );
+        assert!(
+            issuer
+                .issue("0123456789abcdef".into(), String::new(), &request)
+                .is_err()
+        );
         assert!(
             issuer
                 .verify(&binding.capability, "fds-0123456789abcdef-weather")
@@ -221,6 +250,35 @@ mod tests {
             issuer
                 .verify(
                     &String::from_utf8(tampered).unwrap(),
+                    "fds-0123456789abcdef-weather"
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn generation_less_v1_capabilities_are_rejected() {
+        let issuer = BindingIssuer::new(vec![7; 32], vec![9; 32]).unwrap();
+        let legacy = serde_json::json!({
+            "version": 1,
+            "tenant": "0123456789abcdef",
+            "driver": "gcp-firestore",
+            "store_id": "fds-0123456789abcdef-weather",
+            "workload_id": "gcf-0123456789abcdef-weather",
+            "read": true,
+            "write": true,
+            "expires_at": u64::MAX,
+        });
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&legacy).unwrap());
+        let mut mac = issuer.mac().unwrap();
+        mac.update(encoded.as_bytes());
+        let signature =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        assert!(
+            issuer
+                .verify(
+                    &format!("{encoded}.{signature}"),
                     "fds-0123456789abcdef-weather"
                 )
                 .is_err()

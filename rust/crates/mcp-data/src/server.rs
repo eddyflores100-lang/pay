@@ -24,7 +24,7 @@ use crate::binding::{
 use crate::driver::{DataError, DriverRegistry};
 use crate::types::{
     CreateDocumentStoreRequest, DocumentRequest, DocumentStoreRequest, GatewayReadRequest,
-    ListDocumentStoresRequest, PutDocumentRequest, Tenant,
+    ListDocumentStoresRequest, PutDocumentRequest, StoreBinding, Tenant,
 };
 
 pub const VERIFIED_PAYER_HEADER: &str = "x-pay-verified-payer";
@@ -291,8 +291,14 @@ async fn create_binding(
                 },
             )
             .await?;
+        let generation = store.created_at.ok_or_else(|| {
+            DataError::Provider("document store omitted its creation identity".into())
+        })?;
         request.store_id = store.id;
-        Ok(state.bindings.issue(tenant.key, &request)?.into())
+        Ok(state
+            .bindings
+            .issue(tenant.key, generation, &request)?
+            .into())
     }
     .await;
     internal_response(result)
@@ -317,6 +323,9 @@ async fn binding_get_document(
                     payer: String::new(),
                     key: capability.tenant,
                     channel_id: String::new(),
+                    binding: Some(StoreBinding {
+                        generation: capability.generation,
+                    }),
                 },
                 DocumentRequest {
                     driver: capability.driver,
@@ -350,6 +359,9 @@ async fn binding_put_document(
                     payer: String::new(),
                     key: capability.tenant,
                     channel_id: String::new(),
+                    binding: Some(StoreBinding {
+                        generation: capability.generation,
+                    }),
                 },
                 PutDocumentRequest {
                     driver: capability.driver,
@@ -383,6 +395,9 @@ async fn binding_delete_document(
                     payer: String::new(),
                     key: capability.tenant,
                     channel_id: String::new(),
+                    binding: Some(StoreBinding {
+                        generation: capability.generation,
+                    }),
                 },
                 DocumentRequest {
                     driver: capability.driver,
@@ -564,6 +579,7 @@ fn tenant_from_payer(payer: &str) -> crate::driver::Result<Tenant> {
         payer: payer.to_string(),
         key,
         channel_id: String::new(),
+        binding: None,
     })
 }
 

@@ -133,6 +133,11 @@ impl Fixture {
                 state.revision += 1;
                 document["name"] = json!(name);
                 document["updateTime"] = json!(format!("revision-{}", state.revision));
+                document["createTime"] = state
+                    .documents
+                    .get(name)
+                    .and_then(|existing| existing.get("createTime").cloned())
+                    .unwrap_or_else(|| json!(format!("created-{}", state.revision)));
                 state.documents.insert(name.to_owned(), document.clone());
                 ok(document)
             } else {
@@ -198,6 +203,7 @@ fn tenant(channel: &str) -> Tenant {
         payer: "payer".into(),
         key: "0123456789abcdef".into(),
         channel_id: channel.into(),
+        binding: None,
     }
 }
 
@@ -375,4 +381,92 @@ async fn normal_delete_fences_child_deletion() {
 #[tokio::test]
 async fn normal_delete_fences_parent_deletion_after_empty_listing() {
     replacement_survives("children", false, true).await;
+}
+
+#[tokio::test]
+async fn capabilities_do_not_survive_store_recreation() {
+    use crate::binding::{BindingIssuer, CAPABILITY_HEADER, CreateBindingRequest};
+    use tower::ServiceExt;
+    let (driver, _fixture, server) = fixture().await;
+    let owner = tenant("channelA");
+    create_and_write(&driver, &owner, json!("original")).await;
+    let issuer = BindingIssuer::new(vec![7; 32], vec![9; 32]).unwrap();
+    let issue = |store: crate::types::DocumentStore| {
+        issuer
+            .issue(
+                owner.key.clone(),
+                store.created_at.unwrap(),
+                &CreateBindingRequest {
+                    payer: "payer".into(),
+                    binding_name: "weather".into(),
+                    driver: DRIVER_ID.into(),
+                    store_id: store.id,
+                    workload_id: "gcf-0123456789abcdef-weather".into(),
+                    read: true,
+                    write: true,
+                    lease_seconds: Some(300),
+                },
+            )
+            .unwrap()
+            .capability
+    };
+    let stale = issue(
+        driver
+            .get_document_store(&owner, store_request())
+            .await
+            .unwrap(),
+    );
+    let drivers =
+        crate::driver::DriverRegistry::new([driver.clone() as Arc<dyn DataDriver>]).unwrap();
+    let app = crate::server::runtime_router(drivers, issuer.clone());
+    let call = |method: &str, capability: &str, body: Option<Value>| {
+        let request = Request::builder()
+            .method(method)
+            .uri("/__402/bindings/fds-0123456789abcdef-weather/key")
+            .header(CAPABILITY_HEADER, capability)
+            .header("content-type", "application/json")
+            .body(body.map_or_else(Body::empty, |value| Body::from(value.to_string())))
+            .unwrap();
+        let app = app.clone();
+        async move {
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
+        }
+    };
+    let (status, body) = call("GET", &stale, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["value"], "original");
+
+    driver
+        .delete_document_store(&owner, store_request())
+        .await
+        .unwrap();
+    create_and_write(&driver, &owner, json!("replacement")).await;
+    for (method, body) in [
+        ("GET", None),
+        ("PUT", Some(json!("overwritten"))),
+        ("DELETE", None),
+    ] {
+        let (status, _) = call(method, &stale, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method}");
+    }
+
+    let fresh = issue(
+        driver
+            .get_document_store(&owner, store_request())
+            .await
+            .unwrap(),
+    );
+    let (status, body) = call("GET", &fresh, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["value"], "replacement");
+    server.abort();
+    let _ = server.await;
 }

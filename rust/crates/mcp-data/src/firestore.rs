@@ -255,6 +255,7 @@ impl FirestoreDriver {
                 "document store is not ready for operations".into(),
             ));
         }
+        require_store_binding(tenant, &store)?;
         Ok(store)
     }
 
@@ -608,6 +609,7 @@ impl DataDriver for FirestoreDriver {
             payer: String::new(),
             key: tenant_key.to_string(),
             channel_id: String::new(),
+            binding: None,
         };
         let store = self.require_ready_store(&tenant, &request.store_id).await?;
         if firestore_bool(&store, "gatewayReads") != Some(true) {
@@ -671,6 +673,7 @@ impl DataDriver for FirestoreDriver {
                     payer: String::new(),
                     key: tenant_key.to_string(),
                     channel_id: channel_id.to_string(),
+                    binding: None,
                 },
                 store,
             )
@@ -875,6 +878,18 @@ fn require_channel_lease(channel_id: &str, value: &Value) -> Result<()> {
     Ok(())
 }
 
+/// A capability-bound tenant may only touch the incarnation it was issued for.
+fn require_store_binding(tenant: &Tenant, store: &Value) -> Result<()> {
+    if let Some(binding) = &tenant.binding
+        && store.get("createTime").and_then(Value::as_str) != Some(binding.generation.as_str())
+    {
+        return Err(DataError::InvalidRequest(
+            "data capability was issued for a different store incarnation".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn provider_error(status: StatusCode, value: &Value) -> DataError {
     let message = value
         .pointer("/error/message")
@@ -1034,6 +1049,7 @@ mod tests {
             payer: "payer".into(),
             key: "0123456789abcdef".into(),
             channel_id: "channel".into(),
+            binding: None,
         };
         assert!(
             driver
@@ -1087,6 +1103,7 @@ mod tests {
             payer: "payer".into(),
             key: "0123456789abcdef".into(),
             channel_id: "channel".into(),
+            binding: None,
         };
         let config = FirestoreConfig {
             project: "project".into(),
