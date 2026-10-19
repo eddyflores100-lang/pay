@@ -613,10 +613,11 @@ async fn push_session_full_flow() {
                         .signatures[0]
                             .to_string()
                     ),
+                    // The open lands after the slot observed at verification.
                     "getSignatureStatuses" => serde_json::json!({
-                        "context": { "slot": 34 },
+                        "context": { "slot": 35 },
                         "value": [{
-                            "slot": 34,
+                            "slot": 35,
                             "confirmations": null,
                             "err": null,
                             "confirmationStatus": "finalized",
@@ -625,9 +626,9 @@ async fn push_session_full_flow() {
                     }),
                     "getMultipleAccounts" => {
                         assert_eq!(body["params"][0].as_array().map(Vec::len), Some(1));
-                        assert_eq!(body["params"][1]["minContextSlot"], 34);
+                        assert_eq!(body["params"][1]["minContextSlot"], 35);
                         serde_json::json!({
-                            "context": { "slot": 34 },
+                            "context": { "slot": 35 },
                             "value": [{
                                 "data": [
                                     base64::engine::general_purpose::STANDARD.encode(&channel_data),

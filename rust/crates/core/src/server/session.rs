@@ -578,9 +578,13 @@ impl SessionOperatorRuntime {
                 &params.program_id,
             )
             .map_err(|e| Error::Mpp(format!("failed to build settlement instruction: {e}")))?;
+        let distribution = SealParams {
+            rent_payer: Some(rent_payer),
+            ..params.clone()
+        };
         instructions.push(
-            params
-                .distribute_instruction(&rent_payer, &treasury, &token_program)
+            distribution
+                .distribute_instruction(&treasury, &token_program)
                 .map_err(|error| Error::Mpp(format!("failed to build distribution: {error}")))?,
         );
 

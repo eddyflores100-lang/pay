@@ -66,6 +66,7 @@ pub fn build_handler(
         plan_id,
         plan_created_at,
         period_hours,
+        subscription_expires: None,
         network: defaults.network.to_string(),
         program_id: None,
         challenge_binding_secret,

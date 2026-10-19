@@ -810,6 +810,7 @@ fn bound_distribution_instruction(
         channel_id: onchain.address,
         authorized_signer: None,
         payer: Some(onchain.payer()),
+        rent_payer: Some(onchain.rent_payer()),
         mint: Some(onchain.mint()),
         program_id: deployment.program_id,
         channel_version: config.channel_version,
@@ -821,7 +822,7 @@ fn bound_distribution_instruction(
         splits: config.splits.clone(),
         distribution_hash: onchain.channel.distribution_hash,
     }
-    .distribute_instruction(&onchain.rent_payer(), treasury_owner, token_program)
+    .distribute_instruction(treasury_owner, token_program)
     .map_err(binding_error)
 }
 
