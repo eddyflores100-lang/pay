@@ -1164,6 +1164,14 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
                 "requested path is not published by the deployment owner".into(),
             ));
         }
+        if let Some(expected) = &request.expected_created_at
+            && (value.get("name").and_then(Value::as_str) != Some(resource.as_str())
+                || value.get("createTime").and_then(Value::as_str) != Some(expected.as_str()))
+        {
+            return Err(ComputeError::InvalidRequest(
+                "deployment was recreated after the payment was admitted".into(),
+            ));
+        }
         let deployment = normalize_deployment(value)?;
         self.invoke_origin(
             &deployment,

@@ -49,6 +49,14 @@ pub struct DeletePaymentPolicyRequest {
     pub expected_version: u64,
 }
 
+/// Durable policy snapshot the payment gate admitted a request under.
+#[derive(Clone, Debug, Deserialize)]
+pub struct AdmittedPolicy {
+    pub deployment: DeploymentIdentity,
+    pub version: u64,
+    pub price_micro_usd: u64,
+}
+
 #[derive(Serialize)]
 pub struct ResolvedPaymentPolicy {
     pub deployment: DeploymentIdentity,
@@ -264,6 +272,24 @@ impl PaymentService {
             schemes: policy.spec.schemes,
             allocations,
         })
+    }
+
+    /// Reject a paid request whose admitted policy is no longer the live
+    /// policy of that exact deployment incarnation.
+    pub async fn require_admitted(&self, admitted: &AdmittedPolicy) -> Result<()> {
+        let stale =
+            || ComputeError::InvalidRequest("admitted payment policy is no longer current".into());
+        let stored = self.load(&admitted.deployment).await?.ok_or_else(stale)?;
+        let policy = stored.policy.as_ref().ok_or_else(stale)?;
+        if stored.retired
+            || policy.deleted
+            || policy.deployment != admitted.deployment
+            || policy.version != admitted.version
+            || policy.spec.price_micro_usd != admitted.price_micro_usd
+        {
+            return Err(stale());
+        }
+        Ok(())
     }
 
     pub fn router(self) -> Router {

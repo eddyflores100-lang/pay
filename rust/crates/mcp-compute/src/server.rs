@@ -21,7 +21,8 @@ use sha2::{Digest, Sha256};
 use crate::binding::DataBindingClient;
 use crate::driver::{ComputeError, DriverRegistry};
 use crate::payment_service::{
-    DeletePaymentPolicyRequest, GetPaymentPolicyRequest, PaymentService, SetPaymentPolicyRequest,
+    AdmittedPolicy, DeletePaymentPolicyRequest, GetPaymentPolicyRequest, PaymentService,
+    SetPaymentPolicyRequest,
 };
 use crate::trigger_driver::TriggerDriverRegistry;
 use crate::trigger_types::{
@@ -36,6 +37,8 @@ pub const VERIFIED_PAYER_HEADER: &str = "x-pay-verified-payer";
 pub const VERIFIED_CHANNEL_HEADER: &str = "x-pay-verified-channel";
 pub const ORIGINAL_HOST_HEADER: &str = "x-pay-original-host";
 pub const PROXY_PROOF_HEADER: &str = "x-pay-proxy-proof";
+/// Durable deployment policy the payment gate admitted the request under.
+pub const PAYMENT_POLICY_HEADER: &str = "x-pay-payment-policy";
 pub const USAGE_HEADER: &str = "x-pay-gcp-cpu-microusd";
 const MAX_GATEWAY_BODY_BYTES: usize = 10 * 1024 * 1024;
 const TRIGGER_EXECUTOR_PROOF_HEADER: &str = "x-compute-trigger-proof";
@@ -431,6 +434,7 @@ struct AppState {
     gateway_domain: String,
     executor_proof: Vec<u8>,
     proxy_proof: Vec<u8>,
+    payments: Option<PaymentService>,
 }
 
 pub fn router(
@@ -490,6 +494,7 @@ pub fn router_with_payments(
         gateway_domain,
         executor_proof,
         proxy_proof,
+        payments: payments.clone(),
     };
     let mcp = Router::new()
         .nest_service("/mcp", service)
@@ -669,6 +674,24 @@ async fn gateway_invoke_inner(
     } else {
         gateway_path_target(request.uri())?
     };
+    // Policy-priced requests must reach the incarnation and policy version
+    // the payment gate admitted, never a same-name replacement.
+    let expected_created_at = match &state.payments {
+        None => None,
+        Some(payments) => {
+            let admitted = admitted_policy(request.headers())?;
+            if host != Some(admitted.deployment.hostname.as_str())
+                || admitted.deployment.resource_name.rsplit('/').next()
+                    != Some(deployment_id.as_str())
+            {
+                return Err(ComputeError::InvalidRequest(
+                    "admitted payment policy names a different deployment".into(),
+                ));
+            }
+            payments.require_admitted(&admitted).await?;
+            Some(admitted.deployment.created_at)
+        }
+    };
     let driver = state.drivers.for_gateway(&deployment_id)?;
     let (parts, body) = request.into_parts();
     let body = to_bytes(body, MAX_GATEWAY_BODY_BYTES)
@@ -697,6 +720,7 @@ async fn gateway_invoke_inner(
     let invocation = driver
         .invoke_gateway(GatewayInvokeRequest {
             deployment_id,
+            expected_created_at,
             method: parts.method.to_string(),
             path_and_query: gateway_path,
             headers,
@@ -715,6 +739,17 @@ async fn gateway_invoke_inner(
     builder.body(Body::from(invocation.body)).map_err(|error| {
         ComputeError::Provider(format!("failed to build invocation response: {error}"))
     })
+}
+
+fn admitted_policy(headers: &HeaderMap) -> crate::driver::Result<AdmittedPolicy> {
+    let value = headers
+        .get(PAYMENT_POLICY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            ComputeError::InvalidRequest("admitted payment policy is required".into())
+        })?;
+    serde_json::from_str(value)
+        .map_err(|_| ComputeError::InvalidRequest("admitted payment policy is invalid".into()))
 }
 
 fn gateway_path_target(uri: &axum::http::Uri) -> crate::driver::Result<(String, String)> {
@@ -900,6 +935,7 @@ mod tests {
             gateway_domain: "cpu.example.invalid".into(),
             executor_proof: b"correct-proof-that-is-at-least-32-bytes".to_vec(),
             proxy_proof: PROXY_PROOF.to_vec(),
+            payments: None,
         };
         let app = Router::new()
             .route(
