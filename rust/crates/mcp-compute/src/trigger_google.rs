@@ -463,6 +463,8 @@ impl TriggerDriver for GoogleTriggerDriver {
             )
             .await?;
         require_function_owner(&function, tenant)?;
+        let target_channel_lease = function_lease(&tenant.channel_id)?;
+        require_function_lease(&function, &target_channel_lease)?;
         validate_budgeted_function(&function)?;
         let physical = self.physical_name(tenant, &request.name)?;
         let resource = self.resource(region, &physical)?;
@@ -501,6 +503,7 @@ impl TriggerDriver for GoogleTriggerDriver {
             "trigger_resource": resource,
             "channel_lease": channel,
             "target_resource": function_resource,
+            "target_channel_lease": target_channel_lease,
             "tenant_key": tenant.key,
             "path": request.target.path,
             "input": request.input,
@@ -683,24 +686,6 @@ impl TriggerDriver for GoogleTriggerDriver {
                 "executor trigger resource is outside the configured project and region".into(),
             ));
         }
-        if !self
-            .consume_budget(&request.trigger_resource, &request.channel_lease)
-            .await?
-        {
-            let _ = self
-                .request(
-                    Method::POST,
-                    format!(
-                        "{}/v1/{}:pause",
-                        self.config.scheduler_api_base, request.trigger_resource
-                    ),
-                    Some(&json!({})),
-                )
-                .await;
-            return Err(TriggerError::InvalidRequest(
-                "prepaid execution budget is exhausted or expired".into(),
-            ));
-        }
         validate_schedule("* * * * *", "Etc/UTC", &request.path)?;
         let (target_region, target_name) =
             parse_function_resource(&request.target_resource, &self.config.project, None)?;
@@ -721,7 +706,26 @@ impl TriggerDriver for GoogleTriggerDriver {
             )
             .await?;
         require_function_tenant(&function, &request.tenant_key)?;
+        require_function_lease(&function, &request.target_channel_lease)?;
         validate_budgeted_function(&function)?;
+        if !self
+            .consume_budget(&request.trigger_resource, &request.channel_lease)
+            .await?
+        {
+            let _ = self
+                .request(
+                    Method::POST,
+                    format!(
+                        "{}/v1/{}:pause",
+                        self.config.scheduler_api_base, request.trigger_resource
+                    ),
+                    Some(&json!({})),
+                )
+                .await;
+            return Err(TriggerError::InvalidRequest(
+                "prepaid execution budget is exhausted or expired".into(),
+            ));
+        }
         let origin = function
             .pointer("/serviceConfig/uri")
             .and_then(Value::as_str)
@@ -885,6 +889,24 @@ fn require_function_tenant(value: &Value, tenant_key: &str) -> Result<()> {
     } else {
         Err(TriggerError::InvalidRequest(
             "target function is not owned by the verified payer".into(),
+        ))
+    }
+}
+
+/// Compute deployment lease label for a verified channel.
+fn function_lease(channel_id: &str) -> Result<String> {
+    crate::google::channel_lease_key(channel_id)
+        .map_err(|error| TriggerError::InvalidRequest(error.to_string()))
+}
+
+fn require_function_lease(value: &Value, expected: &str) -> Result<()> {
+    if !expected.is_empty()
+        && value.pointer("/labels/pay-channel").and_then(Value::as_str) == Some(expected)
+    {
+        Ok(())
+    } else {
+        Err(TriggerError::InvalidRequest(
+            "target function is funded by a different payment channel".into(),
         ))
     }
 }
@@ -1174,6 +1196,17 @@ mod tests {
         sibling.channel_id = String::new();
         assert!(require_funding_channel(&value, &sibling).is_err());
         assert!(require_funding_channel(&json!({}), &owner).is_err());
+    }
+
+    #[test]
+    fn trigger_targets_require_the_callers_deployment_lease() {
+        let lease = function_lease("channelA").unwrap();
+        let function = json!({ "labels": { "pay-channel": lease } });
+        assert!(require_function_lease(&function, &lease).is_ok());
+        assert!(require_function_lease(&function, &function_lease("channelB").unwrap()).is_err());
+        assert!(require_function_lease(&function, "").is_err());
+        assert!(require_function_lease(&json!({ "labels": {} }), &lease).is_err());
+        assert!(function_lease("").is_err());
     }
 
     #[test]

@@ -496,3 +496,49 @@ async fn trigger_control_is_scoped_to_the_funding_channel() {
     harness.driver.delete(&owner, request()).await.unwrap();
     assert!(!harness.state.lock().unwrap().jobs.contains_key(&trigger.id));
 }
+
+#[tokio::test]
+#[ignore = "requires redis-server on PATH; run with --ignored"]
+async fn triggers_cannot_target_another_channels_deployment() {
+    let mut harness = Harness::new().await;
+    harness.add_function(FUNCTION, "channelA", "2026-01-01T00:00:00Z");
+    let sibling = tenant("channelB");
+    assert!(
+        harness
+            .driver
+            .create(
+                &sibling,
+                create_request("refresh", "weather", "*/5 * * * *")
+            )
+            .await
+            .is_err()
+    );
+    assert!(harness.state.lock().unwrap().jobs.is_empty());
+
+    let trigger = harness
+        .driver
+        .create(
+            &tenant("channelA"),
+            create_request("refresh", "weather", "*/5 * * * *"),
+        )
+        .await
+        .unwrap();
+    let request = harness.executor_request(&trigger.id);
+    assert_eq!(request.target_channel_lease, function_lease("channelA"));
+    harness.driver.execute(request.clone()).await.unwrap();
+    assert_eq!(harness.invocations(), 1);
+    assert_eq!(
+        harness.remaining(&trigger.id).await,
+        Some(i64::from(PREPAID_RUNS) - 1)
+    );
+
+    // The target now belongs to another channel: execution fails closed
+    // before consuming budget or invoking it.
+    harness.add_function(FUNCTION, "channelB", "2026-01-01T00:00:00Z");
+    assert!(harness.driver.execute(request).await.is_err());
+    assert_eq!(harness.invocations(), 1);
+    assert_eq!(
+        harness.remaining(&trigger.id).await,
+        Some(i64::from(PREPAID_RUNS) - 1)
+    );
+}

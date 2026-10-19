@@ -317,6 +317,7 @@ async fn scheduled_invocation_isolates_platform_authentication() {
             trigger_resource: TRIGGER.into(),
             channel_lease: "lease".into(),
             target_resource: RESOURCE.into(),
+            target_channel_lease: crate::google::channel_lease_key("channel").unwrap(),
             tenant_key: TENANT.into(),
             path: "/invoke".into(),
             input: json!({"hello": "world"}),
