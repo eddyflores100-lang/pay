@@ -21,7 +21,8 @@ port: 8080
 rpc_timeout_ms: 3000
 
 # Shared MPP replay store for every replica (redis:// or rediss://; memory://
-# is an explicit single-process opt-in). Required while send is enabled;
+# is an explicit single-process opt-in). Required while send, subscriptions or
+# channels is enabled;
 # PAY_MPP_REDIS_URL is also accepted.
 mpp_store_url: ""
 

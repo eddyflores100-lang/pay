@@ -52,8 +52,10 @@ pub struct AppState {
     /// caller authentication and fee reimbursement collection are available.
     #[allow(dead_code)]
     pub push: Option<PushState>,
-    /// Process-local replay store shared by every per-request charge `Mpp`.
+    /// Replay store shared by every per-request charge `Mpp` across replicas.
     pub charge_store: std::sync::Arc<dyn pay_kit::mpp::store::Store>,
+    /// One in-flight cancellation per subscription PDA across replicas.
+    pub cancel_reservations: crate::store::Reservations,
 }
 
 impl AppState {
@@ -91,6 +93,25 @@ impl AppState {
         };
         let confidential =
             build_confidential_workers(config, &stablecoins, store_backend.as_ref()).await?;
+        let charges_enabled =
+            config.send.enabled || config.subscriptions.enabled || config.channels.enabled;
+        let (charge_store, cancel_reservations) = match &store_backend {
+            Some(backend) => (
+                backend.namespace("charge"),
+                backend.reservations("subscription-cancel"),
+            ),
+            None if charges_enabled => {
+                return Err(Error::SendNotConfigured(
+                    "mpp_store_url is required while send, subscriptions or channels is enabled"
+                        .into(),
+                ));
+            }
+            // No charge endpoint can run, so nothing reads these.
+            None => (
+                StoreBackend::Memory.namespace("charge"),
+                StoreBackend::Memory.reservations("subscription-cancel"),
+            ),
+        };
 
         let push = if config.push.enabled {
             Some(PushState::from_config(&config.push).await?)
@@ -115,7 +136,8 @@ impl AppState {
             confidential,
             confidential_amount_verified: !config.send.accept_unverified_confidential_amount,
             push,
-            charge_store: std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new()),
+            charge_store,
+            cancel_reservations,
         })
     }
 

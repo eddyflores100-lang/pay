@@ -54,6 +54,107 @@ impl StoreBackend {
     }
 }
 
+/// Short-lived exclusive reservations (e.g. one in-flight cancellation per
+/// subscription), shared by every replica on the Redis backend.
+pub enum Reservations {
+    Redis {
+        connection: redis::aio::ConnectionManager,
+        prefix: String,
+    },
+    Memory(std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>),
+}
+
+/// A held reservation; `token` proves ownership on release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reservation {
+    key: String,
+    token: String,
+}
+
+impl StoreBackend {
+    pub fn reservations(&self, namespace: &str) -> Reservations {
+        match self {
+            Self::Redis(connection) => Reservations::Redis {
+                connection: connection.clone(),
+                prefix: format!("pay-api:{namespace}:"),
+            },
+            Self::Memory => Reservations::Memory(Default::default()),
+        }
+    }
+}
+
+impl Reservations {
+    /// Take `key` for `ttl` unless someone else holds it.
+    pub async fn reserve(
+        &self,
+        key: &str,
+        ttl: std::time::Duration,
+    ) -> Result<Option<Reservation>, StoreError> {
+        let token = uuid::Uuid::new_v4().to_string();
+        let acquired = match self {
+            Self::Redis { connection, prefix } => {
+                let mut connection = connection.clone();
+                let set: Option<String> = redis::cmd("SET")
+                    .arg(format!("{prefix}{key}"))
+                    .arg(&token)
+                    .arg("NX")
+                    .arg("PX")
+                    .arg(ttl.as_millis().max(1) as u64)
+                    .query_async(&mut connection)
+                    .await
+                    .map_err(internal)?;
+                set.is_some()
+            }
+            Self::Memory(entries) => {
+                let mut entries = entries.lock().expect("reservations lock");
+                let now = std::time::Instant::now();
+                match entries.get(key) {
+                    Some((_, expires)) if *expires > now => false,
+                    _ => {
+                        entries.insert(key.to_string(), (token.clone(), now + ttl));
+                        true
+                    }
+                }
+            }
+        };
+        Ok(acquired.then(|| Reservation {
+            key: key.to_string(),
+            token,
+        }))
+    }
+
+    /// Release `reservation` if it is still the holder.
+    pub async fn release(&self, reservation: &Reservation) -> Result<(), StoreError> {
+        const RELEASE: &str = r#"
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"#;
+        match self {
+            Self::Redis { connection, prefix } => {
+                let mut connection = connection.clone();
+                redis::Script::new(RELEASE)
+                    .key(format!("{prefix}{}", reservation.key))
+                    .arg(&reservation.token)
+                    .invoke_async::<i32>(&mut connection)
+                    .await
+                    .map_err(internal)?;
+            }
+            Self::Memory(entries) => {
+                let mut entries = entries.lock().expect("reservations lock");
+                if entries
+                    .get(&reservation.key)
+                    .is_some_and(|(token, _)| *token == reservation.token)
+                {
+                    entries.remove(&reservation.key);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 struct RedisStore {
     connection: redis::aio::ConnectionManager,
     prefix: String,
@@ -146,6 +247,55 @@ mod tests {
             StoreBackend::connect("memory://").await,
             Ok(StoreBackend::Memory)
         ));
+    }
+
+    async fn exercise_reservations(a: &Reservations, b: &Reservations) {
+        let ttl = std::time::Duration::from_secs(60);
+        let held = a
+            .reserve("pda", ttl)
+            .await
+            .unwrap()
+            .expect("first reserves");
+        assert_eq!(b.reserve("pda", ttl).await.unwrap(), None);
+        assert!(b.reserve("other", ttl).await.unwrap().is_some());
+
+        // A stale holder cannot release a newer reservation.
+        a.release(&held).await.unwrap();
+        let newer = b.reserve("pda", ttl).await.unwrap().expect("released");
+        a.release(&held).await.unwrap();
+        assert_eq!(a.reserve("pda", ttl).await.unwrap(), None);
+        b.release(&newer).await.unwrap();
+
+        let short = a
+            .reserve("expiring", std::time::Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert!(short.is_some());
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert!(b.reserve("expiring", ttl).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn memory_reservations_are_exclusive_and_expire() {
+        let reservations = StoreBackend::Memory.reservations("cancel");
+        exercise_reservations(&reservations, &reservations).await;
+    }
+
+    #[tokio::test]
+    async fn redis_reservations_are_exclusive_across_replicas() {
+        let Some(redis) = spawn_redis().await else {
+            return;
+        };
+        let url = format!("redis://127.0.0.1:{}/", redis.1);
+        let a = StoreBackend::connect(&url)
+            .await
+            .unwrap()
+            .reservations("cancel");
+        let b = StoreBackend::connect(&url)
+            .await
+            .unwrap()
+            .reservations("cancel");
+        exercise_reservations(&a, &b).await;
     }
 
     #[tokio::test]

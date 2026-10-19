@@ -63,8 +63,8 @@ pub struct Config {
     pub push: PushConfig,
 
     /// Shared MPP replay store (`redis://` / `rediss://`, or the explicit
-    /// single-process `memory://`). Required while send is enabled. Falls
-    /// back to `PAY_MPP_REDIS_URL`.
+    /// single-process `memory://`). Required while send, subscriptions or
+    /// channels is enabled. Falls back to `PAY_MPP_REDIS_URL`.
     #[serde(default)]
     pub mpp_store_url: Option<String>,
 }
@@ -1049,11 +1049,6 @@ impl Config {
             if self.send.sol_price_asset.trim().is_empty() {
                 return Err(ConfigError::Invalid("send.sol_price_asset is empty".into()));
             }
-            if self.mpp_store_url().is_none() {
-                return Err(ConfigError::Invalid(
-                    "mpp_store_url is required when send.enabled is true".into(),
-                ));
-            }
             validate_confidential_amount_policy(&self.send).map_err(ConfigError::Invalid)?;
         }
         if self.redemption.enabled {
@@ -1087,6 +1082,13 @@ impl Config {
                     "send.fee_payer.pubkey is required when redemption.enabled is true".into(),
                 ));
             }
+        }
+        if (self.send.enabled || self.subscriptions.enabled || self.channels.enabled)
+            && self.mpp_store_url().is_none()
+        {
+            return Err(ConfigError::Invalid(
+                "mpp_store_url is required when send, subscriptions or channels is enabled".into(),
+            ));
         }
         if self.subscriptions.enabled {
             if self
@@ -1333,6 +1335,26 @@ mod tests {
         config.mpp_store_url = Some(" ".into());
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("mpp_store_url is required"), "{error}");
+        for endpoint in ["subscriptions", "channels"] {
+            let mut value = serde_json::json!({
+                "networks": { "mainnet": { "rpc_url": "http://rpc" } },
+                "stablecoins": [{ "symbol": "USDC", "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "token_program": "spl_token", "decimals": 6 }],
+            });
+            value[endpoint] = serde_json::json!({ "enabled": true });
+            let mut config: super::Config = serde_json::from_value(value).unwrap();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("mpp_store_url is required"),
+                "{endpoint}: {error}"
+            );
+            config.mpp_store_url = Some("redis://127.0.0.1/".into());
+            let error = config
+                .validate()
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(!error.contains("mpp_store_url"), "{endpoint}: {error}");
+        }
 
         let auditor = base64::engine::general_purpose::STANDARD.encode([1u8; 64]);
         let mut config = enabled_send_config();
