@@ -1637,7 +1637,29 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
         }
     }
 
-    let reconciliations = stream::iter(fetched_channels.into_iter().map(|(state, onchain)| {
+    // A payer close is recorded and its amount chosen atomically before any
+    // terminal transaction is planned from the record.
+    let mut reconcilable = Vec::with_capacity(fetched_channels.len());
+    for (state, onchain) in fetched_channels {
+        let state = match onchain.as_ref() {
+            Some(onchain) if onchain.channel.status == STATUS_CLOSING => {
+                let channel_id = state.channel_id.clone();
+                match fence_batch_close(&batch.store, state, onchain, now, runtime.dry_run).await {
+                    Ok(state) => state,
+                    Err(error) => {
+                        metrics.failures += 1;
+                        metrics.skipped += 1;
+                        warn!(%channel_id, %error, "failed to record batch channel close");
+                        continue;
+                    }
+                }
+            }
+            _ => state,
+        };
+        reconcilable.push((state, onchain));
+    }
+
+    let reconciliations = stream::iter(reconcilable.into_iter().map(|(state, onchain)| {
         reconcile_batch_channel(
             &runtime.rpc,
             &runtime.rpc_url,
@@ -2245,6 +2267,61 @@ async fn update_batch_settled_watermark(
         .map(|_| ())
 }
 
+/// Record the payer's close on the batch record and, unless a live
+/// reservation must finish first, freeze the amount the seal will carry.
+///
+/// Inside the grace period that is the accepted cumulative, which
+/// `settle_and_seal` redeems. Past it the program accepts no voucher, so the
+/// record is frozen only when nothing accepted is above the onchain
+/// watermark; otherwise it stays open and reconciliation refuses to seal.
+fn batch_close_transition(
+    current: Option<ChannelState>,
+    closed_at: u64,
+    onchain_settled: u64,
+    past_deadline: bool,
+    now: i64,
+) -> Result<ChannelState, StoreError> {
+    let mut state =
+        current.ok_or_else(|| StoreError::Internal("batch channel not found".into()))?;
+    state.close_requested_at.get_or_insert(closed_at);
+    if state.final_cumulative.is_none() && !state.has_blocking_authorization(now) {
+        if !past_deadline {
+            state.freeze_watermark_at(state.cumulative.max(onchain_settled));
+        } else if state.cumulative <= onchain_settled {
+            state.freeze_watermark_at(onchain_settled);
+        }
+    }
+    Ok(state)
+}
+
+async fn fence_batch_close(
+    store: &impl ChannelStore,
+    state: ChannelState,
+    onchain: &channel::DecodedChannel,
+    now: i64,
+    dry_run: bool,
+) -> Result<ChannelState, JobError> {
+    let closed_at = u64::try_from(onchain.channel.closure_started_at)
+        .ok()
+        .filter(|closed_at| *closed_at > 0)
+        .unwrap_or(now.max(0) as u64);
+    let settled = onchain.channel.settlement.settled;
+    let past_deadline = now >= onchain.close_deadline();
+    if dry_run {
+        return batch_close_transition(Some(state), closed_at, settled, past_deadline, now)
+            .map_err(|error| JobError::Config(error.to_string()));
+    }
+    store
+        .update_channel(
+            &state.channel_id,
+            Box::new(move |current| {
+                batch_close_transition(current, closed_at, settled, past_deadline, now)
+            }),
+        )
+        .await
+        .map_err(|error| JobError::Config(format!("record batch close: {error}")))
+}
+
 fn inventory_snapshot(
     redis_sealed: bool,
     onchain_status: u8,
@@ -2523,6 +2600,30 @@ async fn reconcile_batch_channel(
                 target_settled,
             )
         }
+        STATUS_CLOSING if state.final_cumulative.is_none() => {
+            if now >= onchain.close_deadline()
+                && state.cumulative > onchain.channel.settlement.settled
+            {
+                return Err(JobError::Config(format!(
+                    "batch channel {} closed with {} accepted above the settled {}; refusing to \
+                     seal below it",
+                    state.channel_id,
+                    state.cumulative - onchain.channel.settlement.settled,
+                    onchain.channel.settlement.settled
+                )));
+            }
+            // A live reservation defers the seal on both sides of the deadline.
+            return Ok(BatchReconcileResult {
+                channel_id: state_channel_id,
+                candidate: None,
+                delete_absent: false,
+                snapshot,
+                stablecoin_settled_base_units: settled_metric,
+                stablecoin_distributed_base_units: distributed_metric,
+                escrow_active: Some(true),
+                observed_settled_on_chain: Some(onchain.channel.settlement.settled),
+            });
+        }
         STATUS_CLOSING if now < onchain.close_deadline() => {
             let onchain_signer = Pubkey::from(onchain.channel.authorized_signer.to_bytes());
             let (signature, target_settled, expires_at) = close_voucher(
@@ -2573,6 +2674,15 @@ async fn reconcile_batch_channel(
             )
         }
         STATUS_CLOSING if now >= onchain.close_deadline() => {
+            if state.cumulative > onchain.channel.settlement.settled {
+                return Err(JobError::Config(format!(
+                    "batch channel {} closed with {} accepted above the settled {}; refusing to \
+                     seal below it",
+                    state.channel_id,
+                    state.cumulative - onchain.channel.settlement.settled,
+                    onchain.channel.settlement.settled
+                )));
+            }
             instructions.push(channel::build_seal_ix(&channel_id));
             let token_program = token_programs
                 .get(&onchain.mint())
@@ -5181,6 +5291,179 @@ mod tests {
             server.abort();
             assert_eq!(result.delete_absent, expected, "slot {finalized_slot}");
         }
+    }
+
+    /// A batch record and its payer-closed V1 channel with an empty payout plan.
+    fn batch_closing_fixture() -> (ChannelState, channel::DecodedChannel, Pubkey) {
+        use pay_kit::generated::payment_channels::generated::{
+            accounts::Channel, types::SettlementWatermarks,
+        };
+        let operator = Pubkey::new_unique();
+        let mut state = channel_state();
+        state.cumulative = 300;
+        state.highest_voucher_signature = Some(bs58::encode([5_u8; 64]).into_string());
+        state.highest_voucher_expires_at = Some(10_000);
+        let address = |key: &Pubkey| payment_channels::to_address(key);
+        let onchain = channel::DecodedChannel {
+            address: state.channel_id.parse().unwrap(),
+            channel: Channel {
+                discriminator: 1,
+                version: 1,
+                bump: 1,
+                status: STATUS_CLOSING,
+                salt: 0,
+                deposit: 1_000,
+                settlement: SettlementWatermarks {
+                    settled: 100,
+                    payout_watermark: 0,
+                },
+                closure_started_at: 1_000,
+                payer_withdrawn_at: 0,
+                grace_period: 100,
+                distribution_hash: payment_channels::distribution_hash(&[]),
+                payer: address(&state.payer.parse().unwrap()),
+                payee: address(&operator),
+                authorized_signer: address(&state.authorized_signer.parse().unwrap()),
+                mint: address(&Pubkey::new_unique()),
+                rent_payer: address(&operator),
+                open_slot: state.open_slot.unwrap(),
+            },
+        };
+        (state, onchain, operator)
+    }
+
+    async fn reconcile_closing_batch(
+        state: ChannelState,
+        onchain: &channel::DecodedChannel,
+        operator: &Pubkey,
+        now: i64,
+    ) -> Result<BatchReconcileResult, JobError> {
+        let rpc = RpcClient::new(Duration::from_millis(10)).unwrap();
+        let token_programs =
+            HashMap::from([(onchain.mint(), pay_api_core::ata::SPL_TOKEN_PROGRAM_ID)]);
+        reconcile_batch_channel(
+            &rpc,
+            "http://127.0.0.1:1",
+            state,
+            Some(onchain.clone()),
+            now,
+            0,
+            operator,
+            &Pubkey::new_unique(),
+            &token_programs,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn payer_close_waits_for_in_flight_batch_work_and_seals_the_frozen_watermark() {
+        let (mut state, onchain, operator) = batch_closing_fixture();
+        state
+            .pending_deliveries
+            .push(pay_kit::core::store::PendingDelivery {
+                delivery_id: "in-flight".into(),
+                amount: 50,
+                sequence: 0,
+                expires_at: 1_050,
+                request_fingerprint: None,
+                handler_succeeded: false,
+            });
+        let store = pay_kit::core::store::MemoryChannelStore::new();
+        store
+            .put_channel(&state.channel_id, state.clone())
+            .await
+            .unwrap();
+
+        // In grace with a live reservation: the close is recorded so no new
+        // work is admitted, but nothing is frozen or sealed yet.
+        let fenced = fence_batch_close(&store, state.clone(), &onchain, 1_010, false)
+            .await
+            .unwrap();
+        assert_eq!(fenced.close_requested_at, Some(1_000));
+        assert_eq!(fenced.final_cumulative, None);
+        let deferred = reconcile_closing_batch(fenced, &onchain, &operator, 1_010)
+            .await
+            .unwrap();
+        assert!(deferred.candidate.is_none());
+
+        // The handler commits its charge, then the next pass freezes and seals it.
+        store
+            .update_channel(
+                &state.channel_id,
+                Box::new(|current| {
+                    let mut state = current.unwrap();
+                    state.pending_deliveries.clear();
+                    state.cumulative = 350;
+                    Ok(state)
+                }),
+            )
+            .await
+            .unwrap();
+        let current = store.get_channel(&state.channel_id).await.unwrap().unwrap();
+        let fenced = fence_batch_close(&store, current, &onchain, 1_020, false)
+            .await
+            .unwrap();
+        assert_eq!(fenced.final_cumulative, Some(350));
+        let candidate = reconcile_closing_batch(fenced, &onchain, &operator, 1_020)
+            .await
+            .unwrap()
+            .candidate
+            .unwrap();
+        assert_eq!(candidate.kind, BatchCandidateKind::FinalizeClose);
+        assert_eq!(candidate.settled_on_chain, 350);
+    }
+
+    #[tokio::test]
+    async fn post_grace_batch_seal_refuses_to_drop_accepted_vouchers() {
+        let (state, onchain, operator) = batch_closing_fixture();
+        let store = pay_kit::core::store::MemoryChannelStore::new();
+        store
+            .put_channel(&state.channel_id, state.clone())
+            .await
+            .unwrap();
+        let past = onchain.close_deadline();
+        let fenced = fence_batch_close(&store, state.clone(), &onchain, past, false)
+            .await
+            .unwrap();
+        assert_eq!(fenced.final_cumulative, None);
+        let error = reconcile_closing_batch(fenced.clone(), &onchain, &operator, past)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("refusing to seal below"),
+            "{error}"
+        );
+        // Even a record frozen earlier in grace is never sealed below its amount.
+        let mut frozen = fenced;
+        frozen.freeze_watermark_at(300);
+        assert!(
+            reconcile_closing_batch(frozen, &onchain, &operator, past)
+                .await
+                .is_err()
+        );
+
+        // Nothing accepted above the onchain watermark: seal and distribute.
+        let mut settled = state;
+        settled.cumulative = 100;
+        let store = pay_kit::core::store::MemoryChannelStore::new();
+        store
+            .put_channel(&settled.channel_id, settled.clone())
+            .await
+            .unwrap();
+        let fenced = fence_batch_close(&store, settled, &onchain, past, false)
+            .await
+            .unwrap();
+        assert_eq!(fenced.final_cumulative, Some(100));
+        let candidate = reconcile_closing_batch(fenced, &onchain, &operator, past)
+            .await
+            .unwrap()
+            .candidate
+            .unwrap();
+        assert_eq!(candidate.kind, BatchCandidateKind::FinalizeClose);
+        assert_eq!(candidate.settled_on_chain, 100);
+        assert_eq!(candidate.instructions.len(), 2);
     }
 
     #[test]
