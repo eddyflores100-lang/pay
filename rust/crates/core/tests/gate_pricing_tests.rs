@@ -371,3 +371,67 @@ async fn selected_variant_tier_carries_its_own_splits() {
         vec![(AFFILIATE_A.to_string(), "1000000".to_string())]
     );
 }
+
+// ── Body-size tiers without Content-Length (SOLA1-82) ──────────────────────
+
+fn upload_api() -> ApiSpec {
+    spec(&std::fs::read_to_string("tests/fixtures/test-paywall.yml").unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_body_size_is_charged_at_the_large_tier() {
+    let api = upload_api();
+    assert_eq!(charge_amount(&api, "v1/upload", None).await, "100000000");
+    assert_eq!(
+        charge_amount(&api, "v1/upload", Some(1_048_577)).await,
+        "100000000"
+    );
+    assert_eq!(
+        charge_amount(&api, "v1/upload", Some(1_048_576)).await,
+        "10000000"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chunked_request_through_middleware_is_quoted_at_the_large_tier() {
+    use axum::{Router, middleware, routing::any};
+
+    let state = State {
+        apis: Arc::new(vec![upload_api()]),
+        mpp: sol_mpp(),
+    };
+    let app = Router::new()
+        .fallback(any(|| async { "protected" }))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            pay_core::server::payment::payment_middleware::<State>,
+        ))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let body = vec![b'X'; 1_048_577];
+    let chunks = futures_util::stream::once(async move { Ok::<_, std::io::Error>(body) });
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/upload"))
+        .header("host", "testapi.localhost")
+        .body(reqwest::Body::wrap_stream(chunks))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    let header = response
+        .headers()
+        .get("www-authenticate")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let charge: ChargeRequest = parse_www_authenticate(header)
+        .unwrap()
+        .request
+        .decode()
+        .unwrap();
+    assert_eq!(charge.amount, "100000000");
+    server.abort();
+}

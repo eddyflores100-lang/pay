@@ -213,7 +213,12 @@ pub fn resolve_fixed_price(
     if dimensions.is_empty() {
         return resolve_price(metering, props, variant_hint, None);
     }
-    Some(resolve_dimensions(dimensions, props, None))
+    Some(resolve_dimensions_as(
+        dimensions,
+        props,
+        None,
+        Unmeasured::Costliest,
+    ))
 }
 
 fn fixed_charge_dimensions<'a>(
@@ -238,7 +243,14 @@ fn fixed_charge_dimensions<'a>(
         .map(|variant| variant.dimensions.as_slice())
         .chain(Some(metering.dimensions.as_slice()).filter(|dims| !dims.is_empty()))
         .max_by(|a, b| {
-            let usd = |dims| per_call_usd(&resolve_dimensions(dims, props, None));
+            let usd = |dims| {
+                per_call_usd(&resolve_dimensions_as(
+                    dims,
+                    props,
+                    None,
+                    Unmeasured::Costliest,
+                ))
+            };
             usd(a).total_cmp(&usd(b))
         })
         .unwrap_or(&metering.dimensions)
@@ -828,7 +840,7 @@ pub fn resolve_split_rules<'a>(
 ) -> &'a [SplitRule] {
     fixed_charge_dimensions(metering, props, variant_hint)
         .iter()
-        .filter_map(|dimension| select_price_tier(dimension, props))
+        .filter_map(|dimension| select_tier(dimension, props, Unmeasured::Costliest))
         .map(|tier| tier.splits.as_slice())
         .find(|splits| !splits.is_empty())
         .unwrap_or(&metering.splits)
@@ -907,10 +919,31 @@ fn resolve_dimensions(
     props: &RequestProperties,
     ctx: Option<&MeteringContext>,
 ) -> ResolvedPrice {
+    resolve_dimensions_as(dimensions, props, ctx, Unmeasured::Provisional)
+}
+
+/// How a tier condition on a request property that was not measured resolves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unmeasured {
+    /// Request-time estimate later corrected by response metering; only an
+    /// unknown `body_size`, which nothing measures later, is priced
+    /// conservatively.
+    Provisional,
+    /// Fixed per-call authorization: never repriced, so any unmeasured
+    /// condition prices the costliest tier.
+    Costliest,
+}
+
+fn resolve_dimensions_as(
+    dimensions: &[MeterDimension],
+    props: &RequestProperties,
+    ctx: Option<&MeteringContext>,
+    unmeasured: Unmeasured,
+) -> ResolvedPrice {
     let resolved = dimensions
         .iter()
         .map(|dim| {
-            let price = resolve_tier(&dim.tiers, props, ctx, dim);
+            let price = resolve_tier(&dim.tiers, props, ctx, unmeasured);
             ResolvedDimension {
                 direction: format!("{:?}", dim.direction).to_lowercase(),
                 unit: format!("{:?}", dim.unit).to_lowercase(),
@@ -929,7 +962,7 @@ fn resolve_tier(
     tiers: &[PriceTier],
     props: &RequestProperties,
     ctx: Option<&MeteringContext>,
-    _dim: &MeterDimension,
+    unmeasured: Unmeasured,
 ) -> f64 {
     // If we have accounting context and tiers have up_to, resolve by cumulative usage
     let has_volume_tiers = tiers.iter().any(|t| t.up_to.is_some());
@@ -953,7 +986,7 @@ fn resolve_tier(
         return first_non_free_price(tiers);
     }
 
-    select_price_tier_from_tiers(tiers, props)
+    select_price_tier_from_tiers(tiers, props, unmeasured)
         .map(|tier| tier.price_usd)
         .unwrap_or(0.0)
 }
@@ -962,6 +995,14 @@ pub(crate) fn select_price_tier<'a>(
     dimension: &'a MeterDimension,
     props: &RequestProperties,
 ) -> Option<&'a PriceTier> {
+    select_tier(dimension, props, Unmeasured::Provisional)
+}
+
+fn select_tier<'a>(
+    dimension: &'a MeterDimension,
+    props: &RequestProperties,
+    unmeasured: Unmeasured,
+) -> Option<&'a PriceTier> {
     if dimension.tiers.iter().any(|tier| tier.up_to.is_some()) {
         return dimension
             .tiers
@@ -969,13 +1010,29 @@ pub(crate) fn select_price_tier<'a>(
             .find(|tier| tier.price_usd > 0.0)
             .or_else(|| dimension.tiers.first());
     }
-    select_price_tier_from_tiers(&dimension.tiers, props)
+    select_price_tier_from_tiers(&dimension.tiers, props, unmeasured)
 }
 
 fn select_price_tier_from_tiers<'a>(
     tiers: &'a [PriceTier],
     props: &RequestProperties,
+    unmeasured: Unmeasured,
 ) -> Option<&'a PriceTier> {
+    // A condition on a property that was not measured (e.g. a chunked body
+    // without Content-Length) must not silently select a cheaper tier.
+    let conservative = |condition: &MeterCondition| {
+        condition_property(condition, props).is_none()
+            && (unmeasured == Unmeasured::Costliest
+                || matches!(condition, MeterCondition::BodySize { .. }))
+    };
+    if tiers
+        .iter()
+        .any(|tier| tier.condition.as_ref().is_some_and(conservative))
+    {
+        return tiers
+            .iter()
+            .max_by(|a, b| a.price_usd.total_cmp(&b.price_usd));
+    }
     tiers
         .iter()
         .find(|tier| {
@@ -1010,21 +1067,31 @@ fn first_non_free_price(tiers: &[PriceTier]) -> f64 {
         .unwrap_or(0.0)
 }
 
-pub(crate) fn evaluate_condition(condition: &MeterCondition, props: &RequestProperties) -> bool {
-    let (actual, op, threshold) = match condition {
-        MeterCondition::InputTokens { op, value } => (props.input_tokens, op, *value),
-        MeterCondition::InputCharacters { op, value } => (props.input_characters, op, *value),
-        MeterCondition::ContextLength { op, value } => (props.context_length, op, *value),
-        MeterCondition::BodySize { op, value } => (props.body_size, op, *value),
-        MeterCondition::DurationSeconds { op, value } => (props.duration_seconds, op, *value),
-        MeterCondition::BatchSize { op, value } => (props.batch_size, op, *value),
-        MeterCondition::ImagePixels { op, value } => (props.image_pixels, op, *value),
-    };
+fn condition_property(condition: &MeterCondition, props: &RequestProperties) -> Option<u64> {
+    match condition {
+        MeterCondition::InputTokens { .. } => props.input_tokens,
+        MeterCondition::InputCharacters { .. } => props.input_characters,
+        MeterCondition::ContextLength { .. } => props.context_length,
+        MeterCondition::BodySize { .. } => props.body_size,
+        MeterCondition::DurationSeconds { .. } => props.duration_seconds,
+        MeterCondition::BatchSize { .. } => props.batch_size,
+        MeterCondition::ImagePixels { .. } => props.image_pixels,
+    }
+}
 
-    let actual = match actual {
-        Some(v) => v,
-        // If we don't have the property, assume the condition doesn't apply (pass)
-        None => return true,
+/// Whether `condition` holds. An unmeasured property passes (provisional).
+pub(crate) fn evaluate_condition(condition: &MeterCondition, props: &RequestProperties) -> bool {
+    let (op, threshold) = match condition {
+        MeterCondition::InputTokens { op, value }
+        | MeterCondition::InputCharacters { op, value }
+        | MeterCondition::ContextLength { op, value }
+        | MeterCondition::BodySize { op, value }
+        | MeterCondition::DurationSeconds { op, value }
+        | MeterCondition::BatchSize { op, value }
+        | MeterCondition::ImagePixels { op, value } => (op, *value),
+    };
+    let Some(actual) = condition_property(condition, props) else {
+        return true;
     };
 
     match op {
@@ -3009,5 +3076,40 @@ mod tests {
             assert_eq!(price("gpt-4-turbo"), 0.01);
             assert_eq!(price("v1/models/gpt-4o:generateContent"), 1.00);
         }
+    }
+
+    #[test]
+    fn unmeasured_condition_property_prices_the_costliest_tier() {
+        let metering = yaml_metering(
+            "dimensions:\n  - direction: usage\n    unit: requests\n    scale: 1\n    tiers:\n      - price_usd: 0.01\n        condition: {field: body_size, op: \"<=\", value: 1048576}\n      - price_usd: 0.10\n        condition: {field: body_size, op: \">\", value: 1048576}\n",
+        );
+        let price = |body_size| {
+            let props = RequestProperties {
+                body_size,
+                ..Default::default()
+            };
+            per_call_usd(&resolve_fixed_price(&metering, &props, None).unwrap())
+        };
+        assert_eq!(price(None), 0.10);
+        assert_eq!(price(Some(1_048_577)), 0.10);
+        assert_eq!(price(Some(1_048_576)), 0.01);
+        assert_eq!(price(Some(0)), 0.01);
+    }
+
+    #[test]
+    fn fixed_price_does_not_assume_unmeasured_conditions_pass() {
+        let metering = yaml_metering(
+            "dimensions:\n  - direction: usage\n    unit: requests\n    scale: 1\n    tiers:\n      - price_usd: 0.01\n        condition: {field: context_length, op: \"<=\", value: 1000}\n      - price_usd: 0.05\n        condition: {field: context_length, op: \">\", value: 1000}\n",
+        );
+        let props = RequestProperties::default();
+        assert_eq!(
+            per_call_usd(&resolve_fixed_price(&metering, &props, None).unwrap()),
+            0.05
+        );
+        // Response-repriced paths keep their provisional estimate.
+        assert_eq!(
+            per_call_usd(&resolve_price(&metering, &props, None, None).unwrap()),
+            0.01
+        );
     }
 }
