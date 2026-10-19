@@ -1032,6 +1032,33 @@ fn prepare_hardware_account(
     }
 }
 
+/// Hosted payments settle only challenges issued by the origin the caller
+/// requested; the paid retry is sent to that origin.
+fn reject_cross_origin_challenge(
+    requested_url: &str,
+    outcome: &pay_core::client::runner::RunOutcome,
+) -> Result<(), pay_core::Error> {
+    use pay_core::client::runner::RunOutcome;
+
+    let resource_url = match outcome {
+        RunOutcome::MppChallenge { resource_url, .. }
+        | RunOutcome::SessionChallenge { resource_url, .. }
+        | RunOutcome::SubscriptionChallenge { resource_url, .. }
+        | RunOutcome::X402Challenge { resource_url, .. }
+        | RunOutcome::X402UptoChallenge { resource_url, .. }
+        | RunOutcome::X402BatchChallenge { resource_url, .. }
+        | RunOutcome::X402SignInChallenge { resource_url, .. } => resource_url,
+        _ => return Ok(()),
+    };
+    if pay_core::client::fetch::same_origin(requested_url, resource_url) {
+        return Ok(());
+    }
+    Err(pay_core::Error::RequestValidation(format!(
+        "The payment challenge came from {resource_url}, not the requested origin. \
+         Request that URL directly if you intend to pay it."
+    )))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn do_paid_fetch(
     method: &str,
@@ -1108,6 +1135,9 @@ fn do_paid_fetch(
     }
 
     let outcome = fetch_request(&initial_headers)?;
+    if scope.outbound_policy == pay_core::client::fetch::OutboundPolicy::PublicInternetOnly {
+        reject_cross_origin_challenge(url, &outcome)?;
+    }
     if let Some(payment_network) = outcome.payment_network(network_override.as_deref())? {
         account_override =
             prepare_hardware_account(store, &payment_network, account_override, peer.as_ref())?;
@@ -1620,6 +1650,58 @@ fn interpret_retry(
 
 #[cfg(test)]
 mod tests {
+
+    fn x402_outcome(resource_url: &str) -> pay_core::client::runner::RunOutcome {
+        let requirements: pay_kit::x402::exact::PaymentRequirements =
+            serde_json::from_value(serde_json::json!({
+                "network": "mainnet",
+                "recipient": "11111111111111111111111111111111",
+                "amount": "1000",
+                "currency": "USDC",
+                "decimals": 6,
+                "resource": resource_url,
+            }))
+            .unwrap();
+        pay_core::client::runner::RunOutcome::X402Challenge {
+            challenge: Box::new(pay_core::client::x402::Challenge {
+                x402_version: 2,
+                requirements,
+                siwx: None,
+                extensions: None,
+            }),
+            advertised_challenges: Default::default(),
+            resource_url: resource_url.to_string(),
+        }
+    }
+
+    #[test]
+    fn hosted_payment_rejects_challenge_from_redirected_origin() {
+        let err = reject_cross_origin_challenge(
+            "https://api.example/start",
+            &x402_outcome("https://attacker.example/paid"),
+        )
+        .expect_err("cross-origin challenge must not be paid");
+        assert!(err.to_string().contains("attacker.example"), "{err}");
+    }
+
+    #[test]
+    fn hosted_payment_accepts_challenge_from_requested_origin() {
+        reject_cross_origin_challenge(
+            "https://api.example/start",
+            &x402_outcome("https://api.example/paid?x=1"),
+        )
+        .expect("same-origin challenge");
+        reject_cross_origin_challenge(
+            "https://api.example/start",
+            &pay_core::client::runner::RunOutcome::Completed {
+                exit_code: 0,
+                body: None,
+                content_type: None,
+                response_headers: vec![],
+            },
+        )
+        .expect("non-payment outcomes pass through");
+    }
     use super::*;
 
     #[test]
