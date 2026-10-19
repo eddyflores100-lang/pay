@@ -1007,10 +1007,7 @@ fn is_transfer_ix(ix: &Value) -> bool {
         .and_then(Value::as_str)
         .unwrap_or("");
     if program == SPL_TOKEN_PROGRAM || program == TOKEN_2022_PROGRAM {
-        return matches!(
-            kind,
-            "transfer" | "transferChecked" | "mintTo" | "mintToChecked"
-        );
+        return matches!(kind, "transfer" | "transferChecked");
     }
     if program == SYSTEM_PROGRAM {
         return matches!(kind, "transfer" | "transferChecked");
@@ -1119,11 +1116,9 @@ fn extract_token_transfers(
             Some(value) => value,
             None => continue,
         };
+        // Issuance (`mintTo*`) debits no payer, so it is never a payment.
         let kind = parsed.get("type").and_then(Value::as_str).unwrap_or("");
-        if !matches!(
-            kind,
-            "transfer" | "transferChecked" | "mintTo" | "mintToChecked"
-        ) {
+        if !matches!(kind, "transfer" | "transferChecked") {
             continue;
         }
         let info = match parsed.get("info") {
@@ -2681,6 +2676,42 @@ mod tests {
             assert_eq!(session.events[0].kind, "deposit");
             assert_eq!(session.payer.as_deref(), Some("PayerWallet"));
             assert_eq!(session.channel_status, Some(WireChannelStatus::Open));
+        }
+    }
+
+    #[test]
+    fn minting_with_a_memo_is_not_an_x402_payment() {
+        let mint = "AttackerMint1111111111111111111111111111111";
+        for kind in ["mintTo", "mintToChecked"] {
+            for program in [SPL_TOKEN_PROGRAM, TOKEN_2022_PROGRAM] {
+                let receipt = parse(json!({
+                    "meta": {
+                        "err": null, "fee": 5000, "innerInstructions": [],
+                        "postTokenBalances": [owner_balance(1, "Attacker", "123456")]
+                    },
+                    "transaction": {"message": {
+                        "accountKeys": ["Attacker", "AttackerATA"],
+                        "instructions": [
+                            {"programId": program, "program": "spl-token", "parsed": {
+                                "type": kind,
+                                "info": {
+                                    "account": "AttackerATA",
+                                    "mint": mint,
+                                    "mintAuthority": "Attacker",
+                                    "tokenAmount": {"amount": "123456", "decimals": 6}
+                                }
+                            }},
+                            {"programId": MEMO_PROGRAM, "program": "spl-memo", "parsed": "proof"}
+                        ]
+                    }}
+                }));
+                assert!(
+                    matches!(receipt.intent.kind, ReceiptIntentKind::Transfer),
+                    "{kind}"
+                );
+                assert!(receipt.transfers.is_empty(), "{kind}");
+                assert!(receipt.total.is_none(), "{kind}");
+            }
         }
     }
 
