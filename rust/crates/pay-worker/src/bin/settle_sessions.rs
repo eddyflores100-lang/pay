@@ -1164,8 +1164,11 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
         .filter(|candidate| candidate.kind == CandidateKind::IdleClose)
         .count();
     let watermark_planned = planned.saturating_sub(idle_close_planned);
+    // A V1 cluster must not be held to V0's size: a V2 close with hooks and
+    // splits does not fit 1232 bytes.
+    let accepted_versions = accepted_tx_versions(&runtime.rpc_url).await;
     let handle = spawn(
-        SettlementConfig::new(runtime.operator, Arc::clone(&runtime.signer)),
+        settlement_config(runtime, pay_kit::core::tx::highest(&accepted_versions)),
         Arc::new(RpcBroadcaster::new(runtime.rpc_url.clone())),
     );
     let mut submissions = JoinSet::new();
@@ -1283,8 +1286,8 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
                     .latest_blockhash()
                     .await
                     .map_err(|e| e.to_string())?;
-                let mut transaction = pay_kit::core::tx::build_unsigned(
-                    pay_kit::core::tx::TxVersion::V0,
+                let mut transaction = pay_kit::core::tx::build_unsigned_fitting(
+                    &accepted_versions,
                     &runtime.operator,
                     &candidate.instructions,
                     blockhash,
@@ -1765,27 +1768,8 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
     let pipeline = TxPipeline::new(runtime.rpc_url.clone(), TxPipelineConfig::default());
     // Version 1 when the cluster gate is active: 18 voucher settlements per
     // flush transaction instead of 4.
-    let tx_version = {
-        let rpc_url = runtime.rpc_url.clone();
-        tokio::task::spawn_blocking(move || {
-            pay_kit::core::tx::highest(
-                &pay_kit::core::tx::TxV1Mode::Auto
-                    .resolve(&pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient::new(rpc_url)),
-            )
-        })
-        .await
-        .unwrap_or(pay_kit::core::tx::TxVersion::V0)
-    };
-    let mut settlement_config =
-        SettlementConfig::new(runtime.operator, Arc::clone(&runtime.signer))
-            .with_tx_version(tx_version);
-    if tx_version == pay_kit::core::tx::TxVersion::V1 {
-        // Fifteen distribution settlements can introduce 67 distinct static
-        // accounts. Keep V1 enabled, but cap this heterogeneous workload below
-        // its 64-account ceiling until pay-kit packs against compiled messages.
-        settlement_config.max_voucher_settlements_per_tx =
-            settlement_config.max_voucher_settlements_per_tx.min(14);
-    }
+    let tx_version = pay_kit::core::tx::highest(&accepted_tx_versions(&runtime.rpc_url).await);
+    let settlement_config = settlement_config(runtime, tx_version);
     let handle = spawn(
         settlement_config,
         Arc::new(RpcBroadcaster::with_pipeline(pipeline.clone())),
@@ -1918,6 +1902,32 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
     metrics.duration_seconds = started_at.elapsed().as_secs_f64();
     lock.release().await;
     Ok(metrics)
+}
+
+/// Transaction versions the cluster accepts (`enable_tx_v1` probed once).
+async fn accepted_tx_versions(rpc_url: &str) -> Vec<pay_kit::core::tx::TxVersion> {
+    let rpc_url = rpc_url.to_owned();
+    tokio::task::spawn_blocking(move || {
+        pay_kit::core::tx::TxV1Mode::Auto
+            .resolve(&pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient::new(rpc_url))
+    })
+    .await
+    .unwrap_or_else(|_| vec![pay_kit::core::tx::TxVersion::V0])
+}
+
+fn settlement_config(
+    runtime: &SettlementRuntime,
+    tx_version: pay_kit::core::tx::TxVersion,
+) -> SettlementConfig {
+    let mut config = SettlementConfig::new(runtime.operator, Arc::clone(&runtime.signer))
+        .with_tx_version(tx_version);
+    if tx_version == pay_kit::core::tx::TxVersion::V1 {
+        // Fifteen distribution settlements can introduce 67 distinct static
+        // accounts. Keep V1 enabled, but cap this heterogeneous workload below
+        // its 64-account ceiling until pay-kit packs against compiled messages.
+        config.max_voucher_settlements_per_tx = config.max_voucher_settlements_per_tx.min(14);
+    }
+    config
 }
 
 fn log_summary(metrics: &SettleSessionsMetrics) {
@@ -5675,6 +5685,81 @@ mod tests {
         assert_eq!(candidate.kind, BatchCandidateKind::FinalizeClose);
         assert_eq!(candidate.settled_on_chain, 100);
         assert_eq!(candidate.instructions.len(), 3);
+    }
+
+    fn test_runtime() -> SettlementRuntime {
+        let signer: Arc<dyn TransactionSigner> = Arc::new(
+            pay_kit::mpp::solana_keychain::MemorySigner::from_bytes(&[
+                7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+                7, 7, 7, 7, 234, 74, 108, 99, 226, 156, 82, 10, 190, 245, 80, 123, 19, 46, 197,
+                249, 149, 71, 118, 174, 190, 190, 123, 146, 66, 30, 234, 105, 20, 70, 210, 44,
+            ])
+            .unwrap(),
+        );
+        SettlementRuntime {
+            session: None,
+            batch: None,
+            dry_run: false,
+            lock_ttl: 300,
+            network: "localnet".into(),
+            rpc_url: "http://127.0.0.1:1".into(),
+            treasury_owner: Pubkey::new_unique(),
+            rpc: RpcClient::new(Duration::from_secs(1)).unwrap(),
+            operator: signer.pubkey(),
+            signer,
+            confirm_timeout: Duration::from_secs(1),
+            resource_cleaner: ResourceCleaner::default(),
+            resource_cleanup_interval: Duration::from_secs(1),
+            resource_cleanup_quiet: Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn session_settlement_builds_with_the_cluster_version() {
+        use pay_kit::core::tx::TxVersion;
+        let runtime = test_runtime();
+        let v1 = settlement_config(&runtime, TxVersion::V1);
+        assert_eq!(v1.tx_version, TxVersion::V1);
+        assert!(v1.max_voucher_settlements_per_tx <= 14);
+        let v0 = settlement_config(&runtime, TxVersion::V0);
+        assert_eq!(v0.tx_version, TxVersion::V0);
+        assert_eq!(
+            v0.max_voucher_settlements_per_tx,
+            SettlementConfig::new(runtime.operator, runtime.signer.clone())
+                .max_voucher_settlements_per_tx
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_cluster_resolves_to_version_zero_only() {
+        use pay_kit::core::tx::TxVersion;
+        assert_eq!(
+            accepted_tx_versions("http://127.0.0.1:1").await,
+            vec![TxVersion::V0]
+        );
+    }
+
+    #[test]
+    fn a_close_too_large_for_version_zero_builds_on_a_v1_cluster() {
+        use pay_kit::core::tx::{TxVersion, build_unsigned_fitting};
+        let operator = Pubkey::new_unique();
+        // A hooked, split close exceeds V0's 1232 bytes but fits V1.
+        let close = solana_instruction::Instruction {
+            program_id: payment_channels::to_address(&payment_channels::default_program_id()),
+            accounts: vec![],
+            data: vec![0; 1_300],
+        };
+        let build = |accepted: &[TxVersion]| {
+            build_unsigned_fitting(
+                accepted,
+                &operator,
+                std::slice::from_ref(&close),
+                solana_hash::Hash::default(),
+                None,
+            )
+        };
+        assert!(build(&[TxVersion::V0]).is_err());
+        assert!(build(&[TxVersion::V0, TxVersion::V1]).is_ok());
     }
 
     #[test]
