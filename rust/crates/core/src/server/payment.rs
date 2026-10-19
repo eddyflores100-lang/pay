@@ -458,11 +458,29 @@ async fn prepare_metered_request_body(
                 .body(Body::from(r#"{"error":"request_body_too_large"}"#))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         })?;
+    if has_padded_model(&bytes) {
+        // Pricing, the upstream, and seller accounting must all see one model
+        // identity; reject rather than normalize it for pricing only.
+        return Err(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"error":"invalid_model","message":"model must not have leading or trailing whitespace"}"#,
+            ))
+            .unwrap_or_else(|_| StatusCode::BAD_REQUEST.into_response()));
+    }
     let (variant, bytes) = prepare_metered_json_body(&bytes, force_stream_usage);
     if force_stream_usage && let Ok(content_length) = bytes.len().to_string().parse() {
         parts.headers.insert(header::CONTENT_LENGTH, content_length);
     }
     Ok((Request::from_parts(parts, Body::from(bytes)), variant))
+}
+
+fn has_padded_model(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|json| json.get("model")?.as_str().map(|m| m.trim() != m))
+        .unwrap_or(false)
 }
 
 fn prepare_metered_json_body(body: &[u8], force_stream_usage: bool) -> (Option<String>, Vec<u8>) {
@@ -1345,6 +1363,36 @@ apis:
         assert_eq!(json["model"], "premium");
         assert_eq!(json["messages"], serde_json::json!([]));
         assert_eq!(json["stream_options"]["include_usage"], true);
+    }
+
+    #[tokio::test]
+    async fn metered_body_rejects_whitespace_padded_model() {
+        let request = |body: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        for padded in [
+            r#"{"model":" fast ","messages":[]}"#,
+            r#"{"model":"fast\n","messages":[]}"#,
+            r#"{"model":"\tfast","messages":[]}"#,
+        ] {
+            let response = prepare_metered_request_body(request(padded), false)
+                .await
+                .expect_err("padded model must be rejected");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let (_, variant) = prepare_metered_request_body(request(r#"{"model":"fast"}"#), false)
+            .await
+            .unwrap();
+        assert_eq!(variant.as_deref(), Some("fast"));
+        let (_, variant) = prepare_metered_request_body(request(r#"{"messages":[]}"#), false)
+            .await
+            .unwrap();
+        assert_eq!(variant, None);
     }
 
     #[test]

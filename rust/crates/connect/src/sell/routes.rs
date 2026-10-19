@@ -957,7 +957,7 @@ async fn dispatch(
                 return openai_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_request",
-                    &format!("request body is not JSON: {error}"),
+                    &format!("invalid request body: {error}"),
                 );
             }
         };
@@ -1022,6 +1022,13 @@ fn admission_for(sale: &SellInference, body: &[u8]) -> Result<Admission, serde_j
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_string);
+    // The gate prices this exact model string; never let accounting resolve
+    // a different rate for a whitespace variant of it.
+    if model.as_deref().is_some_and(|m| m.trim() != m) {
+        return Err(serde::de::Error::custom(
+            "model must not have leading or trailing whitespace",
+        ));
+    }
     let pricing = sale.pricing.clone();
     Ok(Admission {
         expected_usd: pricing.max_usd(),
@@ -1068,7 +1075,7 @@ async fn chat_completions(
                     return openai_error(
                         StatusCode::BAD_REQUEST,
                         "invalid_request",
-                        &format!("request body is not JSON: {error}"),
+                        &format!("invalid request body: {error}"),
                     );
                 }
             };
@@ -1545,6 +1552,41 @@ mod tests {
             assert_eq!(state.registry.get(&id).unwrap().queue.depth(), (0, 0));
             assert_eq!(state.registry.get(&id).unwrap().pending_usd(), 0.0);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn whitespace_padded_model_is_refused_before_admission() {
+        let state = state();
+        let app = router(state.clone());
+        let (id, token) = create_endpoint(
+            &app,
+            json!({
+                "pricing": { "per_token": {
+                    "default": { "in": 1.0, "out": 1.0 },
+                    "models": { "fast": { "in": 0.1, "out": 0.1 } },
+                    "max_usd": 0.25 } },
+                "model": "agent",
+                "network": "devnet",
+                "earn_cap_usd": 0.25
+            }),
+        )
+        .await;
+
+        let response = buyer(&state, &id, json!({ "model": " fast ", "messages": [] })).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let entry = state.registry.get(&id).unwrap();
+        assert_eq!(entry.queue.depth(), (0, 0));
+        assert_eq!(entry.pending_usd(), 0.0);
+        let (_, _, view) = send(
+            &app,
+            Method::GET,
+            &format!("/v1/endpoints/{id}"),
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(view["earned_usd"], 0.0);
+        assert_eq!(view["closed"], false);
     }
 
     #[tokio::test(flavor = "multi_thread")]
