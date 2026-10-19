@@ -348,6 +348,13 @@ pub async fn prepare_upstream_with_identity(
         .map(|pq| pq.as_str())
         .unwrap_or(uri.path());
 
+    if crate::server::gate::has_dot_segment(uri.path()) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "Invalid request path",
+        ));
+    }
+
     let routing = resolve_routing(api, uri.path());
 
     // Respond mode — no upstream call.
@@ -3652,5 +3659,43 @@ mod tests {
             std::env::remove_var("_TEST_OAUTH_CACHE_SECRET_A");
             std::env::remove_var("_TEST_OAUTH_CACHE_SECRET_B");
         }
+    }
+
+    #[tokio::test]
+    async fn forward_request_rejects_encoded_dot_segments_before_upstream() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                uri.path().to_string()
+            }
+        });
+        let (base_url, _handle) = spawn_upstream(app).await;
+        let api = ApiSpec {
+            routing: RoutingConfig::Proxy {
+                url: base_url,
+                path_rewrites: vec![],
+                auth: None,
+            },
+            ..make_api("test")
+        };
+
+        for path in ["/v1/%2e%2e", "/v1/%2E%2E/admin", "/v1/../admin"] {
+            let uri: Uri = path.parse().unwrap();
+            let err = forward_request(&api, Method::GET, &uri, &HeaderMap::new(), Bytes::new())
+                .await
+                .unwrap_err();
+            assert_eq!(err.status(), StatusCode::BAD_REQUEST, "{path}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        let uri: Uri = "/v1/item.json".parse().unwrap();
+        let resp = forward_request(&api, Method::GET, &uri, &HeaderMap::new(), Bytes::new())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"/v1/item.json");
     }
 }

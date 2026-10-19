@@ -1800,7 +1800,13 @@ mod tests {
         .unwrap();
         let gate = Http402Gate::new(BodySigningState { apis: vec![] }, "127.0.0.1:1")
             .with_deployment_policy_resolver(Some(std::sync::Arc::new(resolver)));
-        for path in ["//foo", "///foo?x=1", "//.well-known/test"] {
+        for path in [
+            "//foo",
+            "///foo?x=1",
+            "//.well-known/test",
+            "/v1/%2e%2e",
+            "/v1/%2E%2E/admin?x=1",
+        ] {
             let (mut session, mut client) = request_session(path).await;
             let mut ctx = gate.new_ctx();
             assert!(gate.request_filter(&mut session, &mut ctx).await.unwrap());

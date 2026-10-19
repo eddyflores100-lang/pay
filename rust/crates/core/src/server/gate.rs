@@ -56,13 +56,23 @@ pub const MAX_BATCH_CACHED_RESPONSE_BYTES: usize = 1024 * 1024;
 /// Convert a wire path to the gate's static-route convention without collapsing
 /// distinct upstream paths. Reject ambiguous paths before policy resolution.
 pub fn gate_path(path: &str) -> Result<&str, GateResponse> {
-    if path.starts_with("//") {
+    if path.starts_with("//") || has_dot_segment(path) {
         return Err(GateResponse::json(
             StatusCode::BAD_REQUEST,
             Bytes::from_static(br#"{"error":"invalid_request_path"}"#),
         ));
     }
     Ok(path.strip_prefix('/').unwrap_or(path))
+}
+
+/// Whether `path` has a `.` or `..` segment in any spelling (including
+/// percent-encoded dots). URL parsers resolve these before the upstream sees
+/// the request, so the matched endpoint and the forwarded path would differ.
+pub fn has_dot_segment(path: &str) -> bool {
+    path.split('/').any(|segment| {
+        let decoded = segment.replace("%2e", ".").replace("%2E", ".");
+        decoded == "." || decoded == ".."
+    })
 }
 
 /// Everything the gate needs from a request. No body — the decision is made
@@ -2689,6 +2699,39 @@ mod tests {
     // Ceiling $0.10 at 6 decimals == 100_000 base units (USDC).
     const CEILING_USD: f64 = 0.10;
     const CEILING_BASE: u64 = 100_000;
+
+    #[test]
+    fn gate_path_rejects_dot_segments_in_every_spelling() {
+        for path in [
+            "/v1/%2e%2e",
+            "/v1/%2E%2E/admin",
+            "/v1/.%2e/admin",
+            "/v1/%2e./admin",
+            "/v1/%2e",
+            "/v1/../admin",
+            "/v1/./x",
+            "/..",
+        ] {
+            let response = gate_path(path).expect_err(path);
+            assert_eq!(response.status, StatusCode::BAD_REQUEST, "{path}");
+        }
+    }
+
+    #[test]
+    fn gate_path_accepts_dots_inside_segments() {
+        for (path, expected) in [
+            ("/v1/file.json", "v1/file.json"),
+            ("/v1/%2e%2efoo", "v1/%2e%2efoo"),
+            ("/v1/...", "v1/..."),
+            (
+                "/.well-known/pay-skills.json",
+                ".well-known/pay-skills.json",
+            ),
+            ("/", ""),
+        ] {
+            assert_eq!(gate_path(path).ok(), Some(expected), "{path}");
+        }
+    }
 
     /// A client that lost a successful batch response gets the payment result
     /// back, not a conflict.
