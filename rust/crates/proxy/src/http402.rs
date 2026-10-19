@@ -305,8 +305,13 @@ impl<S: PaymentState> Http402Gate<S> {
         resp: axum::response::Response,
     ) -> pingora::Result<()> {
         let served_ok = resp.status().is_success();
-        let extra = self.drain_payment_headers(ctx, served_ok).await;
-        write_axum_response(session, resp, extra).await
+        match self
+            .drain_payment_headers_with_response(ctx, served_ok, None, &HeaderMap::new(), None)
+            .await
+        {
+            Ok(extra) => write_axum_response(session, resp, extra).await,
+            Err(extra) => write_axum_response(session, batch_commit_failed_response(), extra).await,
+        }
     }
 
     /// Settle/refund pending payment side-effects and collect the headers that
@@ -320,10 +325,17 @@ impl<S: PaymentState> Http402Gate<S> {
         ctx: &mut Ctx,
         served_ok: bool,
     ) -> Vec<(HeaderName, HeaderValue)> {
-        self.drain_payment_headers_with_response(ctx, served_ok, None, &HeaderMap::new(), None)
+        match self
+            .drain_payment_headers_with_response(ctx, served_ok, None, &HeaderMap::new(), None)
             .await
+        {
+            Ok(extra) | Err(extra) => extra,
+        }
     }
 
+    /// `Err` means a served batch authorization failed to commit: the caller
+    /// must replace the successful response with an error. The returned headers
+    /// (e.g. an x402 `exact` receipt) still ride that error response.
     async fn drain_payment_headers_with_response(
         &self,
         ctx: &mut Ctx,
@@ -331,8 +343,9 @@ impl<S: PaymentState> Http402Gate<S> {
         response_status: Option<StatusCode>,
         response_headers: &HeaderMap,
         response_body: Option<&[u8]>,
-    ) -> Vec<(HeaderName, HeaderValue)> {
+    ) -> Result<Vec<(HeaderName, HeaderValue)>, Vec<(HeaderName, HeaderValue)>> {
         let mut extra: Vec<(HeaderName, HeaderValue)> = Vec::new();
+        let mut batch_committed = true;
         if !served_ok {
             // Dropping the forwarded session drops its capacity lease. Keep
             // this in the shared terminal-path drain so request buffering,
@@ -347,8 +360,8 @@ impl<S: PaymentState> Http402Gate<S> {
         {
             extra.push((n, v));
         }
-        if let Some(pending) = ctx.batch.take()
-            && let Some((n, v)) = settle_batch(
+        if let Some(pending) = ctx.batch.take() {
+            match settle_batch(
                 &self.state,
                 pending,
                 served_ok,
@@ -358,8 +371,14 @@ impl<S: PaymentState> Http402Gate<S> {
                     .map(|(status, body)| batch_cached_response(status, response_headers, body)),
             )
             .await
-        {
-            extra.push((n, v));
+            {
+                Ok(Some(header)) => extra.push(header),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(%error, "x402 batch commit failed; withholding response");
+                    batch_committed = false;
+                }
+            }
         }
         if let Some(receipt) = ctx.receipt.take() {
             extra.extend(receipt.headers);
@@ -368,7 +387,11 @@ impl<S: PaymentState> Http402Gate<S> {
             }
         }
         ctx.logged_payment_headers.extend(extra.iter().cloned());
-        extra
+        if batch_committed {
+            Ok(extra)
+        } else {
+            Err(extra)
+        }
     }
 
     async fn settle_pending_upto(
@@ -593,7 +616,8 @@ impl<S: PaymentState> Http402Gate<S> {
                     &response_headers,
                     None,
                 )
-                .await;
+                .await
+                .map_err(|_| batch_commit_failed_error())?;
             self.stream_buffered_upstream(session, ctx, status, response_headers, upstream, extra)
                 .await?;
             tracing::debug!(
@@ -649,7 +673,7 @@ impl<S: PaymentState> Http402Gate<S> {
                 }
             }
         }
-        let extra = self
+        match self
             .drain_payment_headers_with_response(
                 ctx,
                 status.is_success(),
@@ -657,8 +681,13 @@ impl<S: PaymentState> Http402Gate<S> {
                 &response_headers,
                 Some(&body),
             )
-            .await;
-        write_buffered_response(session, status, response_headers, body, extra).await?;
+            .await
+        {
+            Ok(extra) => {
+                write_buffered_response(session, status, response_headers, body, extra).await?
+            }
+            Err(extra) => write_batch_commit_failed(session, extra).await?,
+        }
         tracing::debug!(path, "served via buffered proxy path");
         Ok(true)
     }
@@ -844,7 +873,7 @@ impl<S: PaymentState> Http402Gate<S> {
                 }
             }
         }
-        let extra = self
+        match self
             .drain_payment_headers_with_response(
                 ctx,
                 status.is_success(),
@@ -852,8 +881,11 @@ impl<S: PaymentState> Http402Gate<S> {
                 &headers,
                 Some(&body),
             )
-            .await;
-        write_buffered_response(session, status, headers, body, extra).await
+            .await
+        {
+            Ok(extra) => write_buffered_response(session, status, headers, body, extra).await,
+            Err(extra) => write_batch_commit_failed(session, extra).await,
+        }
     }
 }
 
@@ -1177,9 +1209,19 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         if let Some(pending) = ctx.batch.take() {
             let served_ok = upstream_response.status.is_success();
             if served_ok {
-                if let Some((name, value)) = commit_batch(&self.state, &pending).await {
-                    let _ = upstream_response.insert_header(name.clone(), value.clone());
-                    ctx.logged_payment_headers.push((name, value));
+                match commit_batch(&self.state, &pending).await {
+                    Ok(Some((name, value))) => {
+                        let _ = upstream_response.insert_header(name.clone(), value.clone());
+                        ctx.logged_payment_headers.push((name, value));
+                    }
+                    Ok(None) => {}
+                    // Headers are not yet sent: fail the request instead of
+                    // releasing an unpaid response. The handler-succeeded
+                    // authorization is retained for a resumed commit.
+                    Err(error) => {
+                        tracing::error!(%error, "x402 batch commit failed; withholding response");
+                        return Err(batch_commit_failed_error());
+                    }
                 }
                 if let Some(capture) = BatchResponseCapture::start(
                     upstream_response.status,
@@ -1601,6 +1643,37 @@ async fn write_buffered_response(
 /// Write a gate-produced [`GateResponse`] (402 challenge, 404, receipt JSON, …)
 /// directly to the downstream and stop. Duplicate `WWW-Authenticate` lines are
 /// preserved via `append_header`.
+fn batch_commit_failed_error() -> Box<pingora::Error> {
+    pingora::Error::explain(
+        pingora::ErrorType::HTTPStatus(502),
+        "x402 batch payment commitment failed",
+    )
+}
+
+fn batch_commit_failed_response() -> axum::response::Response {
+    axum::response::Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(BATCH_COMMIT_FAILED_BODY))
+        .expect("static response must build")
+}
+
+const BATCH_COMMIT_FAILED_BODY: &[u8] = b"{\"error\":\"payment_commit_failed\"}";
+
+async fn write_batch_commit_failed(
+    session: &mut Session,
+    extra: Vec<(HeaderName, HeaderValue)>,
+) -> pingora::Result<()> {
+    write_buffered_response(
+        session,
+        StatusCode::BAD_GATEWAY,
+        HeaderMap::new(),
+        Bytes::from_static(BATCH_COMMIT_FAILED_BODY),
+        extra,
+    )
+    .await
+}
+
 async fn write_gate_response(session: &mut Session, r: GateResponse) -> pingora::Result<()> {
     // An unread request body breaks HTTP/1.1 keepalive on a short-circuit.
     let _ = session.drain_request_body().await;
@@ -1660,6 +1733,10 @@ async fn write_axum_response(
     session.write_response_body(Some(body), true).await?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "http402_batch_commit_tests.rs"]
+mod batch_commit_tests;
 
 #[cfg(test)]
 mod tests {

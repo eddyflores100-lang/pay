@@ -5372,7 +5372,10 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64 0.22.1",
+ "bs58",
  "bytes",
+ "ed25519-dalek",
  "futures-util",
  "http 1.5.0",
  "pay-core",
@@ -5382,6 +5385,7 @@ dependencies = [
  "rustls",
  "serde_json",
  "solana-pay-kit",
+ "solana-pubkey 3.0.0",
  "tokio",
  "tracing",
 ]

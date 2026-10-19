@@ -2025,31 +2025,30 @@ fn is_replayable_batch_response_header(name: &HeaderName) -> bool {
 /// No on-chain transaction is involved for a steady-state voucher — the
 /// operator redeems accumulated vouchers in batches out of band. A `deposit`
 /// broadcasts its `open`/`top_up` here, which is why this can fail after the
-/// resource was already served; that loss is logged, not surfaced.
+/// resource was already served. A failed commit is returned as `Err`; the
+/// adapter must withhold the successful response, and the handler-succeeded
+/// authorization is retained (not released) so a retry can only resume it.
 pub async fn settle_batch<S: PaymentState>(
     state: &S,
     forward: BatchForward,
     served_ok: bool,
     cached: Option<pay_kit::core::store::CachedUpstreamResponse>,
-) -> Option<(HeaderName, HeaderValue)> {
+) -> Result<Option<(HeaderName, HeaderValue)>, String> {
     if !served_ok {
         release_batch(state, forward).await;
-        return None;
+        return Ok(None);
     }
-    let header = commit_batch(state, &forward).await;
-    if let Some(cached) = cached {
-        cache_batch_response(state, &forward, cached).await;
-    }
-    header
+    settle_batch_confirmed(state, forward, cached).await
 }
 
 /// Commit a successfully served batch authorization while retaining its
 /// outcome long enough for a streaming adapter to cache the completed body.
+/// `Err` means the charge is unconfirmed and the response must not be released.
 pub async fn commit_batch<S: PaymentState>(
     state: &S,
     forward: &BatchForward,
-) -> Option<(HeaderName, HeaderValue)> {
-    commit_batch_result(state, forward).await.ok().flatten()
+) -> Result<Option<(HeaderName, HeaderValue)>, String> {
+    commit_batch_result(state, forward).await
 }
 
 /// Keep confirmed charging distinct from optional receipt encoding.
