@@ -1047,7 +1047,7 @@ pub(crate) async fn approve_with_privy(
             "This server does not offer Privy login.",
         )
     })?;
-    let identity = privy.verify(token).map_err(|why| {
+    let identity = privy.authenticate(token).await.map_err(|why| {
         tracing::info!(%why, "privy access token refused");
         ApiError::new(
             StatusCode::UNAUTHORIZED,

@@ -19,10 +19,14 @@
 //! `PRIVY_SIGNER_ID` (that key's quorum id), optionally `PRIVY_POLICY_ID`,
 //! `PRIVY_API_BASE_URL`, and one of `PRIVY_VERIFICATION_KEY` (a single PEM,
 //! `\n` escapes accepted) or `PRIVY_JWKS_URL` (default: the app's JWKS at
-//! auth.privy.io, fetched once at startup; it can hold several keys during
-//! a rotation).
+//! auth.privy.io; it can hold several keys during a rotation). The JWKS is
+//! refetched every few minutes and replaced wholesale, so a key Privy
+//! retires stops verifying; keys that cannot be refreshed for an hour stop
+//! verifying too.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -41,6 +45,12 @@ pub const API_BASE_ENV: &str = "PRIVY_API_BASE_URL";
 const DEFAULT_API_BASE: &str = "https://api.privy.io/v1";
 /// `iss` of every Privy access token.
 const ISSUER: &str = "privy.io";
+/// How old a fetched JWKS may get before a sign-in refetches it.
+const JWKS_REFRESH_AFTER: Duration = Duration::from_secs(5 * 60);
+/// Least time between refetches, so unknown `kid`s cannot hammer Privy.
+const JWKS_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// Beyond this age without a successful refetch the keys are not trusted.
+const JWKS_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone)]
 pub struct Config {
@@ -147,6 +157,13 @@ pub enum PrivyError {
 /// The app's ES256 public keys, by `kid` when the JWKS names one.
 struct Keys(Vec<(Option<String>, jsonwebtoken::DecodingKey)>);
 
+/// The verification keys in force and when they were last confirmed.
+struct KeySet {
+    keys: Keys,
+    /// When the JWKS was fetched; `None` for a configured PEM.
+    fetched_at: Option<Instant>,
+}
+
 #[derive(Deserialize)]
 struct Jwks {
     keys: Vec<Jwk>,
@@ -197,6 +214,10 @@ impl Keys {
     }
 
     /// The keys to try for a token: the one its `kid` names, else all.
+    fn knows(&self, kid: Option<&str>) -> bool {
+        kid.is_some_and(|kid| self.0.iter().any(|(k, _)| k.as_deref() == Some(kid)))
+    }
+
     fn candidates(&self, kid: Option<&str>) -> Vec<&jsonwebtoken::DecodingKey> {
         let named: Vec<_> = self
             .0
@@ -216,7 +237,12 @@ impl Keys {
 pub struct Privy {
     cfg: Config,
     http: reqwest::Client,
-    keys: Keys,
+    keys: RwLock<Arc<KeySet>>,
+    /// Serializes JWKS refetches and remembers the last attempt.
+    refresh: tokio::sync::Mutex<Option<Instant>>,
+    refresh_after: Duration,
+    retry_after: Duration,
+    max_age: Duration,
     validation: jsonwebtoken::Validation,
 }
 
@@ -227,13 +253,14 @@ impl Privy {
             .verification_key
             .clone()
             .ok_or(ConfigError::Missing(VERIFICATION_KEY_ENV))?;
-        Self::with_keys(cfg, Keys::from_pem(&pem)?)
+        Self::with_keys(cfg, Keys::from_pem(&pem)?, None)
     }
 
-    /// A client verifying with the keys in a JWKS document.
+    /// A client verifying with the keys in a JWKS document fetched now, and
+    /// refetching it from `cfg.jwks_url` as it ages.
     pub fn with_jwks(cfg: Config, jwks: &str) -> Result<Self, ConfigError> {
         let keys = Keys::from_jwks(&cfg.jwks_url, jwks)?;
-        Self::with_keys(cfg, keys)
+        Self::with_keys(cfg, keys, Some(Instant::now()))
     }
 
     /// The client for this configuration: the PEM when there is one,
@@ -242,24 +269,15 @@ impl Privy {
         if cfg.verification_key.is_some() {
             return Self::new(cfg);
         }
-        let url = cfg.jwks_url.clone();
-        let body = reqwest::get(&url)
-            .await
-            .and_then(|r| r.error_for_status())
-            .map_err(|e| ConfigError::Jwks {
-                url: url.clone(),
-                why: e.to_string(),
-            })?
-            .text()
-            .await
-            .map_err(|e| ConfigError::Jwks {
-                url: url.clone(),
-                why: e.to_string(),
-            })?;
+        let body = fetch_jwks(&reqwest::Client::new(), &cfg.jwks_url).await?;
         Self::with_jwks(cfg, &body)
     }
 
-    fn with_keys(cfg: Config, keys: Keys) -> Result<Self, ConfigError> {
+    fn with_keys(
+        cfg: Config,
+        keys: Keys,
+        fetched_at: Option<Instant>,
+    ) -> Result<Self, ConfigError> {
         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::ES256);
         validation.set_issuer(&[ISSUER]);
         validation.set_audience(&[cfg.app_id.as_str()]);
@@ -272,13 +290,62 @@ impl Privy {
         Ok(Self {
             cfg,
             http,
-            keys,
+            keys: RwLock::new(Arc::new(KeySet { keys, fetched_at })),
+            refresh: tokio::sync::Mutex::new(None),
+            refresh_after: JWKS_REFRESH_AFTER,
+            retry_after: JWKS_RETRY_AFTER,
+            max_age: JWKS_MAX_AGE,
             validation,
         })
     }
 
     pub fn key_count(&self) -> usize {
-        self.keys.0.len()
+        self.key_set().keys.0.len()
+    }
+
+    fn key_set(&self) -> Arc<KeySet> {
+        self.keys.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Verify a token against keys refreshed from the JWKS when they have
+    /// aged or do not name the token's `kid`.
+    pub async fn authenticate(&self, access_token: &str) -> Result<Identity, String> {
+        let kid = jsonwebtoken::decode_header(access_token.trim())
+            .map_err(|e| e.to_string())?
+            .kid;
+        let set = self.key_set();
+        if let Some(fetched_at) = set.fetched_at
+            && (fetched_at.elapsed() >= self.refresh_after || !set.keys.knows(kid.as_deref()))
+        {
+            self.refresh_jwks().await;
+        }
+        self.verify(access_token)
+    }
+
+    async fn refresh_jwks(&self) {
+        let mut last_attempt = self.refresh.lock().await;
+        if last_attempt.is_some_and(|at| at.elapsed() < self.retry_after) {
+            return;
+        }
+        let set = self.key_set();
+        *last_attempt = Some(Instant::now());
+        let keys = match fetch_jwks(&self.http, &self.cfg.jwks_url).await {
+            Ok(body) => Keys::from_jwks(&self.cfg.jwks_url, &body),
+            Err(error) => Err(error),
+        };
+        match keys {
+            Ok(keys) => {
+                *self.keys.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(KeySet {
+                    keys,
+                    fetched_at: Some(Instant::now()),
+                });
+            }
+            Err(error) => tracing::error!(
+                %error,
+                age_secs = set.fetched_at.map(|at| at.elapsed().as_secs()),
+                "Privy JWKS refresh failed; keeping the last set until it expires"
+            ),
+        }
     }
 
     pub fn app_id(&self) -> &str {
@@ -300,9 +367,16 @@ impl Privy {
         let kid = jsonwebtoken::decode_header(token)
             .map_err(|e| e.to_string())?
             .kid;
+        let set = self.key_set();
+        if set
+            .fetched_at
+            .is_some_and(|at| at.elapsed() >= self.max_age)
+        {
+            return Err("the Privy verification keys could not be refreshed".to_string());
+        }
         let mut last = String::from("no verification key");
         let mut data = None;
-        for key in self.keys.candidates(kid.as_deref()) {
+        for key in set.keys.candidates(kid.as_deref()) {
             match jsonwebtoken::decode::<Claims>(token, key, &self.validation) {
                 Ok(d) => {
                     data = Some(d);
@@ -440,6 +514,22 @@ impl Privy {
             policy: crate::tenants::DEFAULT_POLICY,
         }
     }
+}
+
+async fn fetch_jwks(http: &reqwest::Client, url: &str) -> Result<String, ConfigError> {
+    let bad = |e: reqwest::Error| ConfigError::Jwks {
+        url: url.to_string(),
+        why: e.to_string(),
+    };
+    http.get(url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(bad)?
+        .text()
+        .await
+        .map_err(bad)
 }
 
 /// The tenant subject for a Privy user.
@@ -742,6 +832,133 @@ pub(crate) mod tests {
             default_jwks_url("app_1"),
             "https://auth.privy.io/api/v1/apps/app_1/jwks.json"
         );
+    }
+
+    /// A JWKS endpoint whose document the test can replace or break.
+    async fn mock_jwks(doc: Arc<Mutex<Option<String>>>) -> String {
+        async fn serve(
+            State(doc): State<Arc<Mutex<Option<String>>>>,
+        ) -> Result<String, axum::http::StatusCode> {
+            doc.lock()
+                .unwrap()
+                .clone()
+                .ok_or(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+        }
+        let app = Router::new()
+            .route("/jwks.json", get(serve))
+            .with_state(doc);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/jwks.json")
+    }
+
+    fn jwk(kid: &str, key: &SigningKey) -> serde_json::Value {
+        use base64::Engine;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let point = key.verifying_key().to_encoded_point(false);
+        json!({ "kty": "EC", "crv": "P-256", "kid": kid, "use": "sig", "alg": "ES256",
+                "x": b64(point.x().unwrap()), "y": b64(point.y().unwrap()) })
+    }
+
+    fn signed_by(key: &SigningKey, kid: &str, user: &str) -> String {
+        let pem = key.to_pkcs8_pem(p256::pkcs8::LineEnding::LF).unwrap();
+        let encoding = jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()).unwrap();
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        header.kid = Some(kid.to_string());
+        let claims = json!({ "sub": user, "aud": "app_test", "iss": ISSUER, "exp": unix() + 600 });
+        jsonwebtoken::encode(&header, &claims, &encoding).unwrap()
+    }
+
+    #[tokio::test]
+    async fn retired_jwks_keys_stop_verifying_after_refresh() {
+        let retired = SigningKey::random(&mut rand::rngs::OsRng);
+        let current = SigningKey::random(&mut rand::rngs::OsRng);
+        let doc = Arc::new(Mutex::new(Some(
+            json!({ "keys": [jwk("kid_retired", &retired), jwk("kid_current", &current)] })
+                .to_string(),
+        )));
+        let mut cfg = FakeApp::new("http://unused").cfg;
+        cfg.verification_key = None;
+        cfg.jwks_url = mock_jwks(doc.clone()).await;
+        let mut privy = Privy::connect(cfg).await.unwrap();
+        let victim = "did:privy:victim";
+        assert!(
+            privy
+                .authenticate(&signed_by(&retired, "kid_retired", victim))
+                .await
+                .is_ok()
+        );
+
+        // Privy retires the key; the next sign-in after the refresh window
+        // fetches the new set and the retired key is gone.
+        *doc.lock().unwrap() = Some(json!({ "keys": [jwk("kid_current", &current)] }).to_string());
+        privy.refresh_after = Duration::ZERO;
+        privy.retry_after = Duration::ZERO;
+        let forged = signed_by(&retired, "kid_retired", victim);
+        assert!(privy.authenticate(&forged).await.is_err());
+        assert_eq!(privy.key_count(), 1);
+        assert_eq!(
+            privy
+                .authenticate(&signed_by(&current, "kid_current", victim))
+                .await
+                .unwrap()
+                .user_id,
+            victim
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_kid_is_fetched_without_waiting_for_the_refresh_window() {
+        let first = SigningKey::random(&mut rand::rngs::OsRng);
+        let rotated = SigningKey::random(&mut rand::rngs::OsRng);
+        let doc = Arc::new(Mutex::new(Some(
+            json!({ "keys": [jwk("kid_1", &first)] }).to_string(),
+        )));
+        let mut cfg = FakeApp::new("http://unused").cfg;
+        cfg.verification_key = None;
+        cfg.jwks_url = mock_jwks(doc.clone()).await;
+        let privy = Privy::connect(cfg).await.unwrap();
+        *doc.lock().unwrap() = Some(json!({ "keys": [jwk("kid_2", &rotated)] }).to_string());
+        assert!(
+            privy
+                .authenticate(&signed_by(&rotated, "kid_2", USER))
+                .await
+                .is_ok()
+        );
+        assert!(
+            privy
+                .authenticate(&signed_by(&first, "kid_1", USER))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_that_cannot_be_refreshed_expire() {
+        let key = SigningKey::random(&mut rand::rngs::OsRng);
+        let doc = Arc::new(Mutex::new(Some(
+            json!({ "keys": [jwk("kid_1", &key)] }).to_string(),
+        )));
+        let mut cfg = FakeApp::new("http://unused").cfg;
+        cfg.verification_key = None;
+        cfg.jwks_url = mock_jwks(doc.clone()).await;
+        let mut privy = Privy::connect(cfg).await.unwrap();
+        let token = signed_by(&key, "kid_1", USER);
+        *doc.lock().unwrap() = None;
+        privy.refresh_after = Duration::ZERO;
+        privy.retry_after = Duration::ZERO;
+        // A failed refresh keeps the last set while it is young enough.
+        assert!(privy.authenticate(&token).await.is_ok());
+        privy.max_age = Duration::ZERO;
+        assert!(privy.authenticate(&token).await.is_err(), "fails closed");
+        // A configured PEM never ages.
+        let app = FakeApp::new("http://unused");
+        let mut pem = Privy::new(app.cfg.clone()).unwrap();
+        pem.max_age = Duration::ZERO;
+        assert!(pem.authenticate(&app.token_for(USER)).await.is_ok());
     }
 
     #[test]
