@@ -1291,13 +1291,19 @@ pub(super) struct FetchedToken {
 /// tuple. The metadata server returns different tokens for different scope
 /// sets (and different audiences in identity mode), and standard OAuth2
 /// providers key tokens by client. Caching them all under a single slot would
-/// cause one upstream's token to evict another's.
+/// cause one upstream's token to evict another's. The client-secret identity
+/// (env name plus a SHA-256 fingerprint of its value) is part of the key so a
+/// token minted with one secret is never served to a route using another, and
+/// rotating a secret invalidates its cached token.
 #[derive(PartialEq, Eq, Hash)]
 struct TokenKey {
     token_url: String,
     scopes: Vec<String>,
     audience: Option<String>,
+    client_id_env: Option<String>,
     client_id: Option<String>,
+    client_secret_env: Option<String>,
+    client_secret_fingerprint: Option<[u8; 32]>,
 }
 
 static OAUTH2_TOKEN_CACHE: std::sync::OnceLock<Arc<RwLock<HashMap<TokenKey, CachedToken>>>> =
@@ -1319,7 +1325,12 @@ async fn oauth2_token(
         token_url: token_url.to_string(),
         scopes: scopes.to_vec(),
         audience: audience.map(str::to_string),
+        client_id_env: client_id_env.map(str::to_string),
         client_id: client_id_env.and_then(|e| std::env::var(e).ok()),
+        client_secret_env: client_secret_env.map(str::to_string),
+        client_secret_fingerprint: client_secret_env
+            .and_then(|e| std::env::var(e).ok())
+            .map(|secret| Sha256::digest(secret.as_bytes()).into()),
     };
 
     // Check cache — require at least 30s of remaining life to avoid races
@@ -3532,5 +3543,114 @@ mod tests {
         let safe = upstream_error_for_logging(&error);
         assert!(!safe.contains("nested-secret"));
         assert!(safe.contains("api_key=%5BREDACTED%5D"));
+    }
+
+    async fn spawn_secret_bound_oauth_upstream() -> (String, Arc<AtomicUsize>) {
+        let token_requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&token_requests);
+        let app = axum::Router::new()
+            .route(
+                "/token",
+                axum::routing::post(
+                    move |axum::extract::Form(form): axum::extract::Form<
+                        HashMap<String, String>,
+                    >| {
+                        let counter = Arc::clone(&counter);
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            let secret = form.get("client_secret").cloned().unwrap_or_default();
+                            axum::Json(serde_json::json!({
+                                "access_token": format!("token-for-{secret}"),
+                                "expires_in": 3600
+                            }))
+                        }
+                    },
+                ),
+            )
+            .fallback(|headers: axum::http::HeaderMap| async move {
+                headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("missing")
+                    .to_string()
+            });
+        let (base_url, _handle) = spawn_upstream(app).await;
+        (base_url, token_requests)
+    }
+
+    fn secret_bound_oauth_api(base_url: &str, client_id_env: &str, secret_env: &str) -> ApiSpec {
+        ApiSpec {
+            routing: RoutingConfig::Proxy {
+                url: base_url.to_string(),
+                path_rewrites: vec![],
+                auth: Some(Box::new(AuthConfig::Oauth2 {
+                    token_url: format!("{base_url}/token"),
+                    scopes: vec!["scope.shared".to_string()],
+                    audience: None,
+                    client_id_from_env: Some(client_id_env.to_string()),
+                    client_secret_from_env: Some(secret_env.to_string()),
+                    headers: HashMap::new(),
+                })),
+            },
+            ..make_api("test")
+        }
+    }
+
+    async fn upstream_authorization(api: &ApiSpec) -> String {
+        let uri: Uri = "/upstream".parse().unwrap();
+        let resp = forward_request(api, Method::GET, &uri, &HeaderMap::new(), Bytes::new())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn oauth2_cache_never_shares_tokens_across_client_secrets() {
+        let (base_url, token_requests) = spawn_secret_bound_oauth_upstream().await;
+        // SAFETY: test-only env mutation with names unique to this test.
+        unsafe {
+            std::env::set_var("_TEST_OAUTH_CACHE_SHARED_ID", "client-1");
+            std::env::set_var("_TEST_OAUTH_CACHE_SECRET_A", "secret-a");
+            std::env::set_var("_TEST_OAUTH_CACHE_SECRET_B", "secret-b");
+        }
+        let route_a = secret_bound_oauth_api(
+            &base_url,
+            "_TEST_OAUTH_CACHE_SHARED_ID",
+            "_TEST_OAUTH_CACHE_SECRET_A",
+        );
+        let route_b = secret_bound_oauth_api(
+            &base_url,
+            "_TEST_OAUTH_CACHE_SHARED_ID",
+            "_TEST_OAUTH_CACHE_SECRET_B",
+        );
+
+        assert_eq!(
+            upstream_authorization(&route_a).await,
+            "Bearer token-for-secret-a"
+        );
+        assert_eq!(
+            upstream_authorization(&route_b).await,
+            "Bearer token-for-secret-b"
+        );
+        // Positive control: each route still reuses its own cached token.
+        assert_eq!(
+            upstream_authorization(&route_a).await,
+            "Bearer token-for-secret-a"
+        );
+        assert_eq!(token_requests.load(Ordering::SeqCst), 2);
+
+        // Rotating a secret value invalidates the token minted with the old one.
+        unsafe { std::env::set_var("_TEST_OAUTH_CACHE_SECRET_A", "secret-a2") };
+        assert_eq!(
+            upstream_authorization(&route_a).await,
+            "Bearer token-for-secret-a2"
+        );
+        assert_eq!(token_requests.load(Ordering::SeqCst), 3);
+        unsafe {
+            std::env::remove_var("_TEST_OAUTH_CACHE_SHARED_ID");
+            std::env::remove_var("_TEST_OAUTH_CACHE_SECRET_A");
+            std::env::remove_var("_TEST_OAUTH_CACHE_SECRET_B");
+        }
     }
 }
