@@ -462,20 +462,42 @@ where
 {
     async_stream::try_stream! {
         futures_util::pin_mut!(stream);
+        // Bytes whose usage is below the voucher threshold are held, not
+        // released, until a commit covers them: a disconnect or upstream error
+        // must never leave delivered usage unpaid.
+        let mut held: Vec<Bytes> = Vec::new();
+        let mut held_target = 0;
         while let Some(next) = stream.next().await {
             let chunk = next.map_err(box_error)?;
             meter.touch_channel_if_due();
             let decision = meter.observe_chunk(&chunk, is_sse).map_err(box_error)?;
-            if let Some(decision) = decision {
-                settle_decision(&mut meter, decision).await?;
+            held.push(chunk);
+            match decision {
+                Some(decision) if decision.requires_voucher() => {
+                    // Do not release the bytes that crossed the voucher
+                    // threshold until the cumulative commit is durable.
+                    settle_decision(&mut meter, decision).await?;
+                }
+                Some(decision) if decision.outstanding_base_units() > 0 => {
+                    held_target = decision.target_cumulative_base_units();
+                }
+                _ => {}
             }
-            // Do not release the bytes that crossed the voucher threshold
-            // until the corresponding cumulative commit is durable.
-            yield chunk;
+            let committed = meter.context.committed_base_units();
+            if committed >= held_target {
+                meter.record_commit(committed);
+                held_target = 0;
+                for chunk in held.drain(..) {
+                    yield chunk;
+                }
+            }
         }
 
         if let Some(decision) = meter.finish(is_sse).map_err(box_error)? {
             settle_decision(&mut meter, decision).await?;
+        }
+        for chunk in held.drain(..) {
+            yield chunk;
         }
     }
 }
@@ -2174,5 +2196,143 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             error.to_string().contains("missing required observation"),
             "{error}"
         );
+    }
+
+    async fn client_voucher_stream(
+        min_voucher_delta: u64,
+        label: &str,
+    ) -> (
+        Arc<SessionMpp>,
+        Arc<MemoryChannelStore>,
+        String,
+        SessionHandle,
+        SessionStreamMeter,
+    ) {
+        let store_impl = Arc::new(MemoryChannelStore::new());
+        let store: Arc<dyn ChannelStore> = store_impl.clone();
+        let session = Arc::new(
+            SessionMpp::new_with_channel_store(
+                SessionConfig {
+                    operator: solana_pubkey::Pubkey::new_unique().to_string(),
+                    recipient: solana_pubkey::Pubkey::new_unique().to_string(),
+                    suggested_deposit: Some(1_000),
+                    currency: solana_pubkey::Pubkey::new_unique().to_string(),
+                    network: "localnet".to_string(),
+                    min_voucher_delta,
+                    ..SessionConfig::default()
+                },
+                label,
+                store,
+            )
+            .with_blockhash_cache(stream_test_blockhash_cache()),
+        );
+        let challenge = session.challenge(None).unwrap();
+        let channel = solana_pubkey::Pubkey::new_unique();
+        let signer = stream_test_signer();
+        let authorized_signer = signer.pubkey().to_string();
+        let handle = SessionHandle::new(channel, signer, challenge.clone());
+        let channel_id = channel.to_string();
+        store_impl
+            .put_channel(
+                &channel_id,
+                test_channel_state(
+                    &channel_id,
+                    1_000,
+                    &authorized_signer,
+                    "client",
+                    &challenge.id,
+                    solana_pubkey::Pubkey::new_unique().to_string(),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+        let context = SessionStreamContext::new(session.clone(), channel_id.clone(), 0);
+        let spec = SessionMeterSpec::new([SessionMeterDimension::required(
+            MeterDirection::Output,
+            BillingUnit::Bytes,
+            1,
+            1,
+        )]);
+        let meter = SessionStreamMeter::new(spec, SessionUsageHints::default(), context).unwrap();
+        (session, store_impl, channel_id, handle, meter)
+    }
+
+    #[tokio::test]
+    async fn below_threshold_usage_is_not_released_before_its_commit() {
+        let (session, store, channel_id, _handle, meter) =
+            client_voucher_stream(10, "stream-drop-secret").await;
+        let upstream =
+            futures_util::stream::iter([Ok::<_, reqwest::Error>(Bytes::from_static(b"paid"))])
+                .chain(futures_util::stream::pending());
+        let mut metered = Box::pin(meter_response_stream(upstream, meter, false));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), metered.next())
+                .await
+                .is_err(),
+            "below-threshold usage must stay withheld until committed"
+        );
+        // The client disconnects: nothing billable was released unpaid.
+        drop(metered);
+
+        let state = store.get_channel(&channel_id).await.unwrap().unwrap();
+        assert_eq!(state.cumulative, 0);
+        assert_eq!(
+            session.finalize_params(&channel_id).await.unwrap().settled,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn below_threshold_tail_is_released_after_final_commit() {
+        let (session, _store, channel_id, handle, meter) =
+            client_voucher_stream(10, "stream-tail-secret").await;
+        let upstream = futures_util::stream::iter([
+            Ok::<_, reqwest::Error>(Bytes::from_static(b"pa")),
+            Ok::<_, reqwest::Error>(Bytes::from_static(b"id")),
+        ]);
+        let metered = meter_response_stream(upstream, meter, false);
+        futures_util::pin_mut!(metered);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), metered.next())
+                .await
+                .is_err()
+        );
+        // Vouchers below min_voucher_delta are rejected, so the client covers
+        // the tail with one delta-sized commit.
+        let voucher = handle.voucher_header(10).await.unwrap();
+        session.process(&voucher).await.unwrap();
+
+        let mut served = Vec::new();
+        while let Some(chunk) = tokio::time::timeout(Duration::from_secs(1), metered.next())
+            .await
+            .unwrap()
+        {
+            served.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(served, b"paid");
+        assert_eq!(session.committed_watermark(&channel_id), Some(10));
+    }
+
+    #[tokio::test]
+    async fn committed_ahead_usage_streams_without_holding() {
+        let (session, _store, _channel_id, handle, meter) =
+            client_voucher_stream(10, "stream-ahead-secret").await;
+        let voucher = handle.voucher_header(100).await.unwrap();
+        session.process(&voucher).await.unwrap();
+        let upstream =
+            futures_util::stream::iter([Ok::<_, reqwest::Error>(Bytes::from_static(b"paid"))])
+                .chain(futures_util::stream::pending());
+        let metered = meter_response_stream(upstream, meter, false);
+        futures_util::pin_mut!(metered);
+
+        let released = tokio::time::timeout(Duration::from_secs(1), metered.next())
+            .await
+            .expect("prepaid usage must not be held")
+            .unwrap()
+            .unwrap();
+        assert_eq!(released, Bytes::from_static(b"paid"));
     }
 }
