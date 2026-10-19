@@ -1544,6 +1544,12 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
             warn!(channel_id = %state.channel_id, "bound or malformed session in batch namespace; refusing static batch settlement");
             continue;
         }
+        if let Err(error) = state.check_binding(&batch_worker_binding()) {
+            metrics.failures += 1;
+            metrics.skipped += 1;
+            warn!(channel_id = %state.channel_id, %error, "batch record belongs to another deployment; keeping it untouched");
+            continue;
+        }
         if !batch_reconciliation_due(
             &state,
             now,
@@ -1572,7 +1578,7 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let channels =
-                channel::fetch_channels(&runtime.rpc, &runtime.rpc_url, &addresses).await?;
+                channel::fetch_channels_each(&runtime.rpc, &runtime.rpc_url, &addresses).await?;
             Ok::<_, JobError>(states.into_iter().zip(channels).collect::<Vec<_>>())
         }
         .await;
@@ -1586,7 +1592,18 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
     let mut fetched_channels = Vec::with_capacity(metrics.channels_scanned);
     for (batch_size, fetched_batch) in fetched_batches {
         match fetched_batch {
-            Ok(channels) => fetched_channels.extend(channels),
+            Ok(channels) => {
+                for (state, fetched) in channels {
+                    match fetched {
+                        Ok(onchain) => fetched_channels.push((state, onchain)),
+                        Err(error) => {
+                            metrics.failures += 1;
+                            metrics.skipped += 1;
+                            warn!(channel_id = %state.channel_id, %error, "batch channel account is not this worker's; keeping record");
+                        }
+                    }
+                }
+            }
             Err(error) => {
                 metrics.failures += batch_size;
                 metrics.skipped += batch_size;
@@ -2243,6 +2260,20 @@ async fn update_batch_settled_watermark(
         )
         .await
         .map(|_| ())
+}
+
+/// The deployment this worker settles: canonical-program batch channels. A
+/// record bound to another program is never reconciled, settled or deleted
+/// here, since its channel account would read as foreign or absent.
+fn batch_worker_binding() -> pay_kit::core::store::ChannelBinding {
+    pay_kit::core::store::ChannelBinding {
+        scheme: pay_kit::x402::batch_settlement::BATCH_SETTLEMENT_SCHEME.to_string(),
+        pay_to: None,
+        network: None,
+        program_id: Some(payment_channels::pubkey_string(
+            &payment_channels::default_program_id(),
+        )),
+    }
 }
 
 /// Record the payer's close on the batch record and, unless a live
@@ -5547,6 +5578,51 @@ mod tests {
             .unwrap();
         assert!(done.candidate.is_none());
         assert!(!done.delete_absent);
+    }
+
+    #[test]
+    fn batch_records_bound_to_another_program_are_never_reconciled() {
+        let worker = batch_worker_binding();
+        let mut state = channel_state();
+        // Records that predate bindings, and canonical-program records, are ours.
+        assert!(state.check_binding(&worker).is_ok());
+        state.set_binding(&pay_kit::core::store::ChannelBinding {
+            pay_to: Some(Pubkey::new_unique().to_string()),
+            ..worker.clone()
+        });
+        assert!(state.check_binding(&worker).is_ok());
+        state.set_binding(&pay_kit::core::store::ChannelBinding {
+            program_id: Some(Pubkey::new_unique().to_string()),
+            ..worker.clone()
+        });
+        assert!(state.check_binding(&worker).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_custom_program_channel_never_reads_as_absent() {
+        let custom = Pubkey::new_unique();
+        let mut data = vec![0; channel::CHANNEL_ACCOUNT_SIZE];
+        data[0] = 1;
+        data[1] = 1;
+        let encoded = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(&data)
+        };
+        let (url, server) = spawn_rpc(move |_| {
+            serde_json::json!({
+                "context": {"slot": u64::MAX},
+                "value": [null, {"owner": custom.to_string(), "data": [encoded, "base64"]}]
+            })
+        })
+        .await;
+        let rpc = RpcClient::new(Duration::from_secs(5)).unwrap();
+        let fetched =
+            channel::fetch_channels_each(&rpc, &url, &[Pubkey::new_unique(), Pubkey::new_unique()])
+                .await
+                .unwrap();
+        server.abort();
+        assert!(matches!(fetched[0], Ok(None)));
+        assert!(fetched[1].is_err());
     }
 
     #[tokio::test]

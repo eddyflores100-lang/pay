@@ -306,8 +306,12 @@ fn decode_v1_account(
             "V2 channel is unsupported by the V1/batch worker path".into(),
         ));
     }
+    // A live account owned by another program is not an absent channel: a
+    // record for it belongs to a deployment this worker cannot judge.
     if owner != default_program_id().to_string() {
-        return Ok(None);
+        return Err(JobError::Config(format!(
+            "channel {address} is owned by {owner}, not the worker's payment-channels program"
+        )));
     }
     decode_v1_channel(address, data)
 }
@@ -321,6 +325,19 @@ pub async fn fetch_channels(
     rpc_url: &str,
     addresses: &[Pubkey],
 ) -> Result<Vec<Option<DecodedChannel>>, JobError> {
+    fetch_channels_each(rpc, rpc_url, addresses)
+        .await?
+        .into_iter()
+        .collect()
+}
+
+/// [`fetch_channels`] with one decode result per address, so one foreign or
+/// unsupported account fails only its own channel.
+pub async fn fetch_channels_each(
+    rpc: &RpcClient,
+    rpc_url: &str,
+    addresses: &[Pubkey],
+) -> Result<Vec<Result<Option<DecodedChannel>, JobError>>, JobError> {
     if addresses.len() > 100 {
         return Err(JobError::TxBuild(format!(
             "channel account batch has {} addresses; maximum is 100",
@@ -336,7 +353,10 @@ pub async fn fetch_channels(
                 .collect::<Vec<_>>(),
         )
         .await?;
-    addresses
+    if accounts.len() != addresses.len() {
+        return Err(JobError::Rpc(pay_api_core::Error::RpcMalformed));
+    }
+    Ok(addresses
         .iter()
         .copied()
         .zip(accounts)
@@ -348,7 +368,7 @@ pub async fn fetch_channels(
             // shape; a decode failure means this is not a live channel.
             decode_v1_account(&address, &account.owner, &account.data)
         })
-        .collect()
+        .collect())
 }
 
 /// The recovered distribution preimage: the raw `count || entries` bytes that
@@ -1003,6 +1023,28 @@ mod tests {
             assert_eq!(create.accounts[2].pubkey, channel.channel.payer);
             assert_eq!(create.accounts[5].pubkey, to_address(&token_program));
         }
+    }
+
+    #[test]
+    fn a_foreign_owned_account_is_never_reported_absent() {
+        let mut bytes = vec![0; CHANNEL_ACCOUNT_SIZE];
+        bytes[0] = 1;
+        bytes[1] = 1;
+        let address = Pubkey::new_unique();
+        let custom = Pubkey::new_unique().to_string();
+        assert!(decode_v1_account(&address, &custom, &bytes).is_err());
+        assert!(decode_v1_account(&address, &custom, &[2]).is_err());
+        let canonical = default_program_id().to_string();
+        assert!(
+            decode_v1_account(&address, &canonical, &bytes)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            decode_v1_account(&address, &canonical, &[2])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
