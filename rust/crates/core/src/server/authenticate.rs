@@ -40,7 +40,6 @@ pub fn build_handler(
     let (period_unit, period_count) = spec.parse_period().map_err(Error::Config)?;
     let period_hours = period_hours_from_spec(period_unit, period_count)?;
 
-    let _ = spec; // `spec` is only consulted via `parse_period` above; reserved for richer statement composition.
     // `challenge_binding_secret` and `realm` are required on the SDK side, no
     // SDK-internal env-var fallbacks. The pay server middleware
     // resolves both from `operator.{challenge_binding_secret,realm}`
@@ -66,7 +65,7 @@ pub fn build_handler(
         plan_id,
         plan_created_at,
         period_hours,
-        subscription_expires: None,
+        subscription_expires: spec.expires_at.clone(),
         network: defaults.network.to_string(),
         program_id: None,
         challenge_binding_secret,
@@ -157,6 +156,91 @@ mod tests {
         )
         .expect("ok");
         assert!(server.is_some());
+    }
+
+    async fn signed_credential(
+        server: &AuthenticateServer,
+        plan_id: &str,
+    ) -> pay_kit::mpp::PaymentCredential {
+        use pay_kit::mpp::program::subscriptions::{default_program_id, find_subscription_pda};
+        use pay_kit::mpp::solana_keychain::SolanaSigner;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+        let mut keypair = [0u8; 64];
+        keypair[..32].copy_from_slice(&key.to_bytes());
+        keypair[32..].copy_from_slice(key.verifying_key().as_bytes());
+        let signer =
+            pay_kit::mpp::solana_keychain::memory::MemorySigner::from_bytes(&keypair).unwrap();
+        let plan = plan_id.parse().unwrap();
+        let (pda, _) = find_subscription_pda(&plan, &signer.pubkey(), &default_program_id());
+        let header = pay_kit::mpp::client::build_authenticate_credential_header(
+            &signer,
+            &server.challenge().unwrap(),
+            &pda.to_string(),
+        )
+        .await
+        .unwrap();
+        pay_kit::mpp::parse_authorization(&header).unwrap()
+    }
+
+    fn rfc3339_from_now(seconds: i64) -> String {
+        (chrono::Utc::now() + chrono::Duration::seconds(seconds))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    #[tokio::test]
+    async fn legacy_tokens_stop_verifying_at_the_endpoint_expiry() {
+        let plan_id = "Amp9FrnEX17tVeZ7QnHX1Hh4TynhH4sXLRSde797vdKR";
+        let mut spec = make_spec(Some(plan_id));
+        let server = |spec: &SubscriptionEndpoint| {
+            build_handler(
+                spec,
+                defaults(),
+                "api.example.com",
+                "https://api.example.com/",
+            )
+            .unwrap()
+            .unwrap()
+        };
+        // Issued before the cutoff, so it carries the plan-period expiration.
+        let credential = signed_credential(&server(&spec), plan_id).await;
+        server(&spec).verify(&credential).unwrap();
+
+        spec.expires_at = Some(rfc3339_from_now(3600));
+        server(&spec).verify(&credential).unwrap_err();
+        spec.expires_at = Some(rfc3339_from_now(-1));
+        server(&spec).verify(&credential).unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn tokens_issued_under_an_endpoint_expiry_verify_until_it() {
+        let plan_id = "Amp9FrnEX17tVeZ7QnHX1Hh4TynhH4sXLRSde797vdKR";
+        let mut spec = make_spec(Some(plan_id));
+        spec.expires_at = Some(rfc3339_from_now(3600));
+        let server = build_handler(
+            &spec,
+            defaults(),
+            "api.example.com",
+            "https://api.example.com/",
+        )
+        .unwrap()
+        .unwrap();
+        let credential = signed_credential(&server, plan_id).await;
+        server.verify(&credential).unwrap();
+    }
+
+    #[test]
+    fn malformed_endpoint_expiry_is_a_config_error() {
+        let mut spec = make_spec(Some("Amp9FrnEX17tVeZ7QnHX1Hh4TynhH4sXLRSde797vdKR"));
+        spec.expires_at = Some("next tuesday".into());
+        assert!(
+            build_handler(
+                &spec,
+                defaults(),
+                "api.example.com",
+                "https://api.example.com/"
+            )
+            .is_err()
+        );
     }
 
     #[test]
