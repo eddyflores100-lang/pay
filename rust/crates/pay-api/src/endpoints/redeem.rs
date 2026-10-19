@@ -4,7 +4,9 @@
 //! the gateway hot wallet's recent transactions via Helius, atomically claims
 //! the code in Redis, then builds + signs + broadcasts a transaction that pays
 //! the code's campaign amount of the configured token to the destination and
-//! stamps `pay-redeem:<code>` as a memo.
+//! stamps `Redeem code <code>` as a memo. Success is only reported once the
+//! payout confirms; an unconfirmed payout keeps its signature in the claim and
+//! is reconciled on the next attempt.
 //!
 //! The fee payer / hot wallet is `state.send.fee_payer` — the same
 //! GCP-KMS-backed signer the `/v1/send` endpoint uses. The redemption
@@ -56,6 +58,9 @@ const DEFAULT_MAX_SCAN_PAGES: usize = 8;
 /// Helius enhanced-transactions page limit.
 const HELIUS_PAGE_LIMIT: usize = 100;
 
+/// Stays below the CLI's 30s redeem request timeout.
+const REDEEM_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 // ── HTTP shapes ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -87,19 +92,9 @@ pub async fn handler(
         Some(cfg) if cfg.enabled => cfg,
         _ => return err_resp(StatusCode::SERVICE_UNAVAILABLE, "redemption disabled"),
     };
-
     if let Err(msg) = validate_redemption_code(&req.code) {
         return err_resp(StatusCode::BAD_REQUEST, &msg);
     }
-    let grant = match cfg.grants.get(&req.code) {
-        Some(grant) => grant,
-        None => return err_resp(StatusCode::BAD_REQUEST, "unknown code"),
-    };
-    let destination_pk = match Pubkey::from_str(req.destination.trim()) {
-        Ok(pk) => pk,
-        Err(_) => return err_resp(StatusCode::BAD_REQUEST, "invalid destination pubkey"),
-    };
-
     let signer = match fee_payer_signer(&state).await {
         Ok(s) => s,
         Err(_) => {
@@ -109,7 +104,28 @@ pub async fn handler(
             );
         }
     };
+    redeem(&state, cfg, signer, &req).await
+}
+
+async fn redeem(
+    state: &AppState,
+    cfg: &RedemptionState,
+    signer: Arc<dyn TransactionSigner>,
+    req: &RedeemRequest,
+) -> Response {
+    let grant = match cfg.grants.get(&req.code) {
+        Some(grant) => grant,
+        None => return err_resp(StatusCode::BAD_REQUEST, "unknown code"),
+    };
+    let destination_pk = match Pubkey::from_str(req.destination.trim()) {
+        Ok(pk) => pk,
+        Err(_) => return err_resp(StatusCode::BAD_REQUEST, "invalid destination pubkey"),
+    };
     let hot_wallet = signer.pubkey();
+    let rpc_url = match state.rpc_url_for(cfg.network) {
+        Ok(url) => url.to_string(),
+        Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
 
     // 1. Dedup scan.
     match find_prior_burn(&hot_wallet, &req.code, cfg).await {
@@ -134,27 +150,36 @@ pub async fn handler(
         }
     }
 
-    // 2. Atomically claim the code in durable storage. The claim is never
-    // deleted: a crash or ambiguous broadcast remains fail-closed and can be
-    // reconciled from the stored destination plus the on-chain memo.
-    match acquire_redemption_claim(cfg, &req.code, &destination_pk).await {
-        Ok(true) => {}
-        Ok(false) => return err_resp(StatusCode::CONFLICT, "code already redeemed or claimed"),
-        Err(error) => {
-            warn!(%error, "redemption claim store unavailable");
-            return err_resp(StatusCode::BAD_GATEWAY, "redemption claim failed");
+    // 2. Atomically claim the code in durable storage. A claim is only
+    // released when its payout provably cannot land; an existing claim is
+    // reconciled against the chain before a retry may proceed.
+    let mut reconciled = false;
+    loop {
+        match acquire_redemption_claim(cfg, &req.code, &destination_pk).await {
+            Ok(true) => break,
+            Ok(false) if !reconciled => {
+                reconciled = true;
+                match reconcile_existing_claim(state, cfg, &rpc_url, &req.code).await {
+                    Ok(()) => continue,
+                    Err(response) => return response,
+                }
+            }
+            Ok(false) => {
+                return err_resp(StatusCode::CONFLICT, "code already redeemed or claimed");
+            }
+            Err(error) => {
+                warn!(%error, "redemption claim store unavailable");
+                return err_resp(StatusCode::BAD_GATEWAY, "redemption claim failed");
+            }
         }
     }
 
     // 3. Build the unsigned tx.
-    let rpc_url = match state.rpc_url_for(cfg.network) {
-        Ok(url) => url.to_string(),
-        Err(e) => {
-            release_redemption_claim_best_effort(cfg, &req.code, &destination_pk).await;
-            return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
-        }
-    };
-    let blockhash_str = match state.rpc.get_latest_blockhash(&rpc_url).await {
+    let (blockhash_str, last_valid_block_height) = match state
+        .rpc
+        .get_latest_blockhash_with_last_valid_height(&rpc_url)
+        .await
+    {
         Ok(b) => b,
         Err(e) => {
             release_redemption_claim_best_effort(cfg, &req.code, &destination_pk).await;
@@ -184,41 +209,72 @@ pub async fn handler(
         }
     };
 
-    // 4. Sign and serialize before making the claim terminal. A signing or
-    // serialization failure has not sent funds and can safely be retried.
-    let signed_tx = match sign_transaction(unsigned, signer).await {
-        Ok(tx) => tx,
+    // 4. Sign before recording the signature. A signing failure has not
+    // sent funds and can safely be retried.
+    let (signature, signed_tx) = match sign_transaction(unsigned, signer).await {
+        Ok(signed) => signed,
         Err(msg) => {
             release_redemption_claim_best_effort(cfg, &req.code, &destination_pk).await;
             return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &msg);
         }
     };
-    match mark_redemption_broadcasting(cfg, &req.code, &destination_pk).await {
+    let pending = ClaimState::Pending {
+        signature,
+        last_valid_block_height: Some(last_valid_block_height),
+    }
+    .encode();
+    match transition_claim(
+        cfg,
+        &req.code,
+        &ClaimState::Claimed(destination_pk).encode(),
+        Some(&pending),
+    )
+    .await
+    {
         Ok(true) => {}
         Ok(false) => return err_resp(StatusCode::CONFLICT, "code claim was lost"),
         Err(error) => {
-            warn!(%error, "redemption claim could not be made terminal");
+            warn!(%error, "redemption claim could not record the payout signature");
+            release_redemption_claim_best_effort(cfg, &req.code, &destination_pk).await;
             return err_resp(StatusCode::BAD_GATEWAY, "redemption claim failed");
         }
     }
-    let signature = match broadcast_transaction(&state, &rpc_url, &signed_tx).await {
-        Ok(sig) => sig,
-        Err(error) if is_deterministic_preflight_error(&error) => {
-            // A rejected preflight never submits the transaction, so the
-            // claim can be retried. Transport and timeout errors remain
-            // claimed because the RPC may have accepted the transaction.
-            release_redemption_claim_best_effort(cfg, &req.code, &destination_pk).await;
-            return err_resp(StatusCode::BAD_GATEWAY, &error.to_string());
-        }
-        Err(error) => {
-            return err_resp(StatusCode::BAD_GATEWAY, &error.to_string());
-        }
-    };
 
-    if let Err(error) = record_redemption_signature(cfg, &req.code, &signature).await {
-        // The durable claim already prevents another payout. Keep serving the
-        // successful signature and let operators reconcile the stale status.
-        warn!(%error, %signature, "failed to update redemption claim status");
+    // 5. Broadcast, then wait for the payout to confirm before reporting it.
+    if let Err(error) = broadcast_transaction(state, &rpc_url, &signed_tx).await {
+        if is_deterministic_preflight_error(&error) {
+            // A rejected preflight never submits the transaction, so the
+            // claim can be retried.
+            release_claim_best_effort(cfg, &req.code, &pending).await;
+            return err_resp(StatusCode::BAD_GATEWAY, &error.to_string());
+        }
+        // Transport and timeout errors keep the pending claim: the RPC may
+        // have accepted the transaction. A retry reconciles it.
+        warn!(%error, %signature, "redemption broadcast outcome unknown");
+        return pending_resp(&signature);
+    }
+
+    match await_signature(state, &rpc_url, &signature, cfg.confirm_timeout).await {
+        PayoutStatus::Confirmed => {}
+        PayoutStatus::Failed => {
+            warn!(%signature, "redemption payout failed on-chain");
+            release_claim_best_effort(cfg, &req.code, &pending).await;
+            return err_resp(StatusCode::BAD_GATEWAY, "redemption payout failed; retry");
+        }
+        PayoutStatus::Pending => return pending_resp(&signature),
+    }
+
+    if let Err(error) = transition_claim(
+        cfg,
+        &req.code,
+        &pending,
+        Some(&ClaimState::Confirmed(signature).encode()),
+    )
+    .await
+    {
+        // The pending claim already prevents another payout and reconciles
+        // to confirmed on the next attempt.
+        warn!(%error, %signature, "failed to mark redemption claim confirmed");
     }
 
     info!(
@@ -243,6 +299,154 @@ pub async fn handler(
         }),
     )
         .into_response()
+}
+
+/// Resolve a claim left by an earlier attempt. `Ok(())` means the claim was
+/// released because its payout can never land, so the caller may claim again.
+async fn reconcile_existing_claim(
+    state: &AppState,
+    cfg: &RedemptionState,
+    rpc_url: &str,
+    code: &str,
+) -> Result<(), Response> {
+    let raw = match read_claim(cfg, code).await {
+        Ok(Some(raw)) => raw,
+        // Released concurrently; claim again.
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            warn!(%error, "redemption claim store unavailable");
+            return Err(err_resp(StatusCode::BAD_GATEWAY, "redemption claim failed"));
+        }
+    };
+    let (signature, last_valid_block_height) = match ClaimState::decode(&raw) {
+        Some(ClaimState::Confirmed(signature)) => {
+            return Err(already_redeemed_resp(&signature));
+        }
+        Some(ClaimState::Pending {
+            signature,
+            last_valid_block_height,
+        }) => (signature, last_valid_block_height),
+        // A claim without a recorded signature may still be mid-flight.
+        Some(ClaimState::Claimed(_)) | None => {
+            return Err(err_resp(
+                StatusCode::CONFLICT,
+                "code already redeemed or claimed",
+            ));
+        }
+    };
+
+    let status = match state
+        .rpc
+        .get_signature_status(rpc_url, &signature.to_string())
+        .await
+    {
+        Ok(status) => status,
+        Err(error) => {
+            warn!(%error, %signature, "redemption reconciliation status lookup failed");
+            return Err(err_resp(StatusCode::BAD_GATEWAY, "redemption claim failed"));
+        }
+    };
+    match classify_signature_status(status.as_ref()) {
+        PayoutStatus::Confirmed => {
+            if let Err(error) = transition_claim(
+                cfg,
+                code,
+                &raw,
+                Some(&ClaimState::Confirmed(signature).encode()),
+            )
+            .await
+            {
+                warn!(%error, %signature, "failed to mark redemption claim confirmed");
+            }
+            Err(already_redeemed_resp(&signature))
+        }
+        PayoutStatus::Failed => release_reconciled_claim(cfg, code, &raw).await,
+        PayoutStatus::Pending if status.is_none() => {
+            // Unknown to the cluster: release only once its blockhash has
+            // expired at finalized commitment, after which it can never land.
+            let Some(last_valid) = last_valid_block_height else {
+                return Err(pending_resp(&signature));
+            };
+            match state.rpc.get_finalized_block_height(rpc_url).await {
+                Ok(height) if height > last_valid => {
+                    release_reconciled_claim(cfg, code, &raw).await
+                }
+                Ok(_) => Err(pending_resp(&signature)),
+                Err(error) => {
+                    warn!(%error, "redemption reconciliation block height lookup failed");
+                    Err(err_resp(StatusCode::BAD_GATEWAY, "redemption claim failed"))
+                }
+            }
+        }
+        PayoutStatus::Pending => Err(pending_resp(&signature)),
+    }
+}
+
+async fn release_reconciled_claim(
+    cfg: &RedemptionState,
+    code: &str,
+    raw: &str,
+) -> Result<(), Response> {
+    match transition_claim(cfg, code, raw, None).await {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            warn!(%error, "redemption claim store unavailable");
+            Err(err_resp(StatusCode::BAD_GATEWAY, "redemption claim failed"))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PayoutStatus {
+    Confirmed,
+    Failed,
+    Pending,
+}
+
+fn classify_signature_status(status: Option<&serde_json::Value>) -> PayoutStatus {
+    let Some(status) = status else {
+        return PayoutStatus::Pending;
+    };
+    if status.get("err").is_some_and(|err| !err.is_null()) {
+        return PayoutStatus::Failed;
+    }
+    match status
+        .get("confirmationStatus")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("confirmed" | "finalized") => PayoutStatus::Confirmed,
+        _ => PayoutStatus::Pending,
+    }
+}
+
+/// Poll the payout signature until it confirms, fails, or `timeout` elapses.
+async fn await_signature(
+    state: &AppState,
+    rpc_url: &str,
+    signature: &Signature,
+    timeout: std::time::Duration,
+) -> PayoutStatus {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut backoff = std::time::Duration::from_millis(200);
+    loop {
+        match state
+            .rpc
+            .get_signature_status(rpc_url, &signature.to_string())
+            .await
+        {
+            Ok(status) => match classify_signature_status(status.as_ref()) {
+                PayoutStatus::Pending => {}
+                outcome => return outcome,
+            },
+            Err(error) => warn!(%error, %signature, "redemption status poll failed"),
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return PayoutStatus::Pending;
+        }
+        tokio::time::sleep(backoff.min(deadline - now)).await;
+        backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+    }
 }
 
 fn redeem_memo(code: &str) -> String {
@@ -371,55 +575,109 @@ async fn acquire_redemption_claim(
     let mut connection = cfg.claim_store.get_connection_manager().await?;
     let acquired: Option<String> = redis::cmd("SET")
         .arg(redemption_claim_key(code))
-        .arg(format!("claimed:{destination}"))
+        .arg(ClaimState::Claimed(*destination).encode())
         .arg("NX")
         .query_async(&mut connection)
         .await?;
     Ok(acquired.is_some())
 }
 
-async fn mark_redemption_broadcasting(
+/// Durable redemption claim value stored under [`redemption_claim_key`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClaimState {
+    /// Claimed; no transaction signed yet.
+    Claimed(Pubkey),
+    /// A payout was signed and may have been submitted. Legacy `broadcast:`
+    /// claims decode here without an expiry height.
+    Pending {
+        signature: Signature,
+        last_valid_block_height: Option<u64>,
+    },
+    /// The payout confirmed on-chain.
+    Confirmed(Signature),
+}
+
+impl ClaimState {
+    fn encode(&self) -> String {
+        match self {
+            Self::Claimed(destination) => format!("claimed:{destination}"),
+            Self::Pending {
+                signature,
+                last_valid_block_height: Some(height),
+            } => format!("pending:{signature}:{height}"),
+            Self::Pending {
+                signature,
+                last_valid_block_height: None,
+            } => format!("broadcast:{signature}"),
+            Self::Confirmed(signature) => format!("confirmed:{signature}"),
+        }
+    }
+
+    fn decode(raw: &str) -> Option<Self> {
+        let (kind, rest) = raw.split_once(':')?;
+        match kind {
+            "claimed" => Pubkey::from_str(rest).ok().map(Self::Claimed),
+            "pending" => {
+                let (signature, height) = rest.split_once(':')?;
+                Some(Self::Pending {
+                    signature: Signature::from_str(signature).ok()?,
+                    last_valid_block_height: Some(height.parse().ok()?),
+                })
+            }
+            "broadcast" => Some(Self::Pending {
+                signature: Signature::from_str(rest).ok()?,
+                last_valid_block_height: None,
+            }),
+            "confirmed" => Signature::from_str(rest).ok().map(Self::Confirmed),
+            _ => None,
+        }
+    }
+}
+
+async fn read_claim(
     cfg: &RedemptionState,
     code: &str,
-    destination: &Pubkey,
+) -> Result<Option<String>, redis::RedisError> {
+    let mut connection = cfg.claim_store.get_connection_manager().await?;
+    redis::cmd("GET")
+        .arg(redemption_claim_key(code))
+        .query_async(&mut connection)
+        .await
+}
+
+/// Atomically replace the claim when it still equals `expected`; `None`
+/// deletes it. Returns whether the claim changed.
+async fn transition_claim(
+    cfg: &RedemptionState,
+    code: &str,
+    expected: &str,
+    next: Option<&str>,
 ) -> Result<bool, redis::RedisError> {
     const TRANSITION: &str = r#"
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-  redis.call('SET', KEYS[1], ARGV[2])
-  return 1
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+  return 0
 end
-return 0
+if ARGV[2] == '' then
+  redis.call('DEL', KEYS[1])
+else
+  redis.call('SET', KEYS[1], ARGV[2])
+end
+return 1
 "#;
     let mut connection = cfg.claim_store.get_connection_manager().await?;
     let changed: i32 = redis::Script::new(TRANSITION)
         .key(redemption_claim_key(code))
-        .arg(format!("claimed:{destination}"))
-        .arg(format!("broadcasting:{destination}"))
+        .arg(expected)
+        .arg(next.unwrap_or(""))
         .invoke_async(&mut connection)
         .await?;
     Ok(changed == 1)
 }
 
-async fn release_redemption_claim(
-    cfg: &RedemptionState,
-    code: &str,
-    destination: &Pubkey,
-) -> Result<bool, redis::RedisError> {
-    const RELEASE: &str = r#"
-local claim = redis.call('GET', KEYS[1])
-if claim == ARGV[1] or claim == ARGV[2] then
-  return redis.call('DEL', KEYS[1])
-end
-return 0
-"#;
-    let mut connection = cfg.claim_store.get_connection_manager().await?;
-    let deleted: i32 = redis::Script::new(RELEASE)
-        .key(redemption_claim_key(code))
-        .arg(format!("claimed:{destination}"))
-        .arg(format!("broadcasting:{destination}"))
-        .invoke_async(&mut connection)
-        .await?;
-    Ok(deleted == 1)
+async fn release_claim_best_effort(cfg: &RedemptionState, code: &str, expected: &str) {
+    if let Err(error) = transition_claim(cfg, code, expected, None).await {
+        warn!(%error, "failed to release redemption claim");
+    }
 }
 
 async fn release_redemption_claim_best_effort(
@@ -427,24 +685,23 @@ async fn release_redemption_claim_best_effort(
     code: &str,
     destination: &Pubkey,
 ) {
-    if let Err(error) = release_redemption_claim(cfg, code, destination).await {
-        warn!(%error, "failed to release pre-broadcast redemption claim");
-    }
+    release_claim_best_effort(cfg, code, &ClaimState::Claimed(*destination).encode()).await;
 }
 
-async fn record_redemption_signature(
-    cfg: &RedemptionState,
-    code: &str,
-    signature: &Signature,
-) -> Result<(), redis::RedisError> {
-    let mut connection = cfg.claim_store.get_connection_manager().await?;
-    let _: Option<String> = redis::cmd("SET")
-        .arg(redemption_claim_key(code))
-        .arg(format!("broadcast:{signature}"))
-        .arg("XX")
-        .query_async(&mut connection)
-        .await?;
-    Ok(())
+fn pending_resp(signature: &Signature) -> Response {
+    err_resp_with_extra(
+        StatusCode::GATEWAY_TIMEOUT,
+        "redemption pending confirmation; retry later",
+        json!({ "pending_signature": signature.to_string() }),
+    )
+}
+
+fn already_redeemed_resp(signature: &Signature) -> Response {
+    err_resp_with_extra(
+        StatusCode::CONFLICT,
+        "code already redeemed",
+        json!({ "signature": signature.to_string() }),
+    )
 }
 
 // ── VersionedTransaction construction ──────────────────────────────────────────────
@@ -506,12 +763,17 @@ fn build_unsigned(
 async fn sign_transaction(
     mut tx: VersionedTransaction,
     signer: Arc<dyn TransactionSigner>,
-) -> Result<String, String> {
+) -> Result<(Signature, String), String> {
     let fee_payer = signer.pubkey();
     pay_kit::core::signing::cosign_versioned_fee_payer(signer.as_ref(), &fee_payer, &mut tx)
         .await
         .map_err(|e| format!("fee-payer sign failed: {e}"))?;
-    pay_kit::core::tx::encode(&tx).map_err(|e| format!("encode: {e}"))
+    let signature = *tx
+        .signatures
+        .first()
+        .ok_or_else(|| "signed transaction has no signature".to_string())?;
+    let encoded = pay_kit::core::tx::encode(&tx).map_err(|e| format!("encode: {e}"))?;
+    Ok((signature, encoded))
 }
 
 async fn broadcast_transaction(
@@ -565,6 +827,9 @@ pub struct RedemptionState {
     pub helius_base: String,
     pub max_scan_pages: usize,
     pub legacy_scan_cutoff_unix_seconds: Option<i64>,
+    /// How long a request waits for its payout to confirm before answering
+    /// with a pending status.
+    pub confirm_timeout: std::time::Duration,
     /// Active code → campaign grant, loaded from `REDEMPTION_CODES`
     /// (Doppler) at boot. Lookups in the handler are O(1).
     pub grants: HashMap<String, RedemptionGrant>,
@@ -653,6 +918,7 @@ impl RedemptionState {
             helius_base: cfg.helius_base.clone(),
             max_scan_pages: cfg.max_scan_pages.unwrap_or(DEFAULT_MAX_SCAN_PAGES),
             legacy_scan_cutoff_unix_seconds: cfg.legacy_scan_cutoff_unix_seconds,
+            confirm_timeout: REDEEM_CONFIRM_TIMEOUT,
             grants,
             http_client,
             claim_store,
@@ -706,8 +972,43 @@ fn err_resp_with_extra(status: StatusCode, message: &str, extra: serde_json::Val
 
 #[cfg(test)]
 mod tests {
-    use super::{RedemptionGrant, RedemptionState, redemption_claim_key};
+    use super::{ClaimState, RedemptionGrant, RedemptionState, redemption_claim_key};
     use crate::config::{RedemptionCampaignConfig, RedemptionConfig};
+    use solana_pubkey::Pubkey;
+    use solana_signature::Signature;
+
+    #[test]
+    fn claim_states_round_trip() {
+        let destination = Pubkey::new_unique();
+        let signature = Signature::from([7u8; 64]);
+        for state in [
+            ClaimState::Claimed(destination),
+            ClaimState::Pending {
+                signature,
+                last_valid_block_height: Some(1_234),
+            },
+            ClaimState::Pending {
+                signature,
+                last_valid_block_height: None,
+            },
+            ClaimState::Confirmed(signature),
+        ] {
+            assert_eq!(ClaimState::decode(&state.encode()), Some(state));
+        }
+        assert_eq!(
+            ClaimState::decode(&format!("broadcast:{signature}")),
+            Some(ClaimState::Pending {
+                signature,
+                last_valid_block_height: None,
+            })
+        );
+        assert_eq!(
+            ClaimState::decode(&format!("broadcasting:{destination}")),
+            None
+        );
+        assert_eq!(ClaimState::decode(&format!("pending:{signature}:x")), None);
+        assert_eq!(ClaimState::decode("garbage"), None);
+    }
 
     #[test]
     fn resolves_codes_to_campaign_specific_grants() {
@@ -771,5 +1072,427 @@ mod tests {
         assert!(key.starts_with("pay-api:redemption:"));
         assert!(!key.contains("SECRET-CODE-123"));
         assert_eq!(key, redemption_claim_key("SECRET-CODE-123"));
+    }
+
+    mod flow {
+        use std::collections::HashMap;
+        use std::process::{Child, Command, Stdio};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        use axum::Json;
+        use axum::Router;
+        use axum::extract::State;
+        use axum::http::StatusCode;
+        use axum::routing::{get, post};
+        use pay_api_types::Network;
+        use pay_kit::mpp::solana_keychain::{MemorySigner, TransactionSigner};
+        use serde_json::{Value, json};
+        use solana_pubkey::Pubkey;
+        use solana_signature::Signature;
+
+        use super::super::{
+            ClaimState, RedeemRequest, RedemptionGrant, RedemptionState, redeem,
+            redemption_claim_key,
+        };
+        use crate::state::AppState;
+
+        pub(super) struct RedisProcess(Child, pub(super) u16);
+
+        impl Drop for RedisProcess {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        /// Spawn a throwaway redis-server, or `None` when it isn't installed.
+        pub(super) async fn spawn_redis() -> Option<RedisProcess> {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .ok()?
+                .local_addr()
+                .ok()?
+                .port();
+            let child = Command::new("redis-server")
+                .args([
+                    "--bind",
+                    "127.0.0.1",
+                    "--port",
+                    &port.to_string(),
+                    "--save",
+                    "",
+                    "--appendonly",
+                    "no",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            let Ok(child) = child else {
+                eprintln!("skipping: redis-server not installed");
+                return None;
+            };
+            let process = RedisProcess(child, port);
+            for _ in 0..250 {
+                if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .is_ok()
+                {
+                    return Some(process);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("redis-server did not start");
+        }
+
+        #[derive(Clone, Copy)]
+        pub(super) enum SendMode {
+            Accept,
+            Preflight,
+            Transport,
+        }
+
+        pub(super) struct MockRpc {
+            pub(super) send_mode: SendMode,
+            pub(super) sent: Vec<Signature>,
+            pub(super) statuses: HashMap<String, Value>,
+            /// Status applied to every signature sent from now on.
+            pub(super) next_status: Option<Value>,
+            pub(super) block_height: u64,
+            pub(super) last_valid_block_height: u64,
+        }
+
+        impl Default for MockRpc {
+            fn default() -> Self {
+                Self {
+                    send_mode: SendMode::Accept,
+                    sent: Vec::new(),
+                    statuses: HashMap::new(),
+                    next_status: Some(confirmed()),
+                    block_height: 50,
+                    last_valid_block_height: 100,
+                }
+            }
+        }
+
+        pub(super) fn confirmed() -> Value {
+            json!({ "err": null, "confirmationStatus": "confirmed" })
+        }
+
+        pub(super) fn failed() -> Value {
+            json!({ "err": { "InstructionError": [1, { "Custom": 1 }] }, "confirmationStatus": "confirmed" })
+        }
+
+        type Shared = Arc<Mutex<MockRpc>>;
+
+        async fn rpc_handler(
+            State(mock): State<Shared>,
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            let mut mock = mock.lock().unwrap();
+            let method = body["method"].as_str().unwrap_or_default();
+            let result = match method {
+                "getLatestBlockhash" => json!({
+                    "context": { "slot": 1 },
+                    "value": {
+                        "blockhash": solana_hash::Hash::new_unique().to_string(),
+                        "lastValidBlockHeight": mock.last_valid_block_height,
+                    }
+                }),
+                "sendTransaction" => match mock.send_mode {
+                    SendMode::Accept => {
+                        let tx =
+                            pay_kit::core::tx::decode(body["params"][0].as_str().unwrap()).unwrap();
+                        let signature = tx.signatures[0];
+                        mock.sent.push(signature);
+                        if let Some(status) = mock.next_status.clone() {
+                            mock.statuses.insert(signature.to_string(), status);
+                        }
+                        json!(signature.to_string())
+                    }
+                    SendMode::Preflight => {
+                        return (
+                            StatusCode::OK,
+                            Json(json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "error": { "code": -32002, "message": "Transaction simulation failed: insufficient funds" }
+                            })),
+                        );
+                    }
+                    SendMode::Transport => {
+                        let tx =
+                            pay_kit::core::tx::decode(body["params"][0].as_str().unwrap()).unwrap();
+                        mock.sent.push(tx.signatures[0]);
+                        return (StatusCode::BAD_GATEWAY, Json(json!({})));
+                    }
+                },
+                "getSignatureStatuses" => {
+                    let signature = body["params"][0][0].as_str().unwrap_or_default();
+                    json!({
+                        "context": { "slot": 1 },
+                        "value": [mock.statuses.get(signature).cloned().unwrap_or(Value::Null)]
+                    })
+                }
+                "getBlockHeight" => json!(mock.block_height),
+                other => panic!("unexpected RPC method {other}"),
+            };
+            (
+                StatusCode::OK,
+                Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result })),
+            )
+        }
+
+        async fn helius_handler(State(history): State<Arc<Mutex<Vec<Value>>>>) -> Json<Value> {
+            Json(Value::Array(history.lock().unwrap().clone()))
+        }
+
+        pub(super) struct Harness {
+            pub(super) state: AppState,
+            pub(super) cfg: RedemptionState,
+            pub(super) signer: Arc<dyn TransactionSigner>,
+            pub(super) rpc: Shared,
+            _redis: RedisProcess,
+        }
+
+        pub(super) const CODE: &str = "TESTCODE1";
+
+        async fn serve(router: Router) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            format!("http://{addr}")
+        }
+
+        impl Harness {
+            pub(super) async fn new() -> Option<Self> {
+                let redis = spawn_redis().await?;
+                let rpc: Shared = Arc::new(Mutex::new(MockRpc::default()));
+                let rpc_url = serve(
+                    Router::new()
+                        .route("/", post(rpc_handler))
+                        .with_state(rpc.clone()),
+                )
+                .await;
+                let history = Arc::new(Mutex::new(Vec::new()));
+                let helius_url = serve(
+                    Router::new()
+                        .route("/v0/addresses/{address}/transactions", get(helius_handler))
+                        .with_state(history.clone()),
+                )
+                .await;
+                let config: crate::config::Config = serde_json::from_value(json!({
+                    "networks": { "sandbox": { "rpc_url": rpc_url } },
+                    "stablecoins": [],
+                    "send": { "enabled": false },
+                }))
+                .unwrap();
+                let state = AppState::new(&config).await.unwrap();
+                let keypair = solana_keypair::Keypair::new();
+                let signer: Arc<dyn TransactionSigner> = Arc::new(
+                    MemorySigner::from_private_key_string(
+                        &serde_json::to_string(&keypair.to_bytes().to_vec()).unwrap(),
+                    )
+                    .unwrap(),
+                );
+                let mut grants = HashMap::new();
+                grants.insert(
+                    CODE.to_string(),
+                    RedemptionGrant {
+                        campaign_id: "test".to_string(),
+                        amount: 5_000_000,
+                    },
+                );
+                let cfg = RedemptionState {
+                    enabled: true,
+                    mint: Pubkey::new_unique(),
+                    token_program: pay_api_core::ata::SPL_TOKEN_PROGRAM_ID,
+                    decimals: 6,
+                    network: Network::Sandbox,
+                    solana_rpc_api_key: "key".to_string(),
+                    helius_base: helius_url,
+                    max_scan_pages: 2,
+                    legacy_scan_cutoff_unix_seconds: None,
+                    confirm_timeout: Duration::from_millis(300),
+                    grants,
+                    http_client: reqwest::Client::new(),
+                    claim_store: redis::Client::open(format!("redis://127.0.0.1:{}/", redis.1))
+                        .unwrap(),
+                };
+                Some(Self {
+                    state,
+                    cfg,
+                    signer,
+                    rpc,
+                    _redis: redis,
+                })
+            }
+
+            pub(super) async fn redeem(&self, destination: &Pubkey) -> (StatusCode, Value) {
+                let response = redeem(
+                    &self.state,
+                    &self.cfg,
+                    self.signer.clone(),
+                    &RedeemRequest {
+                        code: CODE.to_string(),
+                        destination: destination.to_string(),
+                    },
+                )
+                .await;
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+                )
+            }
+
+            pub(super) async fn claim(&self) -> Option<ClaimState> {
+                let mut connection = self
+                    .cfg
+                    .claim_store
+                    .get_multiplexed_async_connection()
+                    .await
+                    .unwrap();
+                let raw: Option<String> = redis::cmd("GET")
+                    .arg(redemption_claim_key(CODE))
+                    .query_async(&mut connection)
+                    .await
+                    .unwrap();
+                raw.map(|raw| ClaimState::decode(&raw).expect("claim decodes"))
+            }
+
+            pub(super) fn sent(&self) -> Vec<Signature> {
+                self.rpc.lock().unwrap().sent.clone()
+            }
+        }
+
+        #[tokio::test]
+        async fn confirmed_payout_returns_success_and_records_confirmed_claim() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            let destination = Pubkey::new_unique();
+            let (status, body) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let sent = h.sent();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(body["signature"], sent[0].to_string());
+            assert_eq!(h.claim().await, Some(ClaimState::Confirmed(sent[0])));
+
+            let (status, body) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body["signature"], sent[0].to_string());
+            assert_eq!(h.sent().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn payout_failing_on_chain_is_not_success_and_releases_the_code() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            h.rpc.lock().unwrap().next_status = Some(failed());
+            let destination = Pubkey::new_unique();
+            let (status, body) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+            assert!(body.get("signature").is_none());
+            assert_eq!(h.claim().await, None);
+
+            h.rpc.lock().unwrap().next_status = Some(confirmed());
+            let (status, body) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(h.sent().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn unconfirmed_payout_stays_pending_until_its_blockhash_expires() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            h.rpc.lock().unwrap().next_status = None;
+            let destination = Pubkey::new_unique();
+            let (status, body) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+            let first = h.sent()[0];
+            assert_eq!(body["pending_signature"], first.to_string());
+            assert!(body.get("signature").is_none());
+            assert_eq!(
+                h.claim().await,
+                Some(ClaimState::Pending {
+                    signature: first,
+                    last_valid_block_height: Some(100),
+                })
+            );
+
+            // Still within the blockhash lifetime: no second payout.
+            h.rpc.lock().unwrap().block_height = 100;
+            let (status, _) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+            assert_eq!(h.sent().len(), 1);
+
+            // Expired at finalized commitment: the first payout can never land.
+            {
+                let mut rpc = h.rpc.lock().unwrap();
+                rpc.block_height = 101;
+                rpc.last_valid_block_height = 200;
+                rpc.next_status = Some(confirmed());
+            }
+            let (status, body) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let sent = h.sent();
+            assert_eq!(sent.len(), 2);
+            assert_eq!(h.claim().await, Some(ClaimState::Confirmed(sent[1])));
+        }
+
+        #[tokio::test]
+        async fn pending_payout_that_later_lands_is_reported_redeemed_without_repaying() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            h.rpc.lock().unwrap().next_status = None;
+            let destination = Pubkey::new_unique();
+            let (status, _) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+            let first = h.sent()[0];
+
+            h.rpc
+                .lock()
+                .unwrap()
+                .statuses
+                .insert(first.to_string(), confirmed());
+            let (status, body) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body["signature"], first.to_string());
+            assert_eq!(h.sent().len(), 1);
+            assert_eq!(h.claim().await, Some(ClaimState::Confirmed(first)));
+        }
+
+        #[tokio::test]
+        async fn ambiguous_broadcast_keeps_the_signed_payout_pending() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            h.rpc.lock().unwrap().send_mode = SendMode::Transport;
+            let destination = Pubkey::new_unique();
+            let (status, body) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+            let first = h.sent()[0];
+            assert!(matches!(
+                h.claim().await,
+                Some(ClaimState::Pending { signature, .. }) if signature == first
+            ));
+        }
+
+        #[tokio::test]
+        async fn rejected_preflight_releases_the_claim() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            h.rpc.lock().unwrap().send_mode = SendMode::Preflight;
+            let (status, _) = h.redeem(&Pubkey::new_unique()).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(h.claim().await, None);
+        }
     }
 }

@@ -477,6 +477,18 @@ impl RpcClient {
         Ok((blockhash, last_valid_block_height))
     }
 
+    /// `getBlockHeight` at `finalized` commitment.
+    pub async fn get_finalized_block_height(&self, rpc_url: &str) -> Result<u64> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBlockHeight",
+            "params": [{ "commitment": "finalized" }],
+        });
+        let result = self.post_rpc_value(rpc_url, body).await?;
+        result.as_u64().ok_or(Error::RpcMalformed)
+    }
+
     /// `sendTransaction` — submit a fully-signed, base64-encoded transaction.
     /// Returns the transaction signature on success.
     ///
