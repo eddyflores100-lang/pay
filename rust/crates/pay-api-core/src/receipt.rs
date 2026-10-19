@@ -450,8 +450,17 @@ fn attach_subscription_delegation_state(
     };
     subscription.subscription_id = Some(state.address.clone());
     subscription.plan = Some(state.plan.to_string());
-    if subscription.subscriber.is_none() {
-        subscription.subscriber = Some(state.subscriber.to_string());
+    // The delegator is the subscriber; the transfer authority the skeleton
+    // guessed may be the puller or the subscription-authority PDA.
+    let subscriber = state.subscriber.to_string();
+    if let Some(guessed) = subscription.subscriber.replace(subscriber.clone())
+        && guessed != subscriber
+    {
+        for event in &mut subscription.events {
+            if event.sender == guessed {
+                event.sender = subscriber.clone();
+            }
+        }
     }
 
     let period_hours = state.period_hours;
@@ -2430,6 +2439,44 @@ mod tests {
                     "{program}"
                 );
             }
+        }
+
+        #[tokio::test]
+        async fn pull_renewal_reports_the_delegator_as_subscriber() {
+            let rpc = StubRpc::start().await;
+            let f = Fixture::new(&subscriptions_program());
+            f.install(&rpc, SUBSCRIPTIONS_PROGRAM);
+            let authority = Pubkey::new_unique().to_string();
+            let puller = Pubkey::new_unique().to_string();
+            let mut value = tx(
+                SUBSCRIPTIONS_PROGRAM,
+                10,
+                &[
+                    f.subscription.to_string(),
+                    f.plan.to_string(),
+                    authority.clone(),
+                    "DelegatorATA".to_string(),
+                    "RecipientATA".to_string(),
+                    puller,
+                ],
+            );
+            value["meta"]["innerInstructions"] = json!([{
+                "index": 0,
+                "instructions": [
+                    token_transfer(&authority, "RecipientATA", &f.mint.to_string(), "10000000", 6),
+                    token_transfer("Merchant", "TreasuryATA", &f.mint.to_string(), "1", 6)
+                ]
+            }]);
+            let skeleton = parse(value.clone()).subscription.unwrap();
+            assert_eq!(skeleton.subscriber.as_deref(), Some(authority.as_str()));
+
+            let subscription = build(&rpc, &value).await.subscription.unwrap();
+            let delegator = f.subscriber.to_string();
+            assert_eq!(subscription.subscriber.as_deref(), Some(delegator.as_str()));
+            assert_eq!(subscription.events[0].sender, delegator);
+            assert_eq!(subscription.events[0].kind, "renew");
+            // Unrelated legs keep their own sender.
+            assert_eq!(subscription.events[1].sender, "Merchant");
         }
 
         #[tokio::test]
