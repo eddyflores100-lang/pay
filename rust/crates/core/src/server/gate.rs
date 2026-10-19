@@ -1005,8 +1005,9 @@ impl<S: PaymentState> PaymentGate<S> {
             let amount = metering::upto_max_usd(meter, price.as_ref())
                 .map(|usd| format!("{usd}"))
                 .ok_or_else(|| "x402-upto with several dimensions requires upto.max_usd".into());
+            let route = upto_route(req, path);
             match amount.and_then(|amount| {
-                upto.payment_required_header(&amount)
+                upto.payment_required_header_for_route(&amount, Some(&route))
                     .map_err(|e| e.to_string())
             }) {
                 Ok((name, value)) => {
@@ -1231,7 +1232,12 @@ impl<S: PaymentState> PaymentGate<S> {
             ));
         };
         let amount = format!("{ceiling}");
-        match upto.verify_open(pay_header, &amount).await {
+        // The challenge bound the authorization to this route.
+        let route = upto_route(req, path);
+        match upto
+            .verify_open_for_route(pay_header, &amount, Some(&route))
+            .await
+        {
             Ok(open) => {
                 let ceiling_usd: f64 = amount.parse().unwrap_or(0.0);
                 let settle_amount =
@@ -2404,6 +2410,13 @@ fn upto_collected_amount_usd(
 }
 
 /// Reconstruct a minimal URI from path + query for split-rule resolution.
+/// The request identity an x402 `upto` authorization is bound to: method,
+/// path and query. The host is client-supplied and left out.
+fn upto_route(req: &GateRequest<'_>, path: &str) -> String {
+    let query = req.query.map(|q| format!("?{q}")).unwrap_or_default();
+    format!("{} /{}{query}", req.method, path.trim_start_matches('/'))
+}
+
 fn reconstruct_uri(path: &str, query: Option<&str>) -> http::Uri {
     format!(
         "/{}{}",
@@ -2782,6 +2795,26 @@ mod tests {
             network: "solana:devnet".to_string(),
             amount: "500".to_string(),
         }
+    }
+
+    #[test]
+    fn upto_route_binds_method_path_and_query() {
+        let get = Method::GET;
+        let post = Method::POST;
+        let route = |method: &Method, path: &str, query: Option<&str>| {
+            let mut request = req(method, path);
+            request.query = query;
+            request.host = Some("attacker.example");
+            upto_route(&request, path)
+        };
+        assert_eq!(route(&get, "reports", Some("id=7")), "GET /reports?id=7");
+        assert_eq!(route(&get, "/reports", None), "GET /reports");
+        assert_ne!(route(&get, "route-a", None), route(&get, "route-b", None));
+        assert_ne!(route(&get, "orders", None), route(&post, "orders", None));
+        assert_ne!(
+            route(&get, "reports", Some("id=7")),
+            route(&get, "reports", Some("id=8"))
+        );
     }
 
     #[test]
