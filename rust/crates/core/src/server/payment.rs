@@ -126,7 +126,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                     Ok(result) => result,
                     Err(mut response) => {
                         if let Some(forward) = upto.take()
-                            && let Some((name, value)) = crate::server::gate::settle_upto(
+                            && let Ok(Some((name, value))) = crate::server::gate::settle_upto(
                                 &state,
                                 *forward.open,
                                 0,
@@ -206,19 +206,20 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                 None => forwarding.await,
             };
             // x402 `upto`: settle the opened channel *after* serving — debit the
-            // metered amount on success, refund on failure.
+            // metered amount on success, refund on failure. A served response
+            // whose charge did not settle is withheld.
             if let Some(uf) = upto {
                 let served_ok = response.status().is_success();
-                if let Some(plan) = uf.settlement {
+                let settled = if let Some(plan) = uf.settlement {
                     if metering::upto_requires_response_body(
                         &plan.metering,
                         plan.variant_hint.as_deref(),
                     ) {
                         let limit = metering::upto_response_body_limit(&plan.metering);
-                        let (mut parts, body) = response.into_parts();
+                        let (parts, body) = response.into_parts();
                         match axum::body::to_bytes(body, limit).await {
                             Ok(bytes) => {
-                                if let Some((n, v)) = crate::server::gate::settle_upto_metered(
+                                let settled = crate::server::gate::settle_upto_metered(
                                     &state,
                                     *uf.open,
                                     plan,
@@ -227,21 +228,25 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                                     Some(&bytes),
                                     uf.telemetry,
                                 )
-                                .await
-                                {
-                                    parts.headers.append(n, v);
-                                }
+                                .await;
+                                let mut parts = parts;
                                 parts.headers.remove(header::CONTENT_LENGTH);
                                 response = Response::from_parts(parts, Body::from(bytes));
+                                settled
                             }
                             Err(e) => {
                                 tracing::warn!(
                                     error = %e,
                                     "failed to buffer x402 upto response body; refunding"
                                 );
-                                let mut builder =
-                                    Response::builder().status(StatusCode::BAD_GATEWAY);
-                                if let Some((n, v)) = crate::server::gate::settle_upto(
+                                response = Response::builder()
+                                    .status(StatusCode::BAD_GATEWAY)
+                                    .header(header::CONTENT_TYPE, "application/json")
+                                    .body(Body::from(r#"{"error":"response_metering_failed"}"#))
+                                    .unwrap_or_else(|_| {
+                                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                                    });
+                                crate::server::gate::settle_upto(
                                     &state,
                                     *uf.open,
                                     0,
@@ -249,40 +254,39 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                                     uf.telemetry,
                                 )
                                 .await
-                                {
-                                    builder = builder.header(n, v);
-                                }
-                                response = builder
-                                    .header(header::CONTENT_TYPE, "application/json")
-                                    .body(Body::from(r#"{"error":"response_metering_failed"}"#))
-                                    .unwrap_or_else(|_| {
-                                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                                    });
                             }
                         }
-                    } else if let Some((n, v)) = crate::server::gate::settle_upto_metered(
+                    } else {
+                        crate::server::gate::settle_upto_metered(
+                            &state,
+                            *uf.open,
+                            plan,
+                            served_ok,
+                            response.headers(),
+                            None,
+                            uf.telemetry,
+                        )
+                        .await
+                    }
+                } else {
+                    crate::server::gate::settle_upto(
                         &state,
                         *uf.open,
-                        plan,
+                        uf.settle_amount,
                         served_ok,
-                        response.headers(),
-                        None,
                         uf.telemetry,
                     )
                     .await
-                    {
+                };
+                match settled {
+                    Ok(Some((n, v))) => {
                         response.headers_mut().append(n, v);
                     }
-                } else if let Some((n, v)) = crate::server::gate::settle_upto(
-                    &state,
-                    *uf.open,
-                    uf.settle_amount,
-                    served_ok,
-                    uf.telemetry,
-                )
-                .await
-                {
-                    response.headers_mut().append(n, v);
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "x402 upto settlement failed; withholding response");
+                        response = payment_commit_failed_response();
+                    }
                 }
             }
             // x402 `batch-settlement`: the voucher commits only now, and only
@@ -650,6 +654,15 @@ pub(super) async fn settle_axum_delegated_response(
 /// USD-pegged settlement tokens (1 whole token == $1). Server startup
 /// enforces that invariant by refusing non-pegged session currencies
 /// (`ensure_session_currencies_usd_pegged` in the CLI server start path).
+/// A served response whose payment did not settle: the body is withheld.
+fn payment_commit_failed_response() -> Response {
+    Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"error":"payment_commit_failed"}"#))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
 pub(crate) fn price_unit_base_amount(price: &metering::ResolvedPrice, decimals: u8) -> u64 {
     let per_unit = price
         .dimensions

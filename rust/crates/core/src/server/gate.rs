@@ -2250,22 +2250,17 @@ pub async fn cache_batch_response<S: PaymentState>(
 /// serve, refunds the full deposit (settle `0`) on failure, and returns the
 /// `PAYMENT-RESPONSE` receipt header to set on the response.
 ///
-/// Routes through the shared batched-settlement worker (`settle_actual_deferred`):
-/// concurrent settlements pack into one operator-signed tx that is **sent
-/// without waiting for confirmation**, with the background worker confirming +
-/// retrying. This takes the multi-second confirm poll off the response path —
-/// the client's funds are locked by the confirmed `open`, so a late or failed
-/// background confirm is an operator-retry concern (the channel store sweeps
-/// it), not a client error. Settlement errors are logged, not surfaced (the
-/// resource was already served).
+/// Routes through the shared batched-settlement worker
+/// (`settle_actual_deferred`), which confirms the settlement before returning.
+/// `Err` means a served response owing a non-zero amount was not paid: the
+/// adapter must withhold it. A failed refund is only logged.
 pub async fn settle_upto<S: PaymentState>(
     state: &S,
     open: VerifiedUptoOpen,
     settle_amount: u64,
     served_ok: bool,
     telemetry_context: UptoPaymentTelemetry,
-) -> Option<(HeaderName, HeaderValue)> {
-    let upto = state.x402_upto()?;
+) -> Result<Option<(HeaderName, HeaderValue)>, crate::Error> {
     // Settle the configured voucher (clamped to the ceiling) on success, full
     // refund (`0`) on failure.
     let amount = if served_ok {
@@ -2273,41 +2268,48 @@ pub async fn settle_upto<S: PaymentState>(
     } else {
         0
     };
+    let unpaid = |message: String| {
+        telemetry::record_settlement_error(
+            "x402/upto",
+            &telemetry_context.subdomain,
+            &telemetry_context.path,
+            &message,
+            true,
+        );
+        unsettled_upto(amount, message)
+    };
+    let Some(upto) = state.x402_upto() else {
+        return unpaid("x402 upto backend is not configured".to_string());
+    };
     let amount_usd = served_ok
         .then(|| upto_collected_amount_usd(telemetry_context.ceiling_usd, amount, open.max_amount))
         .flatten();
-    match upto.settle_actual_deferred(&open, amount).await {
-        Ok(settlement) => {
-            tracing::Span::current().record("tx_sig", settlement.transaction.as_str());
-            if let Some(ui_amount) = amount_usd {
-                telemetry::record_payment_collected(
-                    "x402/upto",
-                    &telemetry_context.subdomain,
-                    &telemetry_context.path,
-                    Some(&telemetry::PaymentAmount {
-                        currency: "USD".to_string(),
-                        ui_amount,
-                    }),
-                    &settlement.transaction,
-                );
-            }
-            match upto.settlement_header(&settlement) {
-                Ok((name, value)) => Some((
-                    HeaderName::from_bytes(name.as_bytes()).ok()?,
-                    HeaderValue::from_str(&value).ok()?,
-                )),
-                Err(e) => {
-                    telemetry::record_settlement_error(
-                        "x402/upto",
-                        &telemetry_context.subdomain,
-                        &telemetry_context.path,
-                        &e.to_string(),
-                        true,
-                    );
-                    None
-                }
-            }
-        }
+    let outcome = upto
+        .settle_actual_deferred(&open, amount)
+        .await
+        .map_err(|e| e.to_string());
+    let settlement = match confirmed_upto_settlement(outcome) {
+        Ok(settlement) => settlement,
+        Err(message) => return unpaid(message),
+    };
+    tracing::Span::current().record("tx_sig", settlement.transaction.as_str());
+    if let Some(ui_amount) = amount_usd {
+        telemetry::record_payment_collected(
+            "x402/upto",
+            &telemetry_context.subdomain,
+            &telemetry_context.path,
+            Some(&telemetry::PaymentAmount {
+                currency: "USD".to_string(),
+                ui_amount,
+            }),
+            &settlement.transaction,
+        );
+    }
+    // Settled: a receipt that fails to encode is logged, not unpaid.
+    match upto.settlement_header(&settlement) {
+        Ok((name, value)) => Ok(HeaderName::from_bytes(name.as_bytes())
+            .ok()
+            .zip(HeaderValue::from_str(&value).ok())),
         Err(e) => {
             telemetry::record_settlement_error(
                 "x402/upto",
@@ -2316,8 +2318,39 @@ pub async fn settle_upto<S: PaymentState>(
                 &e.to_string(),
                 true,
             );
-            None
+            Ok(None)
         }
+    }
+}
+
+/// A settle attempt counts only when it reports success with a signature.
+fn confirmed_upto_settlement(
+    outcome: Result<pay_kit::x402::upto::UptoSettlementResponse, String>,
+) -> Result<pay_kit::x402::upto::UptoSettlementResponse, String> {
+    let settlement = outcome?;
+    if !settlement.success {
+        return Err(settlement
+            .error_reason
+            .unwrap_or_else(|| "settlement was not successful".to_string()));
+    }
+    if settlement.transaction.is_empty() {
+        return Err("settlement returned no transaction signature".to_string());
+    }
+    Ok(settlement)
+}
+
+/// An unsettled charge leaves a served response unpaid; an unsettled refund
+/// (nothing owed) does not.
+fn unsettled_upto(
+    amount: u64,
+    message: String,
+) -> Result<Option<(HeaderName, HeaderValue)>, crate::Error> {
+    if amount > 0 {
+        Err(crate::Error::PaymentRejected(format!(
+            "x402 upto settlement failed: {message}"
+        )))
+    } else {
+        Ok(None)
     }
 }
 
@@ -2325,7 +2358,7 @@ pub async fn settle_upto<S: PaymentState>(
 ///
 /// When the response did not successfully serve, this always settles `0`
 /// (refund). When usage extraction fails under `missing_usage: error`, it also
-/// refunds so funds are not stranded.
+/// refunds so funds are not stranded. Errors as [`settle_upto`].
 pub async fn settle_upto_metered<S: PaymentState>(
     state: &S,
     open: VerifiedUptoOpen,
@@ -2334,7 +2367,7 @@ pub async fn settle_upto_metered<S: PaymentState>(
     response_headers: &http::HeaderMap,
     response_body: Option<&[u8]>,
     telemetry_context: UptoPaymentTelemetry,
-) -> Option<(HeaderName, HeaderValue)> {
+) -> Result<Option<(HeaderName, HeaderValue)>, crate::Error> {
     if !served_ok {
         return settle_upto(state, open, 0, false, telemetry_context).await;
     }
@@ -2736,6 +2769,41 @@ mod tests {
     // Ceiling $0.10 at 6 decimals == 100_000 base units (USDC).
     const CEILING_USD: f64 = 0.10;
     const CEILING_BASE: u64 = 100_000;
+
+    fn upto_settlement(
+        success: bool,
+        transaction: &str,
+    ) -> pay_kit::x402::upto::UptoSettlementResponse {
+        pay_kit::x402::upto::UptoSettlementResponse {
+            success,
+            error_reason: (!success).then(|| "distribute failed".to_string()),
+            payer: None,
+            transaction: transaction.to_string(),
+            network: "solana:devnet".to_string(),
+            amount: "500".to_string(),
+        }
+    }
+
+    #[test]
+    fn only_a_confirmed_upto_settlement_counts_as_paid() {
+        assert!(confirmed_upto_settlement(Ok(upto_settlement(true, "sig"))).is_ok());
+        assert_eq!(
+            confirmed_upto_settlement(Ok(upto_settlement(false, "sig"))).unwrap_err(),
+            "distribute failed"
+        );
+        assert!(confirmed_upto_settlement(Ok(upto_settlement(true, ""))).is_err());
+        assert!(confirmed_upto_settlement(Err("confirmation timed out".into())).is_err());
+    }
+
+    #[test]
+    fn an_unsettled_upto_charge_withholds_the_response() {
+        assert!(matches!(
+            unsettled_upto(1, "rpc down".into()),
+            Err(crate::Error::PaymentRejected(_))
+        ));
+        // A failed refund owes nothing, so the error response still goes out.
+        assert!(matches!(unsettled_upto(0, "rpc down".into()), Ok(None)));
+    }
 
     #[test]
     fn gate_path_rejects_dot_segments_in_every_spelling() {

@@ -333,8 +333,8 @@ impl<S: PaymentState> Http402Gate<S> {
         }
     }
 
-    /// `Err` means a served batch authorization failed to commit: the caller
-    /// must replace the successful response with an error. The returned headers
+    /// `Err` means a served payment (batch commit or upto charge) did not
+    /// settle: the caller must replace the successful response with an error. The returned headers
     /// (e.g. an x402 `exact` receipt) still ride that error response.
     async fn drain_payment_headers_with_response(
         &self,
@@ -345,7 +345,7 @@ impl<S: PaymentState> Http402Gate<S> {
         response_body: Option<&[u8]>,
     ) -> Result<Vec<(HeaderName, HeaderValue)>, Vec<(HeaderName, HeaderValue)>> {
         let mut extra: Vec<(HeaderName, HeaderValue)> = Vec::new();
-        let mut batch_committed = true;
+        let mut payment_committed = true;
         if !served_ok {
             // Dropping the forwarded session drops its capacity lease. Keep
             // this in the shared terminal-path drain so request buffering,
@@ -353,12 +353,18 @@ impl<S: PaymentState> Http402Gate<S> {
             // release immediately.
             ctx.session.take();
         }
-        if let Some(pending) = ctx.upto.take()
-            && let Some((n, v)) = self
+        if let Some(pending) = ctx.upto.take() {
+            match self
                 .settle_pending_upto(pending, served_ok, response_headers, response_body)
                 .await
-        {
-            extra.push((n, v));
+            {
+                Ok(Some(header)) => extra.push(header),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(%error, "x402 upto settlement failed; withholding response");
+                    payment_committed = false;
+                }
+            }
         }
         if let Some(pending) = ctx.batch.take() {
             match settle_batch(
@@ -376,7 +382,7 @@ impl<S: PaymentState> Http402Gate<S> {
                 Ok(None) => {}
                 Err(error) => {
                     tracing::error!(%error, "x402 batch commit failed; withholding response");
-                    batch_committed = false;
+                    payment_committed = false;
                 }
             }
         }
@@ -387,7 +393,7 @@ impl<S: PaymentState> Http402Gate<S> {
             }
         }
         ctx.logged_payment_headers.extend(extra.iter().cloned());
-        if batch_committed {
+        if payment_committed {
             Ok(extra)
         } else {
             Err(extra)
@@ -400,7 +406,7 @@ impl<S: PaymentState> Http402Gate<S> {
         served_ok: bool,
         response_headers: &HeaderMap,
         response_body: Option<&[u8]>,
-    ) -> Option<(HeaderName, HeaderValue)> {
+    ) -> Result<Option<(HeaderName, HeaderValue)>, pay_core::Error> {
         match pending.settlement {
             Some(plan) => {
                 settle_upto_metered(
@@ -1216,12 +1222,21 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         // only covers fixed-amount plans.
         if let Some(pending) = ctx.upto.take() {
             let served_ok = upstream_response.status.is_success();
-            if let Some((name, value)) = self
+            match self
                 .settle_pending_upto(pending, served_ok, &upstream_response.headers, None)
                 .await
             {
-                let _ = upstream_response.insert_header(name.clone(), value.clone());
-                ctx.logged_payment_headers.push((name, value));
+                Ok(Some((name, value))) => {
+                    let _ = upstream_response.insert_header(name.clone(), value.clone());
+                    ctx.logged_payment_headers.push((name, value));
+                }
+                Ok(None) => {}
+                // Headers are not yet sent: fail the request instead of
+                // releasing a response whose charge did not settle.
+                Err(error) => {
+                    tracing::error!(%error, "x402 upto settlement failed; withholding response");
+                    return Err(batch_commit_failed_error());
+                }
             }
         }
         // Batch authorization is also post-response. Unlike `upto`, its hot
@@ -1322,7 +1337,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         // drains. Dropping the session releases its capacity lease.
         ctx.session.take();
         if let Some(pending) = ctx.upto.take()
-            && let Some(header) = self
+            && let Ok(Some(header)) = self
                 .settle_pending_upto(pending, false, &HeaderMap::new(), None)
                 .await
         {
