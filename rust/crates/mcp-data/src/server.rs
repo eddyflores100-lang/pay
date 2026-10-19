@@ -437,11 +437,7 @@ async fn verified_tenant(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let proxy_verified = request
-        .headers()
-        .get(PROXY_PROOF_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|proof| state.bindings.verify_internal_proof(proof).is_ok());
+    let proxy_verified = proxy_verified(&state, request.headers());
     let tenant = request
         .headers()
         .get(VERIFIED_PAYER_HEADER)
@@ -467,7 +463,21 @@ async fn verified_tenant(
     }
 }
 
+fn proxy_verified(state: &AppState, headers: &HeaderMap) -> bool {
+    headers
+        .get(PROXY_PROOF_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|proof| state.bindings.verify_internal_proof(proof).is_ok())
+}
+
 async fn gateway_read(State(state): State<AppState>, request: Request) -> Response {
+    if !proxy_verified(&state, request.headers()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "verified_gateway_required" })),
+        )
+            .into_response();
+    }
     match gateway_read_inner(state, request).await {
         Ok(response) => response,
         Err(error) => {
@@ -623,6 +633,112 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    const PROXY_PROOF: &str = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    const STORE_ID: &str = "fds-0123456789abcdef-weather";
+    const STORE_PATH: &str = "/v1/projects/project/databases/(default)/documents/pay-data/0123456789abcdef/documentStores/fds-0123456789abcdef-weather";
+
+    /// Firestore REST fixture serving one published store and one document.
+    async fn published_store_fixture() -> (
+        DriverRegistry,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let provider = Router::new().fallback(move |request: Request| {
+            let observed = observed.clone();
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                let path = request.uri().path().to_string();
+                let store_name = STORE_PATH.trim_start_matches("/v1/");
+                let body = if path == STORE_PATH {
+                    serde_json::json!({
+                        "name": store_name,
+                        "updateTime": "2026-10-19T00:00:00Z",
+                        "fields": {
+                            "phase": { "stringValue": "ready" },
+                            "gatewayReads": { "booleanValue": true }
+                        }
+                    })
+                } else if path == format!("{STORE_PATH}/documents/known-key") {
+                    serde_json::json!({
+                        "name": format!("{store_name}/documents/known-key"),
+                        "fields": { "payload": { "stringValue": "{\"secret\":\"published\"}" } }
+                    })
+                } else {
+                    return (StatusCode::NOT_FOUND, Json(serde_json::json!({}))).into_response();
+                };
+                Json(body).into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, provider).await.unwrap() });
+        let driver = crate::firestore::FirestoreDriver::new(crate::firestore::FirestoreConfig {
+            project: "project".into(),
+            database: "(default)".into(),
+            region: "us-central1".into(),
+            api_base: base,
+            metadata_base: "http://metadata.invalid".into(),
+            access_token: Some("token".into()),
+        })
+        .unwrap();
+        let drivers =
+            DriverRegistry::new([Arc::new(driver) as Arc<dyn crate::driver::DataDriver>]).unwrap();
+        (drivers, calls, task)
+    }
+
+    fn gateway_request(proof: Option<&str>) -> Request {
+        let mut builder = Request::builder()
+            .uri("/known-key")
+            .header("host", "arbitrary-service-host")
+            .header(
+                ORIGINAL_HOST_HEADER,
+                format!("{STORE_ID}.data.gcp.gateway-402.com"),
+            );
+        if let Some(proof) = proof {
+            builder = builder.header(PROXY_PROOF_HEADER, proof);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn gateway_reads_require_the_proxy_proof() {
+        use std::sync::atomic::Ordering;
+        let (drivers, calls, task) = published_store_fixture().await;
+        let app = router(
+            drivers,
+            "data.gcp.gateway-402.com".into(),
+            vec!["localhost".into()],
+            BindingIssuer::new(vec![7; 32], PROXY_PROOF.as_bytes().to_vec()).unwrap(),
+        );
+        for proof in [None, Some(""), Some("yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy")] {
+            let response = app.clone().oneshot(gateway_request(proof)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{proof:?}");
+            assert!(response.headers().get(USAGE_HEADER).is_none());
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no provider read before proof"
+        );
+
+        let response = app
+            .oneshot(gateway_request(Some(PROXY_PROOF)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(USAGE_HEADER).is_some());
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["store_id"], STORE_ID);
+        assert_eq!(body["value"]["secret"], "published");
+        task.abort();
     }
 
     #[tokio::test]
