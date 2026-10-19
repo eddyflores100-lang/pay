@@ -143,6 +143,13 @@ pub struct PaidRequestTelemetry {
     pub payment: Option<telemetry::PaymentAmount>,
 }
 
+/// Whether a protected handler completed and its delegated session must be
+/// charged: any 2xx, and for static sessions any 3xx, since a redirect can
+/// follow a completed side effect. Deployment leases charge only 2xx.
+pub fn session_response_served(status: StatusCode, deployment: bool) -> bool {
+    status.is_success() || (!deployment && status.is_redirection())
+}
+
 /// Streaming media types handled consistently by both HTTP adapters.
 pub fn is_streaming_response(headers: &HeaderMap) -> bool {
     headers
@@ -2715,6 +2722,24 @@ mod tests {
             let response = gate_path(path).expect_err(path);
             assert_eq!(response.status, StatusCode::BAD_REQUEST, "{path}");
         }
+    }
+
+    #[test]
+    fn delegated_sessions_charge_completed_redirects_only_with_successes() {
+        for status in [200, 201, 204, 301, 302, 303, 307, 308] {
+            assert!(session_response_served(
+                StatusCode::from_u16(status).unwrap(),
+                false
+            ));
+        }
+        for status in [400, 402, 404, 429, 500, 502, 504] {
+            assert!(!session_response_served(
+                StatusCode::from_u16(status).unwrap(),
+                false
+            ));
+        }
+        assert!(session_response_served(StatusCode::OK, true));
+        assert!(!session_response_served(StatusCode::FOUND, true));
     }
 
     #[test]

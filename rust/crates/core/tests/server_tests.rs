@@ -1319,3 +1319,158 @@ endpoints:
         );
     }
 }
+
+// ── Static delegated sessions charge completed redirects ──
+
+mod static_session_redirects {
+    use super::*;
+    use pay_core::server::payment::payment_middleware;
+    use pay_core::server::session::test_channel_state;
+    use pay_kit::mpp::SessionAuthentication;
+    use pay_kit::mpp::server::session::VoucherSigner;
+    use pay_kit::mpp::store::{ChannelStore, MemoryChannelStore};
+    use pay_kit::solana_keychain::{MemorySigner, SolanaSigner, TransactionSigner};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt;
+
+    #[derive(Clone)]
+    struct StaticState {
+        apis: Arc<Vec<ApiSpec>>,
+        session: Arc<SessionMpp>,
+    }
+
+    impl PaymentState for StaticState {
+        fn apis(&self) -> &[ApiSpec] {
+            &self.apis
+        }
+        fn mpp(&self) -> Option<&Mpp> {
+            None
+        }
+        fn session_mpp(&self) -> Option<&SessionMpp> {
+            Some(&self.session)
+        }
+        fn session_mpp_handle(&self) -> Option<Arc<SessionMpp>> {
+            Some(self.session.clone())
+        }
+    }
+
+    fn signer() -> MemorySigner {
+        MemorySigner::from_bytes(&solana_keypair::Keypair::new().to_bytes()).unwrap()
+    }
+
+    /// Spent amount after two paid requests whose handler returns `status`.
+    async fn spent_after_two_requests(status: StatusCode) -> (u64, usize) {
+        let operator = signer();
+        let operator_address = operator.pubkey().to_string();
+        let operator: Arc<dyn TransactionSigner> = Arc::new(operator);
+        let store = Arc::new(MemoryChannelStore::new());
+        let config = SessionConfig {
+            operator: operator_address.clone(),
+            recipient: solana_pubkey::Pubkey::new_unique().to_string(),
+            currency: "USDC".to_string(),
+            decimals: 6,
+            network: "localnet".to_string(),
+            voucher_signer: VoucherSigner::Operator,
+            ..SessionConfig::default()
+        };
+        let session = Arc::new(
+            SessionMpp::new_with_channel_store(config, "static-redirect-secret", store.clone())
+                .with_blockhash_cache({
+                    let cache = pay_kit::mpp::blockhash::BlockhashCache::new();
+                    cache.set("SURFNETxSAFEHASHxxxxxxxxxxxxxxxxxxxxx11x".into(), 42, 123);
+                    cache
+                })
+                .with_payment_channel_signer(operator),
+        );
+        let challenge = session.challenge(None).unwrap();
+        let channel = solana_pubkey::Pubkey::new_unique();
+        let payer = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let proof = SessionAuthentication::sign(challenge.id.clone(), &channel.to_string(), &payer)
+            .unwrap();
+        store
+            .put_channel(
+                &channel.to_string(),
+                test_channel_state(
+                    channel.to_string(),
+                    1_000_000,
+                    operator_address,
+                    "operator",
+                    &challenge.id,
+                    proof.payer.clone(),
+                    Some(serde_json::to_string(&proof).unwrap()),
+                ),
+            )
+            .await
+            .unwrap();
+        let authorization =
+            pay_core::client::session::SessionHandle::new(channel, Box::new(signer()), challenge)
+                .with_authentication(proof)
+                .use_header()
+                .await
+                .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = calls.clone();
+        let app = Router::new()
+            .fallback(any(move || {
+                handler_calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    axum::response::Response::builder()
+                        .status(status)
+                        .header("location", "/completed")
+                        .body(Body::from("completed"))
+                        .unwrap()
+                }
+            }))
+            .layer(middleware::from_fn_with_state(
+                StaticState {
+                    apis: Arc::new(vec![
+                        serde_yml::from_str(include_str!("fixtures/test-paywall.yml")).unwrap(),
+                    ]),
+                    session: session.clone(),
+                },
+                payment_middleware::<StaticState>,
+            ));
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/simple/echo")
+                        .header("host", "testapi")
+                        .header("authorization", authorization.as_str())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+        }
+        let state = store
+            .get_channel(&channel.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        (state.spent_amount, calls.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_redirects_are_charged_like_successes() {
+        let (redirect_spent, calls) = spent_after_two_requests(StatusCode::SEE_OTHER).await;
+        let (success_spent, _) = spent_after_two_requests(StatusCode::OK).await;
+        assert_eq!(calls, 2);
+        assert!(success_spent > 0);
+        assert_eq!(
+            redirect_spent, success_spent,
+            "each completed 303 must be charged"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_responses_are_not_charged() {
+        let (spent, calls) = spent_after_two_requests(StatusCode::BAD_REQUEST).await;
+        assert_eq!(calls, 2);
+        assert_eq!(spent, 0);
+    }
+}

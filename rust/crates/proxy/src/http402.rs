@@ -659,7 +659,12 @@ impl<S: PaymentState> Http402Gate<S> {
         };
 
         self.observe_buffered_metered_response(ctx, &response_headers, &body);
-        if status.is_success() {
+        if pay_core::server::gate::session_response_served(
+            status,
+            ctx.session
+                .as_ref()
+                .is_some_and(|forward| forward.deadline().is_some()),
+        ) {
             match self
                 .settle_delegated_session(ctx, &response_headers, &body)
                 .await
@@ -867,7 +872,12 @@ impl<S: PaymentState> Http402Gate<S> {
                 .await;
             }
         };
-        if status.is_success() {
+        if pay_core::server::gate::session_response_served(
+            status,
+            ctx.session
+                .as_ref()
+                .is_some_and(|forward| forward.deadline().is_some()),
+        ) {
             match self.settle_delegated_session(ctx, &headers, &body).await {
                 Ok(Some(receipt)) => ctx.receipt = Some(receipt),
                 Ok(None) => {}

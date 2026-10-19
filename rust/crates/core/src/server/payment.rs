@@ -525,7 +525,11 @@ pub(super) async fn settle_axum_delegated_response(
     forward: crate::server::gate::SessionForward,
     response: Response,
 ) -> Response {
-    if !response.status().is_success() && forward.deadline().is_none() {
+    let served = crate::server::gate::session_response_served(
+        response.status(),
+        forward.deadline().is_some(),
+    );
+    if !served && forward.deadline().is_none() {
         // Dropping `forward` releases the capacity lease without charging for
         // a response that was not successfully served.
         return response;
@@ -598,7 +602,7 @@ pub(super) async fn settle_axum_delegated_response(
         }
     };
 
-    if !parts.status.is_success() {
+    if !served {
         parts.headers.remove(header::CONTENT_LENGTH);
         return Response::from_parts(parts, Body::from(bytes));
     }
