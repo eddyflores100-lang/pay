@@ -1131,6 +1131,24 @@ fn do_paid_fetch(
         )
     };
 
+    // A definitive answer to a paid retry ends the attempt; a transport or
+    // server error keeps its idempotency material for the caller's retry.
+    let attempt = pay_core::client::attempt::PaymentAttempt::new(
+        method,
+        url,
+        body.map(RequestBody::as_bytes),
+    );
+    let paid_fetch = |headers: &[(String, String)]| {
+        let outcome = fetch_request(headers)?;
+        if !matches!(
+            outcome,
+            RunOutcome::Completed { exit_code, .. } if exit_code != 0
+        ) {
+            attempt.resolved();
+        }
+        Ok::<_, pay_core::Error>(outcome)
+    };
+
     // Every signing operation runs under `scope.with_approval`: a fresh gate
     // chosen by the caller's context (the platform prompt or the client's
     // elicitation on a laptop, the tenant's spending policy in the cloud),
@@ -1246,13 +1264,14 @@ fn do_paid_fetch(
                         permissions.authorize_x402(challenge.as_ref(), &resource_url)?;
                     }
                     let built_payment = scope.with_approval(peer.as_ref(), |auth| {
-                        pay_core::client::x402::build_payment_with_override(
+                        pay_core::client::x402::build_payment_for_attempt(
                             challenge.as_ref(),
                             store,
                             network_override.as_deref(),
                             account_override.as_deref(),
                             Some(url),
                             auth,
+                            Some(&attempt),
                         )
                     })?;
                     headers.extend(
@@ -1284,7 +1303,7 @@ fn do_paid_fetch(
                     );
                 }
             }
-            interpret_retry(fetch_request(&headers)?)
+            interpret_retry(paid_fetch(&headers)?)
         }
         RunOutcome::X402Challenge {
             challenge,
@@ -1295,13 +1314,14 @@ fn do_paid_fetch(
                 permissions.authorize_x402(&challenge, &resource_url)?;
             }
             let built_payment = scope.with_approval(peer.as_ref(), |auth| {
-                pay_core::client::x402::build_payment_with_override(
+                pay_core::client::x402::build_payment_for_attempt(
                     &challenge,
                     store,
                     network_override.as_deref(),
                     account_override.as_deref(),
                     Some(url),
                     auth,
+                    Some(&attempt),
                 )
             })?;
             let mut headers = extra_headers.to_vec();
@@ -1311,7 +1331,7 @@ fn do_paid_fetch(
                     .into_iter()
                     .map(|(name, value)| (name.to_string(), value)),
             );
-            interpret_retry(fetch_request(&headers)?)
+            interpret_retry(paid_fetch(&headers)?)
         }
         RunOutcome::X402UptoChallenge {
             challenge,
@@ -1338,7 +1358,7 @@ fn do_paid_fetch(
                     .into_iter()
                     .map(|(name, value)| (name.to_string(), value)),
             );
-            interpret_retry(fetch_request(&headers)?)
+            interpret_retry(paid_fetch(&headers)?)
         }
         RunOutcome::X402BatchChallenge {
             challenge,
@@ -1369,7 +1389,7 @@ fn do_paid_fetch(
                     .into_iter()
                     .map(|(name, value)| (name.to_string(), value)),
             );
-            let outcome = fetch_request(&headers)?;
+            let outcome = paid_fetch(&headers)?;
 
             // A corrective 402 means the server's watermark is ahead of ours
             // (a previous response was lost in flight). It proves where it is
@@ -1409,7 +1429,7 @@ fn do_paid_fetch(
                         .into_iter()
                         .map(|(name, value)| (name.to_string(), value)),
                 );
-                let outcome = fetch_request(&headers)?;
+                let outcome = paid_fetch(&headers)?;
                 commit_batch_settlement(
                     session_cache,
                     &corrective.requirements,
@@ -1457,7 +1477,7 @@ fn do_paid_fetch(
                             .into_iter()
                             .map(|(name, value)| (name.to_string(), value)),
                     );
-                    Some(fetch_request(&headers)?)
+                    Some(paid_fetch(&headers)?)
                 }
                 Err(error) if payment_fallback.is_none() => return Err(error),
                 Err(_) => None,
@@ -1474,13 +1494,14 @@ fn do_paid_fetch(
                     permissions.authorize_x402(&pay_challenge, &resource_url)?;
                 }
                 let built_payment = scope.with_approval(peer.as_ref(), |auth| {
-                    pay_core::client::x402::build_payment_with_override(
+                    pay_core::client::x402::build_payment_for_attempt(
                         &pay_challenge,
                         store,
                         network_override.as_deref(),
                         account_override.as_deref(),
                         Some(url),
                         auth,
+                        Some(&attempt),
                     )
                 })?;
                 let mut headers = extra_headers.to_vec();
@@ -1490,7 +1511,7 @@ fn do_paid_fetch(
                         .into_iter()
                         .map(|(name, value)| (name.to_string(), value)),
                 );
-                interpret_retry(fetch_request(&headers)?)
+                interpret_retry(paid_fetch(&headers)?)
             } else if let Some(RunOutcome::PaymentRejected { reason, .. }) = retry {
                 Err(pay_core::Error::PaymentRejected(reason))
             } else {
@@ -1530,7 +1551,7 @@ fn do_paid_fetch(
                 })?;
             let mut headers = extra_headers.to_vec();
             headers.push(("Authorization".to_string(), open_authorization));
-            let retry = fetch_request(&headers)?;
+            let retry = paid_fetch(&headers)?;
             if matches!(&retry, RunOutcome::Completed { .. }) {
                 // Only retain a session after the gateway accepted its open
                 // request; otherwise the channel may not exist remotely.
@@ -1570,7 +1591,7 @@ fn do_paid_fetch(
             })?;
             let mut headers = extra_headers.to_vec();
             headers.push(("Authorization".to_string(), built.authorization.clone()));
-            let retry = fetch_request(&headers)?;
+            let retry = paid_fetch(&headers)?;
             if let RunOutcome::Completed { exit_code, .. } = &retry
                 && *exit_code == 0
                 && let Err(e) =

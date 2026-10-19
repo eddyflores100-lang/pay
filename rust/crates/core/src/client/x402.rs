@@ -166,6 +166,29 @@ pub fn build_payment_with_override(
     resource_url: Option<&str>,
     auth_override: crate::signer::AuthOverride,
 ) -> Result<BuiltPayment> {
+    build_payment_for_attempt(
+        challenge,
+        store,
+        network_override,
+        account_override,
+        resource_url,
+        auth_override,
+        None,
+    )
+}
+
+/// [`build_payment_with_override`] for one logical request: while `attempt`
+/// is unresolved, every build for the same offer carries the same
+/// `payment-identifier`, so the server can deduplicate a retried payment.
+pub fn build_payment_for_attempt(
+    challenge: &Challenge,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+    auth_override: crate::signer::AuthOverride,
+    attempt: Option<&crate::client::attempt::PaymentAttempt>,
+) -> Result<BuiltPayment> {
     let requirements = &challenge.requirements;
     let amount = format_amount(&requirements.amount, &requirements.currency);
     let prompt_context = crate::client::prompt::payment_prompt_context(
@@ -274,7 +297,26 @@ pub fn build_payment_with_override(
             (X402_V1_PAYMENT_HEADER, header)
         }
         _ => {
-            let extensions = build_outbound_extensions(challenge.extensions.as_ref())?;
+            let payment_identifier = || match attempt {
+                Some(attempt) => attempt.reuse_or_insert(
+                    "x402-payment-identifier",
+                    &[
+                        &requirements.network,
+                        requirements.cluster.as_deref().unwrap_or_default(),
+                        &requirements.amount,
+                        &requirements.currency,
+                        &requirements.recipient,
+                        &requirements.resource,
+                    ],
+                    std::time::Duration::from_secs(
+                        requirements.max_age.unwrap_or(300).clamp(1, 3_600),
+                    ),
+                    || Ok(generate_payment_identifier_id()),
+                ),
+                None => Ok(generate_payment_identifier_id()),
+            };
+            let extensions =
+                build_outbound_extensions(challenge.extensions.as_ref(), payment_identifier)?;
             let header = rt
                 .block_on(build_payment_header_v2(
                     &signer,
@@ -1107,11 +1149,11 @@ fn parse_siwx_extension(
 /// and appends a fresh `payment-identifier.info.id` when the server
 /// flagged that extension `info.required = true`.
 ///
-/// TODO: cache the generated id keyed on `(resource_url, body_hash)`
-/// so HTTP-level retries of the same logical request reuse the same
-/// idempotency key and benefit from server-side cached 200s.
+/// `payment_identifier` supplies the id, so retries of one logical request
+/// can reuse theirs.
 fn build_outbound_extensions(
     inbound: Option<&serde_json::Value>,
+    payment_identifier: impl FnOnce() -> Result<String>,
 ) -> Result<Option<PaymentExtensions>> {
     let Some(mut ext) = PaymentExtensions::echoing(inbound)
         .map_err(|e| Error::Mpp(format!("malformed PAYMENT-REQUIRED extensions: {e}")))?
@@ -1119,7 +1161,7 @@ fn build_outbound_extensions(
         return Ok(None);
     };
     if ext.requires_payment_identifier() {
-        ext = ext.with_payment_identifier_id(generate_payment_identifier_id());
+        ext = ext.with_payment_identifier_id(payment_identifier()?);
     }
     Ok(Some(ext))
 }
@@ -1675,9 +1717,11 @@ mod tests {
             serde_json::json!(true)
         );
 
-        let outbound = build_outbound_extensions(challenge.extensions.as_ref())
-            .unwrap()
-            .expect("outbound extensions produced");
+        let outbound = build_outbound_extensions(challenge.extensions.as_ref(), || {
+            Ok(generate_payment_identifier_id())
+        })
+        .unwrap()
+        .expect("outbound extensions produced");
         let pid = outbound
             .payment_identifier
             .as_ref()
@@ -1691,9 +1735,145 @@ mod tests {
         assert!(id.len() >= 16 && id.len() <= 128);
     }
 
+    fn payment_identifier_store() -> MemoryAccountsStore {
+        const TEST_KEYPAIR_BYTES: [u8; 64] = [
+            41, 99, 180, 88, 51, 57, 48, 80, 61, 63, 219, 75, 176, 49, 116, 254, 227, 176, 196,
+            204, 122, 47, 166, 133, 155, 252, 217, 0, 253, 17, 49, 143, 47, 94, 121, 167, 195, 136,
+            72, 22, 157, 48, 77, 88, 63, 96, 57, 122, 181, 243, 236, 188, 241, 134, 174, 224, 100,
+            246, 17, 170, 104, 17, 151, 48,
+        ];
+        let mut file = AccountsFile::default();
+        file.upsert(
+            "devnet",
+            "default",
+            Account {
+                backend: BackendKind::Ephemeral,
+                provider: None,
+                active: true,
+                auth_required: Some(false),
+                pubkey: Some("4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR".to_string()),
+                vault: None,
+                account: None,
+                path: None,
+                secret_key_b58: Some(bs58::encode(TEST_KEYPAIR_BYTES).into_string()),
+                created_at: None,
+                subscriptions: Default::default(),
+            },
+        );
+        MemoryAccountsStore::with_file(file)
+    }
+
+    fn payment_identifier_challenge(blockhash_seed: u8, amount: &str) -> Challenge {
+        Challenge {
+            x402_version: pay_kit::x402::X402_VERSION_V2,
+            requirements: serde_json::from_value(serde_json::json!({
+                "network": SOLANA_DEVNET,
+                "cluster": "devnet",
+                "recipient": "4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR",
+                "amount": amount,
+                "currency": "SOL",
+                "resource": "https://provider.example/resource",
+                "maxAge": 300,
+                "recentBlockhash": bs58::encode([blockhash_seed; 32]).into_string(),
+            }))
+            .unwrap(),
+            siwx: None,
+            extensions: Some(serde_json::json!({
+                "payment-identifier": {
+                    "info": { "required": true },
+                    "schema": { "type": "object", "required": ["id"] }
+                }
+            })),
+        }
+    }
+
+    fn sent_payment_identifier(built: &BuiltPayment) -> String {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&built.headers[0].1)
+            .unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        envelope["extensions"]["payment-identifier"]["info"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn retries_of_one_unresolved_request_keep_their_payment_identifier() {
+        let store = payment_identifier_store();
+        let attempt = crate::client::attempt::PaymentAttempt::new(
+            "POST",
+            "https://provider.example/resource",
+            Some(b"{\"q\":1}"),
+        );
+        let build = |challenge: &Challenge| {
+            build_payment_for_attempt(
+                challenge,
+                &store,
+                Some("devnet"),
+                None,
+                Some("https://provider.example/resource"),
+                None,
+                Some(&attempt),
+            )
+            .unwrap()
+        };
+        // The retry gets a fresh challenge (new blockhash) for the same offer.
+        let first = build(&payment_identifier_challenge(1, "1000"));
+        let retry = build(&payment_identifier_challenge(2, "1000"));
+        assert_eq!(
+            sent_payment_identifier(&first),
+            sent_payment_identifier(&retry)
+        );
+        assert_ne!(
+            first.headers[0].1, retry.headers[0].1,
+            "the transaction is rebuilt"
+        );
+
+        // Different terms are a different payment.
+        let repriced = build(&payment_identifier_challenge(2, "2000"));
+        assert_ne!(
+            sent_payment_identifier(&first),
+            sent_payment_identifier(&repriced)
+        );
+
+        // Once the server answered, a new call is a new payment.
+        attempt.resolved();
+        let next = build(&payment_identifier_challenge(3, "1000"));
+        assert_ne!(
+            sent_payment_identifier(&first),
+            sent_payment_identifier(&next)
+        );
+        attempt.resolved();
+    }
+
+    #[test]
+    fn builds_without_an_attempt_get_fresh_payment_identifiers() {
+        let store = payment_identifier_store();
+        let build = |seed| {
+            build_payment(
+                &payment_identifier_challenge(seed, "1000"),
+                &store,
+                Some("devnet"),
+                None,
+                Some("https://provider.example/resource"),
+            )
+            .unwrap()
+        };
+        assert_ne!(
+            sent_payment_identifier(&build(1)),
+            sent_payment_identifier(&build(2))
+        );
+    }
+
     #[test]
     fn build_outbound_extensions_returns_none_when_inbound_absent() {
-        assert!(build_outbound_extensions(None).unwrap().is_none());
+        assert!(
+            build_outbound_extensions(None, || Ok(generate_payment_identifier_id()))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1704,9 +1884,11 @@ mod tests {
         let inbound = serde_json::json!({
             "payment-identifier": { "info": { "required": false } }
         });
-        let outbound = build_outbound_extensions(Some(&inbound))
-            .unwrap()
-            .expect("echoed");
+        let outbound = build_outbound_extensions(Some(&inbound), || {
+            panic!("no id is generated when the server does not require one")
+        })
+        .unwrap()
+        .expect("echoed");
         assert!(!outbound.requires_payment_identifier());
         assert!(
             outbound
