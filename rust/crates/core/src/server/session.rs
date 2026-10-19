@@ -354,18 +354,7 @@ impl SessionOperatorRuntime {
                 let tx_pipeline = tx_pipeline.clone();
                 let rpc_url = self.rpc_url.clone();
                 async move {
-                    // Version 1 when the cluster gate is active: 18 voucher
-                    // settlements per flush transaction instead of 4.
-                    let tx_version = match rpc_url {
-                        Some(url) => tokio::task::spawn_blocking(move || {
-                            pay_kit::core::tx::highest(&pay_kit::core::tx::TxV1Mode::Auto.resolve(
-                                &pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient::new(url),
-                            ))
-                        })
-                        .await
-                        .unwrap_or(pay_kit::core::tx::TxVersion::V0),
-                        None => pay_kit::core::tx::TxVersion::V0,
-                    };
+                    let tx_version = settlement_tx_version(rpc_url).await;
                     spawn(
                         SettlementConfig::new(operator, signer).with_tx_version(tx_version),
                         Arc::new(RpcBroadcaster::with_pipeline(tx_pipeline)),
@@ -610,18 +599,7 @@ impl SessionOperatorRuntime {
                 let tx_pipeline = tx_pipeline.clone();
                 let rpc_url = self.rpc_url.clone();
                 async move {
-                    // Version 1 when the cluster gate is active: 18 voucher
-                    // settlements per flush transaction instead of 4.
-                    let tx_version = match rpc_url {
-                        Some(url) => tokio::task::spawn_blocking(move || {
-                            pay_kit::core::tx::highest(&pay_kit::core::tx::TxV1Mode::Auto.resolve(
-                                &pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient::new(url),
-                            ))
-                        })
-                        .await
-                        .unwrap_or(pay_kit::core::tx::TxVersion::V0),
-                        None => pay_kit::core::tx::TxVersion::V0,
-                    };
+                    let tx_version = settlement_tx_version(rpc_url).await;
                     spawn(
                         SettlementConfig::new(operator, signer).with_tx_version(tx_version),
                         Arc::new(RpcBroadcaster::with_pipeline(tx_pipeline)),
@@ -650,6 +628,23 @@ impl SessionOperatorRuntime {
         }
         Ok(Some(signature))
     }
+}
+
+/// Message version for operator settlement transactions, from the same
+/// cluster gate that decides what sessions accept: version 1 when active, so
+/// a close that only fits version 1 (hooks, many splits) can still settle.
+async fn settlement_tx_version(rpc_url: Option<String>) -> pay_kit::core::tx::TxVersion {
+    let Some(url) = rpc_url else {
+        return pay_kit::core::tx::TxVersion::V0;
+    };
+    tokio::task::spawn_blocking(move || {
+        pay_kit::core::tx::highest(
+            &pay_kit::core::tx::TxV1Mode::Auto
+                .resolve(&pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient::new(url)),
+        )
+    })
+    .await
+    .unwrap_or(pay_kit::core::tx::TxVersion::V0)
 }
 
 fn close_voucher_required(onchain_settled: u64, latest_accepted: u64) -> bool {
@@ -4063,6 +4058,53 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    /// A JSON-RPC node whose v1 transaction feature gate is `activated`.
+    async fn feature_gate_rpc(activated: bool) -> String {
+        use axum::{Json, Router, routing::post};
+        use base64::Engine as _;
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<serde_json::Value>| async move {
+                assert_eq!(request["method"], "getAccountInfo");
+                assert_eq!(
+                    request["params"][0],
+                    pay_kit::core::tx::TX_V1_FEATURE_GATE.to_string()
+                );
+                let value = activated.then(|| {
+                    let mut data = vec![1u8];
+                    data.extend_from_slice(&7u64.to_le_bytes());
+                    serde_json::json!({
+                        "data": [base64::engine::general_purpose::STANDARD.encode(&data), "base64"],
+                        "executable": false,
+                        "lamports": 1,
+                        "owner": "Feature111111111111111111111111111111111111",
+                        "rentEpoch": 0,
+                        "space": data.len(),
+                    })
+                });
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": {"context": {"slot": 1}, "value": value},
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settlement_uses_version_one_when_the_cluster_accepts_it() {
+        use pay_kit::core::tx::TxVersion;
+        let active = feature_gate_rpc(true).await;
+        assert_eq!(settlement_tx_version(Some(active)).await, TxVersion::V1);
+        let inactive = feature_gate_rpc(false).await;
+        assert_eq!(settlement_tx_version(Some(inactive)).await, TxVersion::V0);
+        assert_eq!(settlement_tx_version(None).await, TxVersion::V0);
     }
 
     #[tokio::test]
