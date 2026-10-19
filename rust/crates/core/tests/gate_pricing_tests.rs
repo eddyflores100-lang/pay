@@ -187,3 +187,50 @@ async fn path_selected_variant_keeps_its_own_price() {
         "50000000"
     );
 }
+
+// ── Overlapping variant values (SOLA1-62) ──────────────────────────────────
+
+const OVERLAPPING_VARIANTS: &str = r#"
+name: collision
+subdomain: collision
+title: Collision
+description: Overlapping model variants
+category: ai_ml
+version: v1
+routing:
+  type: respond
+endpoints:
+  - method: POST
+    path: v1/models/{modelId}:generate
+    metering:
+      schemes: [mpp-charge]
+      variants:
+        - param: model
+          value: gpt-4
+          dimensions:
+            - direction: usage
+              unit: requests
+              scale: 1
+              tiers: [{price_usd: 0.01}]
+        - param: model
+          value: gpt-4o
+          dimensions:
+            - direction: usage
+              unit: requests
+              scale: 1
+              tiers: [{price_usd: 1.00}]
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlapping_variant_is_priced_by_the_forwarded_model() {
+    let api = spec(OVERLAPPING_VARIANTS);
+    assert!(pay_types::metering::validate_api_spec(&api).is_empty());
+    assert_eq!(
+        charge_amount(&api, "v1/models/gpt-4o:generate", None).await,
+        "1000000000"
+    );
+    assert_eq!(
+        charge_amount(&api, "v1/models/gpt-4:generate", None).await,
+        "10000000"
+    );
+}

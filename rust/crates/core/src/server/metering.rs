@@ -867,15 +867,21 @@ pub(crate) fn resolve_variant<'a>(
     variants: &'a [MeterVariant],
     hint: Option<&str>,
 ) -> Option<&'a MeterVariant> {
+    // The most specific (longest) contained value wins, so an exact value
+    // beats its prefixes and `gpt-4o` is never priced as `gpt-4`. Ties keep
+    // config order.
     let mut default = None;
+    let mut best: Option<&MeterVariant> = None;
     for variant in variants {
         if variant.value.eq_ignore_ascii_case("default") {
             default.get_or_insert(variant);
-        } else if hint.is_some_and(|hint| hint.contains(&variant.value)) {
-            return Some(variant);
+        } else if hint.is_some_and(|hint| hint.contains(&variant.value))
+            && best.is_none_or(|best| variant.value.len() > best.value.len())
+        {
+            best = Some(variant);
         }
     }
-    default
+    best.or(default)
 }
 
 fn resolve_dimensions(
@@ -2959,5 +2965,31 @@ mod tests {
         let price = resolve_fixed_price(&metering, &RequestProperties::default(), Some("unlisted"))
             .unwrap();
         assert_eq!(per_call_usd(&price), 0.10);
+    }
+
+    #[test]
+    fn variant_selection_prefers_the_most_specific_value() {
+        for variants in [
+            vec![("gpt-4", 0.01), ("gpt-4o", 1.00)],
+            vec![("gpt-4o", 1.00), ("gpt-4", 0.01)],
+        ] {
+            let yaml = variants
+                .iter()
+                .map(|(value, price)| request_variant(value, *price))
+                .collect::<String>();
+            let metering = yaml_metering(&format!("variants:\n{yaml}"));
+            let price = |hint: &str| {
+                per_call_usd(
+                    &resolve_price(&metering, &RequestProperties::default(), Some(hint), None)
+                        .unwrap(),
+                )
+            };
+            assert_eq!(price("gpt-4o"), 1.00);
+            assert_eq!(price("gpt-4"), 0.01);
+            // Family matching still applies to dated or tagged aliases.
+            assert_eq!(price("gpt-4o-2024-08-06"), 1.00);
+            assert_eq!(price("gpt-4-turbo"), 0.01);
+            assert_eq!(price("v1/models/gpt-4o:generateContent"), 1.00);
+        }
     }
 }
