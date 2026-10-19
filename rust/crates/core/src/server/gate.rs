@@ -840,6 +840,7 @@ impl<S: PaymentState> PaymentGate<S> {
         };
         let variant = variant_hint_from_path(path);
         let price = metering::resolve_price(meter, &props, variant.as_deref(), None);
+        let fixed_price = metering::resolve_fixed_price(meter, &props, variant.as_deref());
 
         let mut challenge_headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
         let mut advertised: Vec<&str> = Vec::new();
@@ -871,7 +872,7 @@ impl<S: PaymentState> PaymentGate<S> {
         if accepted.contains(&Scheme::MppCharge) {
             let mpps = self.state.mpps();
             if !mpps.is_empty() {
-                let amount = crate::server::payment::charge_amount_from_price(price.as_ref());
+                let amount = crate::server::payment::charge_amount_from_price(fixed_price.as_ref());
                 let uri = reconstruct_uri(path, req.query);
                 let external_id = crate::server::payment::resource_memo_with_nonce(
                     resource,
@@ -933,7 +934,7 @@ impl<S: PaymentState> PaymentGate<S> {
         if accepted.contains(&Scheme::X402Exact)
             && let Some(x402) = self.state.x402()
         {
-            let amount = crate::server::payment::charge_amount_from_price(price.as_ref());
+            let amount = crate::server::payment::charge_amount_from_price(fixed_price.as_ref());
             // Parity with MPP charge external_id: resource plus per-challenge
             // suffix, so repeated same-route payments are distinct on-chain.
             let memo = crate::server::payment::resource_memo_with_nonce(
@@ -994,7 +995,7 @@ impl<S: PaymentState> PaymentGate<S> {
         if accepted.contains(&Scheme::X402BatchSettlement)
             && let Some(batch) = self.state.x402_batch()
         {
-            let amount = crate::server::payment::charge_amount_from_price(price.as_ref());
+            let amount = crate::server::payment::charge_amount_from_price(fixed_price.as_ref());
             match batch.payment_required_header(&amount, resource) {
                 Ok((name, value)) => {
                     if let (Ok(n), Ok(v)) = (
@@ -1087,7 +1088,7 @@ impl<S: PaymentState> PaymentGate<S> {
         };
         let variant = variant_hint_from_path(path);
         let amount = crate::server::payment::charge_amount_from_price(
-            metering::resolve_price(meter, &props, variant.as_deref(), None).as_ref(),
+            metering::resolve_fixed_price(meter, &props, variant.as_deref()).as_ref(),
         );
         let payment = amount
             .parse()
@@ -1268,7 +1269,7 @@ impl<S: PaymentState> PaymentGate<S> {
         };
         let variant = variant_hint_from_path(path);
         let amount = crate::server::payment::charge_amount_from_price(
-            metering::resolve_price(meter, &props, variant.as_deref(), None).as_ref(),
+            metering::resolve_fixed_price(meter, &props, variant.as_deref()).as_ref(),
         );
         let payment = amount
             .parse()
@@ -1666,7 +1667,7 @@ impl<S: PaymentState> PaymentGate<S> {
         };
         let variant = variant_hint_from_path(path);
         let amount = crate::server::payment::charge_amount_from_price(
-            metering::resolve_price(meter, &props, variant.as_deref(), None).as_ref(),
+            metering::resolve_fixed_price(meter, &props, variant.as_deref()).as_ref(),
         );
         // Reconstruct a URI for split-rule query params (splits price off the request).
         let uri = reconstruct_uri(path, req.query);

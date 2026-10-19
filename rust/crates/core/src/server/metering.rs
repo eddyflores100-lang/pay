@@ -200,6 +200,59 @@ pub fn resolve_price(
     None
 }
 
+/// Resolve the price a fixed per-call scheme (MPP charge, x402 exact, x402
+/// batch) charges. Those schemes authorize before the request body is read,
+/// so only a path-derived hint can select a variant; otherwise the body may
+/// select any variant and the most expensive candidate is charged.
+pub fn resolve_fixed_price(
+    metering: &Metering,
+    props: &RequestProperties,
+    variant_hint: Option<&str>,
+) -> Option<ResolvedPrice> {
+    let dimensions = fixed_charge_dimensions(metering, props, variant_hint);
+    if dimensions.is_empty() {
+        return resolve_price(metering, props, variant_hint, None);
+    }
+    Some(resolve_dimensions(dimensions, props, None))
+}
+
+fn fixed_charge_dimensions<'a>(
+    metering: &'a Metering,
+    props: &RequestProperties,
+    variant_hint: Option<&str>,
+) -> &'a [MeterDimension] {
+    if metering.variants.is_empty() {
+        return &metering.dimensions;
+    }
+    if variant_hint.is_some() {
+        if let Some(variant) = resolve_variant(&metering.variants, variant_hint) {
+            return &variant.dimensions;
+        }
+        if !metering.dimensions.is_empty() {
+            return &metering.dimensions;
+        }
+    }
+    metering
+        .variants
+        .iter()
+        .map(|variant| variant.dimensions.as_slice())
+        .chain(Some(metering.dimensions.as_slice()).filter(|dims| !dims.is_empty()))
+        .max_by(|a, b| {
+            let usd = |dims| per_call_usd(&resolve_dimensions(dims, props, None));
+            usd(a).total_cmp(&usd(b))
+        })
+        .unwrap_or(&metering.dimensions)
+}
+
+/// Per-call USD amount charged for a resolved fixed price.
+pub fn per_call_usd(price: &ResolvedPrice) -> f64 {
+    price
+        .dimensions
+        .first()
+        .map(|d| d.price_usd / d.scale.max(1) as f64)
+        .unwrap_or(0.0)
+}
+
 pub fn effective_dimensions<'a>(
     metering: &'a Metering,
     variant_hint: Option<&str>,
@@ -2839,5 +2892,72 @@ mod tests {
 
         let expected = 12.0 / 1_000_000.0 * 0.10 + 214.0 / 1_000_000.0 * 0.30;
         assert!((actual.usd - expected).abs() < 1e-12, "usd={}", actual.usd);
+    }
+
+    fn yaml_metering(yaml: &str) -> Metering {
+        serde_yml::from_str(yaml).expect("metering parses")
+    }
+
+    fn request_variant(value: &str, price_usd: f64) -> String {
+        format!(
+            "  - param: model\n    value: {value}\n    dimensions:\n      - direction: usage\n        unit: requests\n        scale: 1\n        tiers: [{{price_usd: {price_usd}}}]\n"
+        )
+    }
+
+    #[test]
+    fn fixed_price_without_path_hint_charges_most_expensive_variant() {
+        let metering = yaml_metering(&format!(
+            "variants:\n{}{}{}",
+            request_variant("cheap", 0.01),
+            request_variant("premium", 0.10),
+            request_variant("default", 0.05),
+        ));
+        let props = RequestProperties::default();
+
+        let unhinted = resolve_fixed_price(&metering, &props, None).unwrap();
+        assert_eq!(per_call_usd(&unhinted), 0.10);
+        // Request-time pricing (upto/session) still uses the default variant.
+        let legacy = resolve_price(&metering, &props, None, None).unwrap();
+        assert_eq!(per_call_usd(&legacy), 0.05);
+
+        let cheap = resolve_fixed_price(&metering, &props, Some("cheap")).unwrap();
+        assert_eq!(per_call_usd(&cheap), 0.01);
+        let other = resolve_fixed_price(&metering, &props, Some("unlisted")).unwrap();
+        assert_eq!(per_call_usd(&other), 0.05);
+    }
+
+    #[test]
+    fn fixed_price_includes_top_level_dimensions_as_candidates() {
+        let metering = yaml_metering(&format!(
+            "dimensions:\n  - direction: usage\n    unit: requests\n    scale: 1\n    tiers: [{{price_usd: 0.25}}]\nvariants:\n{}",
+            request_variant("cheap", 0.01),
+        ));
+        let props = RequestProperties::default();
+
+        assert_eq!(
+            per_call_usd(&resolve_fixed_price(&metering, &props, None).unwrap()),
+            0.25
+        );
+        // A path hint that matches nothing uses the top-level backstop.
+        assert_eq!(
+            per_call_usd(&resolve_fixed_price(&metering, &props, Some("x")).unwrap()),
+            0.25
+        );
+        assert_eq!(
+            per_call_usd(&resolve_fixed_price(&metering, &props, Some("cheap")).unwrap()),
+            0.01
+        );
+    }
+
+    #[test]
+    fn fixed_price_unmatched_hint_without_fallback_charges_most_expensive_variant() {
+        let metering = yaml_metering(&format!(
+            "variants:\n{}{}",
+            request_variant("cheap", 0.01),
+            request_variant("premium", 0.10),
+        ));
+        let price = resolve_fixed_price(&metering, &RequestProperties::default(), Some("unlisted"))
+            .unwrap();
+        assert_eq!(per_call_usd(&price), 0.10);
     }
 }
