@@ -20,6 +20,9 @@ const MAX_INSTRUCTIONS: usize = 16;
 const MAX_TRANSFERS: usize = 8;
 const MAX_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
 const MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS: u64 = 50_000;
+/// Most priority fee a fee-paying hosted wallet may be asked for: far below
+/// the one-cent minimum each transaction reserves.
+const MAX_FEE_PAYER_PRIORITY_LAMPORTS: u64 = 1_000;
 
 #[derive(Serialize)]
 pub struct WalletView {
@@ -145,6 +148,8 @@ fn transaction_spend_minor(
             "The hosted wallet is not a required transaction signer.",
         ));
     }
+    // Account zero pays the fees; the policy accounts only for stablecoins.
+    let pays_fees = signer_index == 0;
     let instructions = transaction.message.instructions();
     if instructions.is_empty() || instructions.len() > MAX_INSTRUCTIONS {
         return Err(signing_denied(
@@ -156,6 +161,8 @@ fn transaction_spend_minor(
     let mut transfers = 0_usize;
     let mut compute_limit_seen = false;
     let mut compute_price_seen = false;
+    let mut compute_limit = MAX_COMPUTE_UNIT_LIMIT;
+    let mut compute_price = 0_u64;
     for instruction in instructions {
         let program = key_at(keys, instruction.program_id_index)?;
         match program.to_string().as_str() {
@@ -213,6 +220,7 @@ fn transaction_spend_minor(
                 [2, bytes @ ..] if bytes.len() == 4 && !compute_limit_seen => {
                     compute_limit_seen = true;
                     let limit = u32::from_le_bytes(bytes.try_into().unwrap());
+                    compute_limit = limit;
                     if limit > MAX_COMPUTE_UNIT_LIMIT {
                         return Err(signing_denied("The compute-unit limit is too high."));
                     }
@@ -220,6 +228,7 @@ fn transaction_spend_minor(
                 [3, bytes @ ..] if bytes.len() == 8 && !compute_price_seen => {
                     compute_price_seen = true;
                     let price = u64::from_le_bytes(bytes.try_into().unwrap());
+                    compute_price = price;
                     if price > MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS {
                         return Err(signing_denied("The compute-unit price is too high."));
                     }
@@ -237,6 +246,13 @@ fn transaction_spend_minor(
     if transfers == 0 {
         return Err(signing_denied(
             "The transaction does not contain a stablecoin payment.",
+        ));
+    }
+    let priority_lamports =
+        (u128::from(compute_price) * u128::from(compute_limit)).div_ceil(1_000_000);
+    if pays_fees && priority_lamports > u128::from(MAX_FEE_PAYER_PRIORITY_LAMPORTS) {
+        return Err(signing_denied(
+            "The priority fee is too high for a fee-paying hosted wallet.",
         ));
     }
 
@@ -470,6 +486,119 @@ mod tests {
 
         let error = transaction_spend_minor(&transaction, &signer.to_string()).unwrap_err();
         assert_eq!(error.status, StatusCode::FORBIDDEN);
+    }
+
+    /// Append `SetComputeUnitPrice(price)`.
+    fn with_compute_price(
+        mut transaction: VersionedTransaction,
+        price: u64,
+    ) -> VersionedTransaction {
+        let compute_budget: Pubkey =
+            pay_kit::mpp::protocol::solana::programs::COMPUTE_BUDGET_PROGRAM
+                .parse()
+                .unwrap();
+        let VersionedMessage::Legacy(message) = &mut transaction.message else {
+            unreachable!()
+        };
+        message.account_keys.push(compute_budget);
+        message.header.num_readonly_unsigned_accounts += 1;
+        let mut data = vec![3];
+        data.extend_from_slice(&price.to_le_bytes());
+        message.instructions.push(CompiledInstruction {
+            program_id_index: (message.account_keys.len() - 1) as u8,
+            accounts: vec![],
+            data,
+        });
+        transaction
+    }
+
+    /// Append `SetComputeUnitLimit(limit)` after a compute-price instruction.
+    fn with_compute_limit(
+        mut transaction: VersionedTransaction,
+        limit: u32,
+    ) -> VersionedTransaction {
+        let VersionedMessage::Legacy(message) = &mut transaction.message else {
+            unreachable!()
+        };
+        let program_id_index = (message.account_keys.len() - 1) as u8;
+        let mut data = vec![2];
+        data.extend_from_slice(&limit.to_le_bytes());
+        message.instructions.push(CompiledInstruction {
+            program_id_index,
+            accounts: vec![],
+            data,
+        });
+        transaction
+    }
+
+    /// Put a separate sponsor in front as the fee payer.
+    fn sponsored(mut transaction: VersionedTransaction) -> VersionedTransaction {
+        let VersionedMessage::Legacy(message) = &mut transaction.message else {
+            unreachable!()
+        };
+        message.account_keys.insert(0, Pubkey::new_unique());
+        message.header.num_required_signatures += 1;
+        for instruction in &mut message.instructions {
+            instruction.program_id_index += 1;
+            for account in &mut instruction.accounts {
+                *account += 1;
+            }
+        }
+        transaction.signatures.push(Default::default());
+        transaction
+    }
+
+    #[test]
+    fn a_fee_paying_hosted_wallet_has_a_bounded_priority_fee() {
+        let (transaction, signer) = payment_transaction(1);
+        let signer = signer.to_string();
+        // The audit's maxima: 50,000 µlamports over 1.4M units is 70,000 lamports.
+        let error = transaction_spend_minor(
+            &with_compute_price(transaction.clone(), MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS),
+            &signer,
+        )
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        // Without a limit the worst case is 1.4M units: 714 µlamports is the
+        // last price within 1,000 lamports, 715 is over.
+        assert!(
+            transaction_spend_minor(&with_compute_price(transaction.clone(), 714), &signer).is_ok()
+        );
+        assert!(
+            transaction_spend_minor(&with_compute_price(transaction.clone(), 715), &signer)
+                .is_err()
+        );
+        // A declared limit narrows the worst case.
+        let limited = with_compute_limit(with_compute_price(transaction.clone(), 5_000), 200_000);
+        assert!(transaction_spend_minor(&limited, &signer).is_ok());
+        let limited = with_compute_limit(with_compute_price(transaction.clone(), 5_001), 200_000);
+        assert!(transaction_spend_minor(&limited, &signer).is_err());
+        // pay-kit's default client price stays accepted.
+        assert_eq!(
+            transaction_spend_minor(&with_compute_price(transaction, 1), &signer).unwrap(),
+            100
+        );
+    }
+
+    #[test]
+    fn a_sponsor_may_pay_bounded_priority_fees() {
+        let (transaction, signer) = payment_transaction(10_000);
+        let sponsored = sponsored(transaction);
+        assert_eq!(
+            transaction_spend_minor(
+                &with_compute_price(sponsored.clone(), MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS),
+                &signer.to_string()
+            )
+            .unwrap(),
+            100
+        );
+        assert!(
+            transaction_spend_minor(
+                &with_compute_price(sponsored, MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS + 1),
+                &signer.to_string()
+            )
+            .is_err()
+        );
     }
 
     fn memory_wallet() -> pay_kit::solana_keychain::MemorySigner {
