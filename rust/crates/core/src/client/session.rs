@@ -506,20 +506,7 @@ pub fn open_operator_signed_session_authorizations(
         )));
     }
 
-    let minimum = request
-        .minimum_deposit
-        .as_deref()
-        .map(parse_session_deposit)
-        .transpose()?
-        .unwrap_or(0);
-    let deposit = request
-        .suggested_deposit
-        .as_deref()
-        .map(parse_session_deposit)
-        .transpose()?
-        .unwrap_or(1_000_000)
-        .max(minimum)
-        .max(1);
+    let deposit = operator_session_deposit(&request)?;
     let sandbox = network_override == Some("localnet");
     let (handle, open_authorization) = open_payment_channel_session_header_with_override(
         challenge,
@@ -538,6 +525,24 @@ pub fn open_operator_signed_session_authorizations(
         .map_err(|error| Error::Mpp(format!("Failed to build runtime: {error}")))?;
     let use_authorization = runtime.block_on(handle.use_header())?;
     Ok((open_authorization, use_authorization))
+}
+
+/// Base-unit deposit an operator-signed session open locks for `request`.
+pub fn operator_session_deposit(request: &SessionRequest) -> Result<u64> {
+    let minimum = request
+        .minimum_deposit
+        .as_deref()
+        .map(parse_session_deposit)
+        .transpose()?
+        .unwrap_or(0);
+    Ok(request
+        .suggested_deposit
+        .as_deref()
+        .map(parse_session_deposit)
+        .transpose()?
+        .unwrap_or(1_000_000)
+        .max(minimum)
+        .max(1))
 }
 
 fn parse_session_deposit(value: &str) -> Result<u64> {

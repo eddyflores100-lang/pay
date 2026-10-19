@@ -1452,9 +1452,13 @@ fn do_paid_fetch(
                 ))
             }
         }
-        RunOutcome::SessionChallenge { challenge, .. } => {
+        RunOutcome::SessionChallenge {
+            challenge,
+            resource_url,
+            ..
+        } => {
             if let Some(permissions) = &scope.payment_permissions {
-                permissions.reject_unsupported("MPP session payments")?;
+                permissions.authorize_session(&challenge, &resource_url)?;
             }
             let key = session_key.ok_or_else(|| {
                 pay_core::Error::Mpp(

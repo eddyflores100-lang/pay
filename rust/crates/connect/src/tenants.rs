@@ -630,7 +630,9 @@ impl PayContext for CloudContext {
             account_override: Some(record.account_name.clone()),
             rpc_url_override: None,
             approval: Arc::new(self.approval(&record)),
-            payment_permissions: None,
+            // Fail closed on challenge-selected terms: mainnet stablecoins
+            // only, before any payment is built or signed.
+            payment_permissions: Some(Arc::new(pay_mcp::McpPermissions::hosted())),
             // The server has no access to the caller's files.
             body_files: false,
             // Arbitrary public APIs remain available, but tenant-controlled

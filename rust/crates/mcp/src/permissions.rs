@@ -170,6 +170,17 @@ impl McpPermissions {
         config.build().map(Self)
     }
 
+    /// Permissions for hosted tenants: mainnet and known stablecoins only,
+    /// from any origin. Amounts are bounded by the tenant spending policy.
+    pub fn hosted() -> Self {
+        Self::from_config(&PermissionConfig {
+            networks: Some(vec!["mainnet".to_string()]),
+            unlimited_amount: true,
+            ..Default::default()
+        })
+        .expect("hosted payment permissions are statically valid")
+    }
+
     fn authorize(
         &self,
         resource_url: &str,
@@ -260,6 +271,26 @@ impl McpPermissions {
         )
     }
 
+    /// Authorize the deposit an operator-signed session open would lock.
+    pub fn authorize_session(
+        &self,
+        challenge: &mpp::Challenge,
+        resource_url: &str,
+    ) -> Result<(), pay_core::Error> {
+        let request: pay_kit::mpp::SessionRequest = challenge
+            .request
+            .decode()
+            .map_err(|error| permission_error(format!("invalid MPP session: {error}")))?;
+        let deposit = pay_core::session::operator_session_deposit(&request)
+            .map_err(|error| permission_error(error.to_string()))?;
+        self.authorize(
+            resource_url,
+            &request.method_details.network,
+            &request.currency,
+            deposit,
+        )
+    }
+
     pub fn reject_unsupported(&self, kind: &str) -> Result<(), pay_core::Error> {
         Err(permission_error(format!(
             "{kind} is not supported when MCP payment permissions are enabled"
@@ -312,5 +343,86 @@ assets:
     fn unknown_yaml_fields_are_rejected() {
         let error = serde_yml::from_str::<PermissionConfig>("maximum: 1").unwrap_err();
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+    #[test]
+    fn hosted_permissions_allow_known_stablecoins_on_mainnet_only() {
+        let hosted = McpPermissions::hosted();
+        assert!(
+            hosted
+                .authorize("https://any.example/x", "mainnet", "USDC", 50_000_000)
+                .is_ok()
+        );
+        assert!(
+            hosted
+                .authorize("https://any.example/x", "mainnet", USDC, 1)
+                .is_ok()
+        );
+        // Challenge-selected custom mints, native SOL, and other clusters
+        // never reach the hosted signer.
+        let custom = "So11111111111111111111111111111111111111112";
+        assert!(
+            hosted
+                .authorize("https://any.example/x", "mainnet", custom, 1)
+                .is_err()
+        );
+        assert!(
+            hosted
+                .authorize("https://any.example/x", "mainnet", "SOL", 1)
+                .is_err()
+        );
+        assert!(
+            hosted
+                .authorize("https://any.example/x", "devnet", "USDC", 1)
+                .is_err()
+        );
+        assert!(hosted.authorize("not a url", "mainnet", "USDC", 1).is_err());
+    }
+
+    fn session_challenge(currency: &str, suggested: &str) -> mpp::Challenge {
+        let request = serde_json::json!({
+            "amount": "1",
+            "currency": currency,
+            "recipient": "11111111111111111111111111111111",
+            "suggestedDeposit": suggested,
+            "methodDetails": {
+                "network": "mainnet",
+                "channelProgram": "11111111111111111111111111111111",
+                "voucherSigner": "operator",
+            },
+        });
+        pay_kit::mpp::PaymentChallenge::new(
+            "id",
+            "realm",
+            "solana",
+            "session",
+            pay_kit::mpp::Base64UrlJson::from_value(&request).unwrap(),
+        )
+    }
+
+    #[test]
+    fn session_deposit_is_authorized_against_the_cap() {
+        let capped = McpPermissions::from_config(&PermissionConfig {
+            max_payment: Some("$1".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            capped
+                .authorize_session(&session_challenge("USDC", "1000000"), "https://a.example/x")
+                .is_ok()
+        );
+        assert!(
+            capped
+                .authorize_session(&session_challenge("USDC", "1000001"), "https://a.example/x")
+                .is_err()
+        );
+        assert!(
+            McpPermissions::hosted()
+                .authorize_session(&session_challenge("SOL", "1"), "https://a.example/x")
+                .is_err()
+        );
     }
 }
