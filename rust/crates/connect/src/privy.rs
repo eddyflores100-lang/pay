@@ -146,7 +146,8 @@ struct Claims {
 pub struct Wallet {
     pub id: String,
     pub address: String,
-    /// Whether pay's key quorum is a signer, so tool calls can sign.
+    /// Whether pay's key quorum is a signer, under the configured policy
+    /// when there is one, so tool calls can sign.
     pub pay_can_sign: bool,
 }
 
@@ -538,11 +539,24 @@ impl Privy {
     }
 
     fn wallet_from(&self, wallet: WalletResponse) -> Wallet {
-        let pay_can_sign = wallet
+        let signer = wallet
             .additional_signers
             .iter()
-            .any(|s| s.id() == self.cfg.signer_id)
-            || wallet.owner_id.as_deref() == Some(self.cfg.signer_id.as_str());
+            .find(|s| s.id() == self.cfg.signer_id);
+        let is_owner = wallet.owner_id.as_deref() == Some(self.cfg.signer_id.as_str());
+        // With a policy configured, it must govern the wallet, and pay's
+        // signer must not carry overrides that replace it.
+        let policy_bound = match &self.cfg.policy_id {
+            None => true,
+            Some(policy) => {
+                wallet.policy_ids.iter().any(|p| p == policy)
+                    && signer.is_none_or(|s| {
+                        let overrides = s.override_policy_ids();
+                        overrides.is_empty() || overrides == [policy.as_str()]
+                    })
+            }
+        };
+        let pay_can_sign = (signer.is_some() || is_owner) && policy_bound;
         Wallet {
             id: wallet.id,
             address: wallet.address,
@@ -780,6 +794,8 @@ struct WalletResponse {
     owner_id: Option<String>,
     #[serde(default)]
     additional_signers: Vec<Signer>,
+    #[serde(default)]
+    policy_ids: Vec<String>,
 }
 
 /// Privy has listed signers both as bare ids and as `{ "signer_id": … }`.
@@ -787,14 +803,28 @@ struct WalletResponse {
 #[serde(untagged)]
 enum Signer {
     Id(String),
-    Object { signer_id: String },
+    Object {
+        signer_id: String,
+        #[serde(default)]
+        override_policy_ids: Vec<String>,
+    },
 }
 
 impl Signer {
     fn id(&self) -> &str {
         match self {
             Signer::Id(id) => id,
-            Signer::Object { signer_id } => signer_id,
+            Signer::Object { signer_id, .. } => signer_id,
+        }
+    }
+
+    fn override_policy_ids(&self) -> Vec<&str> {
+        match self {
+            Signer::Id(_) => Vec::new(),
+            Signer::Object {
+                override_policy_ids,
+                ..
+            } => override_policy_ids.iter().map(String::as_str).collect(),
         }
     }
 }
@@ -919,7 +949,8 @@ pub(crate) mod tests {
             let (user, (_, signers)) = wallets.iter().find(|(_, (w, _))| *w == id).unwrap();
             Json(json!({
                 "id": id, "address": ADDRESS, "chain_type": "solana", "owner_id": format!("kq_{user}"),
-                "additional_signers": signers.iter().map(|s| json!({ "signer_id": s })).collect::<Vec<_>>()
+                "additional_signers": signers.iter().map(|s| json!({ "signer_id": s })).collect::<Vec<_>>(),
+                "policy_ids": ["pol_1"]
             }))
         }
         async fn create(
@@ -1345,6 +1376,67 @@ pub(crate) mod tests {
                 .spent_today(ADDRESS)
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn pay_signs_only_under_the_configured_policy() {
+        let user = json!({ "id": USER, "linked_accounts": [
+            { "type": "wallet", "id": "w_1", "address": ADDRESS, "chain_type": "solana",
+              "connector_type": "embedded", "wallet_index": 0 }
+        ]});
+        let wallet = |policies: serde_json::Value, signer: serde_json::Value| {
+            json!({ "id": "w_1", "address": ADDRESS, "chain_type": "solana",
+                    "additional_signers": [signer], "policy_ids": policies })
+        };
+        let plain = json!({ "signer_id": SIGNER });
+        for (policies, signer, can_sign) in [
+            (json!(["pol_1"]), plain.clone(), true),
+            (json!(["pol_other", "pol_1"]), plain.clone(), true),
+            (
+                json!(["pol_1"]),
+                json!({ "signer_id": SIGNER, "override_policy_ids": ["pol_1"] }),
+                true,
+            ),
+            (json!(["pol_1"]), json!(SIGNER), true),
+            (json!([]), plain.clone(), false),
+            (json!(["pol_other"]), plain.clone(), false),
+            (
+                json!(["pol_1"]),
+                json!({ "signer_id": SIGNER, "override_policy_ids": ["pol_broad"] }),
+                false,
+            ),
+            (
+                json!(["pol_1"]),
+                json!({ "signer_id": SIGNER, "override_policy_ids": ["pol_1", "pol_broad"] }),
+                false,
+            ),
+        ] {
+            let base = serve_json(user.clone(), wallet(policies.clone(), signer.clone())).await;
+            let privy = Privy::new(FakeApp::new(&base).cfg).unwrap();
+            assert_eq!(
+                privy
+                    .solana_wallet(USER)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .pay_can_sign,
+                can_sign,
+                "{policies} {signer}"
+            );
+        }
+        // Without a configured policy only signer membership matters.
+        let base = serve_json(user, wallet(json!([]), plain)).await;
+        let mut cfg = FakeApp::new(&base).cfg;
+        cfg.policy_id = None;
+        assert!(
+            Privy::new(cfg)
+                .unwrap()
+                .solana_wallet(USER)
+                .await
+                .unwrap()
+                .unwrap()
+                .pay_can_sign
         );
     }
 
