@@ -286,8 +286,9 @@ async fn subscription_store(
 /// takes real money wants `PAY_X402_REDIS_URL` (falling back to the MPP
 /// Redis URL). The legacy session URL remains a final fallback for existing
 /// deployments.
-async fn batch_channel_store()
--> pay_core::Result<(Arc<dyn pay_kit::mpp::store::ChannelStore>, bool)> {
+async fn batch_channel_store(
+    network: &SolanaNetwork,
+) -> pay_core::Result<(Arc<dyn pay_kit::mpp::store::ChannelStore>, bool)> {
     channel_store(
         &[
             "PAY_X402_REDIS_URL",
@@ -295,10 +296,20 @@ async fn batch_channel_store()
             "PAY_SESSION_REDIS_URL",
         ],
         &["PAY_X402_REDIS_PREFIX"],
-        "pay:batch:v1:",
+        &batch_store_default_prefix(network),
         "x402 batch-settlement",
     )
     .await
+}
+
+/// Channel ids do not cover the cluster, so each network gets its own key
+/// namespace. Mainnet keeps the original prefix its records live under.
+fn batch_store_default_prefix(network: &SolanaNetwork) -> String {
+    const PREFIX: &str = "pay:batch:v1:";
+    match network {
+        SolanaNetwork::Mainnet => PREFIX.to_string(),
+        other => format!("{PREFIX}{}:", other.slug()),
+    }
 }
 
 /// Payment state (accepted batch vouchers, consumed exact signatures) lives
@@ -2457,7 +2468,7 @@ impl StartCommand {
             });
             let x402_batch = match (wants_batch, fee_payer_signer.clone()) {
                 (true, Some(signer)) => 'batch: {
-                    let (batch_store, durable_batch_store) = batch_channel_store().await?;
+                    let (batch_store, durable_batch_store) = batch_channel_store(&network).await?;
                     if !durable_batch_store
                         && requires_durable_store(&network, deployment_policy_mode)
                     {
@@ -4265,6 +4276,30 @@ mod tests {
             store,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn batch_store_prefixes_never_share_a_namespace_across_networks() {
+        let networks = [
+            SolanaNetwork::Mainnet,
+            SolanaNetwork::Devnet,
+            SolanaNetwork::Localnet,
+            SolanaNetwork::Unknown("custom".into()),
+        ];
+        let prefixes: std::collections::HashSet<_> = networks
+            .iter()
+            .map(super::batch_store_default_prefix)
+            .collect();
+        assert_eq!(prefixes.len(), networks.len());
+        // Existing mainnet records and pay-worker's default stay addressable.
+        assert_eq!(
+            super::batch_store_default_prefix(&SolanaNetwork::Mainnet),
+            "pay:batch:v1:"
+        );
+        assert_eq!(
+            super::batch_store_default_prefix(&SolanaNetwork::Devnet),
+            "pay:batch:v1:devnet:"
+        );
     }
 
     #[tokio::test]
