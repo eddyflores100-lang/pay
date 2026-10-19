@@ -293,9 +293,18 @@ async fn start_session_server() -> (
     tokio::task::JoinHandle<()>,
     Arc<dyn pay_kit::mpp::store::ChannelStore>,
 ) {
+    start_session_server_with(load_test_api()).await
+}
+
+async fn start_session_server_with(
+    api: ApiSpec,
+) -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    Arc<dyn pay_kit::mpp::store::ChannelStore>,
+) {
     let (session, store) =
         test_session_mpp_with_store(&solana_pubkey::Pubkey::new_unique().to_string());
-    let api = load_test_api();
     let state = SessionTestState {
         apis: Arc::new(vec![api]),
         mpp: None,
@@ -873,6 +882,99 @@ async fn middleware_never_forwards_a_replayed_session_voucher() {
     // The next request is paid by a fresh voucher.
     let next = handle.voucher_header(price).await.unwrap();
     assert_eq!(send(Some(next)).await.unwrap().status(), 200);
+}
+
+async fn session_challenge_amount(
+    client: &reqwest::Client,
+    url: &str,
+    path: &str,
+) -> (pay_kit::mpp::PaymentChallenge, u64) {
+    let resp = client
+        .post(format!("{url}/{path}"))
+        .headers(client_with_host("testapi"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    let challenge = pay_kit::mpp::parse_www_authenticate(
+        resp.headers()
+            .get("www-authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let amount = challenge
+        .request
+        .decode::<pay_kit::mpp::SessionRequest>()
+        .unwrap()
+        .amount
+        .parse()
+        .unwrap();
+    (challenge, amount)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn middleware_binds_session_vouchers_to_the_route_price() {
+    // A premium copy of the flat echo route, priced 500x higher.
+    let mut api = load_test_api();
+    let mut premium = api
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.path == "v1/simple/echo")
+        .unwrap()
+        .clone();
+    premium.path = "v1/simple/premium".to_string();
+    premium.metering.as_mut().unwrap().dimensions[0].tiers[0].price_usd = 0.5;
+    api.endpoints.push(premium);
+    let (url, _h, store) = start_session_server_with(api).await;
+    let client = reqwest::Client::new();
+    let (cheap, cheap_price) = session_challenge_amount(&client, &url, "v1/simple/echo").await;
+    let (expensive, expensive_price) =
+        session_challenge_amount(&client, &url, "v1/simple/premium").await;
+    assert_eq!((cheap_price, expensive_price), (1_000, 500_000));
+
+    let post = |path: &str, authorization: String| {
+        client
+            .post(format!("{url}/{path}"))
+            .headers(client_with_host("testapi"))
+            .header("authorization", authorization)
+            .body("{}")
+            .send()
+    };
+    // A voucher answering the cheap challenge cannot pay for the premium route.
+    let handle = seed_client_session(&store, &cheap).await;
+    let resp = post(
+        "v1/simple/premium",
+        handle.voucher_header(cheap_price).await.unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 402);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("issued at 1000 base units")),
+        "{body}"
+    );
+    // Each route still accepts a voucher answering its own challenge.
+    let handle = seed_client_session(&store, &cheap).await;
+    let resp = post(
+        "v1/simple/echo",
+        handle.voucher_header(cheap_price).await.unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let handle = seed_client_session(&store, &expensive).await;
+    let resp = post(
+        "v1/simple/premium",
+        handle.voucher_header(expensive_price).await.unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

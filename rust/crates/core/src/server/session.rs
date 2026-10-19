@@ -2438,6 +2438,28 @@ impl SessionMpp {
         &self,
         credential: pay_kit::mpp::PaymentCredential,
     ) -> Result<SessionOutcome> {
+        self.process_credential_priced(credential, None).await
+    }
+
+    /// Process a credential presented on a route whose challenge was built
+    /// with `challenge(route_amount)`. A voucher answering a challenge issued
+    /// at another price (e.g. for a cheaper route) is rejected.
+    #[tracing::instrument(name = "session_process_credential", skip_all)]
+    pub async fn process_credential_for_route(
+        &self,
+        credential: pay_kit::mpp::PaymentCredential,
+        route_amount: Option<u64>,
+    ) -> Result<SessionOutcome> {
+        let expected = route_amount.unwrap_or(self.session_config.amount);
+        self.process_credential_priced(credential, Some(expected))
+            .await
+    }
+
+    async fn process_credential_priced(
+        &self,
+        credential: pay_kit::mpp::PaymentCredential,
+        expected_amount: Option<u64>,
+    ) -> Result<SessionOutcome> {
         if credential.challenge.intent.as_str() != INTENT {
             return Err(Error::Mpp(format!(
                 "Expected '{}' intent, got '{}'",
@@ -2523,6 +2545,14 @@ impl SessionMpp {
                 // so a voucher for a channel this process never opened is honored
                 // instead of rejected as unknown.
                 let amount = voucher_request_amount(&request)?;
+                if let Some(expected) = expected_amount
+                    && expected != amount
+                {
+                    return Err(Error::PaymentRejected(format!(
+                        "session challenge was issued at {amount} base units, but this route \
+                         costs {expected}; request a new challenge"
+                    )));
+                }
                 self.ensure_channel_loaded(&p.voucher.data.channel_id)
                     .await?;
                 let acceptance = self

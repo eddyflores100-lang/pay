@@ -869,9 +869,7 @@ impl<S: PaymentState> PaymentGate<S> {
 
         if accepted.contains(&Scheme::MppSession) && !session_mpps.is_empty() {
             for sm in session_mpps {
-                let unit_amount = price.as_ref().map(|price| {
-                    crate::server::payment::price_unit_base_amount(price, sm.decimals())
-                });
+                let unit_amount = session_unit_amount(price.as_ref(), sm);
                 match sm.challenge_header(unit_amount) {
                     Ok(h) => {
                         if let Ok(v) = HeaderValue::from_str(&h) {
@@ -2500,6 +2498,11 @@ fn deployment_policy_unavailable() -> GateDecision {
     ))
 }
 
+/// The per-request amount a route's session challenge carries.
+fn session_unit_amount(price: Option<&metering::ResolvedPrice>, sm: &SessionMpp) -> Option<u64> {
+    price.map(|price| crate::server::payment::price_unit_base_amount(price, sm.decimals()))
+}
+
 #[derive(Clone, Copy)]
 enum SessionPricing<'a> {
     Metered(&'a pay_types::metering::Metering),
@@ -2516,7 +2519,22 @@ async fn session_authorized(
     subdomain: &str,
     path: &str,
 ) -> GateDecision {
-    match sm.process_credential(credential).await {
+    let route_amount = match pricing {
+        SessionPricing::Metered(meter) => {
+            let props = metering::RequestProperties {
+                body_size: req.content_length,
+                ..Default::default()
+            };
+            let variant = variant_hint_from_path(path);
+            let price = metering::resolve_price(meter, &props, variant.as_deref(), None);
+            session_unit_amount(price.as_ref(), sm)
+        }
+        SessionPricing::Fixed(_) => None,
+    };
+    match sm
+        .process_credential_for_route(credential, route_amount)
+        .await
+    {
         Ok(SessionOutcome::Active { state, signature }) => {
             if sm.voucher_signer() == pay_kit::mpp::SessionVoucherSigner::Client {
                 let mut response = GateResponse::json(
