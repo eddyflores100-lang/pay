@@ -806,4 +806,57 @@ mod tests {
             "{err}"
         );
     }
+
+    fn mpp_charge(currency: &str, amount: &str) -> pay_core::client::mpp::Challenge {
+        let request = serde_json::json!({
+            "amount": amount,
+            "currency": currency,
+            "recipient": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+            "methodDetails": {
+                "network": "mainnet",
+                "recentBlockhash": "11111111111111111111111111111111",
+            },
+        });
+        pay_kit::mpp::PaymentChallenge::new(
+            "id",
+            "realm",
+            "solana",
+            "charge",
+            pay_kit::mpp::Base64UrlJson::from_value(&request).unwrap(),
+        )
+    }
+
+    #[test]
+    fn native_sol_mpp_charge_is_refused_by_the_usd_policy_before_signing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = gated_file_store(&dir);
+        let ledger = Arc::new(MemoryLedger::new());
+        let gate = PolicyGate::new("tenant", SpendPolicy::dollars(1.0, 10.0), ledger.clone());
+        let result = pay_core::client::mpp::build_credential_with_override(
+            &mpp_charge("SOL", "1000000000"),
+            &store,
+            Some("mainnet"),
+            Some("connector"),
+            Some("https://attacker.example/paid"),
+            Some(Box::new(gate)),
+        );
+        let err = result.expect_err("1 SOL must not pass a $1 policy");
+        assert!(matches!(err, pay_core::Error::PaymentRejected(_)), "{err}");
+        assert_eq!(ledger.spent_today("tenant"), 0);
+    }
+
+    #[test]
+    fn hosted_permissions_refuse_native_sol_before_any_payment_is_built() {
+        let hosted = crate::McpPermissions::hosted();
+        assert!(
+            hosted
+                .authorize_mpp(&mpp_charge("SOL", "1000000000"), "https://a.example/x")
+                .is_err()
+        );
+        assert!(
+            hosted
+                .authorize_mpp(&mpp_charge("USDC", "1000000"), "https://a.example/x")
+                .is_ok()
+        );
+    }
 }
