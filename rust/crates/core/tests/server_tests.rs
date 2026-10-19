@@ -1100,3 +1100,222 @@ async fn respond_service_worker_always_served() {
         .unwrap();
     assert!(ct.contains("javascript"), "Service worker should return JS");
 }
+
+// ── Delegated buffered response settlement ──
+
+mod delegated_buffered_rounding {
+    use super::*;
+    use axum::Json;
+    use pay_core::server::session::test_channel_state;
+    use pay_core::session::SessionHandle;
+    use pay_kit::core::store::{ChannelStore, MemoryChannelStore};
+    use pay_kit::mpp::SessionAuthentication;
+    use pay_kit::mpp::server::session::VoucherSigner;
+    use pay_kit::solana_keychain::{MemorySigner, TransactionSigner};
+
+    #[derive(Clone)]
+    struct DelegatedState {
+        apis: Arc<Vec<ApiSpec>>,
+        session: Arc<SessionMpp>,
+    }
+
+    impl PaymentState for DelegatedState {
+        fn apis(&self) -> &[ApiSpec] {
+            &self.apis
+        }
+        fn mpp(&self) -> Option<&Mpp> {
+            None
+        }
+        fn session_mpp(&self) -> Option<&SessionMpp> {
+            Some(&self.session)
+        }
+        fn session_mpp_handle(&self) -> Option<Arc<SessionMpp>> {
+            Some(self.session.clone())
+        }
+    }
+
+    fn operator_keypair() -> [u8; 64] {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
+        let mut keypair = [0_u8; 64];
+        keypair[..32].copy_from_slice(signing_key.as_bytes());
+        keypair[32..].copy_from_slice(signing_key.verifying_key().as_bytes());
+        keypair
+    }
+
+    fn api_spec() -> ApiSpec {
+        serde_yml::from_str(
+            r#"
+name: delegated-rounding
+subdomain: rounding
+title: "Delegated buffered rounding"
+description: "A response-metered delegated session endpoint."
+category: ai_ml
+version: v1
+routing:
+  type: respond
+endpoints:
+  - method: POST
+    path: v1/chat
+    metering:
+      schemes: [mpp-session]
+      dimensions:
+        - direction: input
+          unit: tokens
+          scale: 1000000
+          tiers:
+            - price_usd: 0.10
+          meter:
+            source: response_json
+            path: /usage/prompt_tokens
+        - direction: output
+          unit: tokens
+          scale: 1000000
+          tiers:
+            - price_usd: 0.30
+          meter:
+            source: response_json
+            path: /usage/completion_tokens
+      upto:
+        max_usd: 0.02
+        missing_usage: refund
+        usage_preset: openai-compatible
+"#,
+        )
+        .unwrap()
+    }
+
+    async fn cumulative_after_requests(prompt_tokens: u64, completion_tokens: u64) -> Vec<u64> {
+        let operator: Arc<dyn TransactionSigner> =
+            Arc::new(MemorySigner::from_bytes(&operator_keypair()).unwrap());
+        let store: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::new());
+        let session = Arc::new(
+            SessionMpp::new_with_channel_store(
+                SessionConfig {
+                    operator: operator.pubkey().to_string(),
+                    recipient: operator.pubkey().to_string(),
+                    suggested_deposit: Some(1_000_000),
+                    currency: solana_pubkey::Pubkey::new_unique().to_string(),
+                    network: "localnet".to_string(),
+                    decimals: 6,
+                    voucher_signer: VoucherSigner::Operator,
+                    ..SessionConfig::default()
+                },
+                "delegated-buffered-rounding-secret",
+                store.clone(),
+            )
+            .with_blockhash_cache({
+                let cache = pay_kit::mpp::blockhash::BlockhashCache::new();
+                cache.set("SURFNETxSAFEHASHxxxxxxxxxxxxxxxxxxxxx11x".into(), 42, 123);
+                cache
+            })
+            .with_payment_channel_signer(operator.clone()),
+        );
+        let state = DelegatedState {
+            apis: Arc::new(vec![api_spec()]),
+            session: session.clone(),
+        };
+        let app = Router::new()
+            .fallback(any(move || async move {
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens
+                        },
+                        "choices": []
+                    })),
+                )
+            }))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                pay_core::server::payment::payment_middleware::<DelegatedState>,
+            ))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/chat", listener.local_addr().unwrap());
+        let server = tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let host = "rounding.localhost";
+
+        let challenge_response = client
+            .post(&url)
+            .header("host", host)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(challenge_response.status(), StatusCode::PAYMENT_REQUIRED);
+        let challenge = pay_kit::mpp::parse_www_authenticate(
+            challenge_response
+                .headers()
+                .get("www-authenticate")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let channel = solana_pubkey::Pubkey::new_unique();
+        let payer = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        let proof = SessionAuthentication::sign(challenge.id.clone(), &channel.to_string(), &payer)
+            .unwrap();
+        store
+            .put_channel(
+                &channel.to_string(),
+                test_channel_state(
+                    channel.to_string(),
+                    1_000_000,
+                    operator.pubkey().to_string(),
+                    "operator",
+                    challenge.id.clone(),
+                    proof.payer.clone(),
+                    Some(serde_json::to_string(&proof).unwrap()),
+                ),
+            )
+            .await
+            .unwrap();
+        let handle = SessionHandle::new(
+            channel,
+            Box::new(MemorySigner::from_bytes(&operator_keypair()).unwrap()),
+            challenge,
+        )
+        .with_authentication(proof);
+
+        let mut cumulative = Vec::new();
+        for _ in 0..2 {
+            let response = client
+                .post(&url)
+                .header("host", host)
+                .header("authorization", handle.use_header().await.unwrap())
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            cumulative.push(
+                store
+                    .get_channel(&channel.to_string())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .cumulative,
+            );
+        }
+        server.abort();
+        cumulative
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sub_base_unit_usage_advances_the_delegated_voucher() {
+        assert_eq!(cumulative_after_requests(1, 1).await, vec![1, 2]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn whole_base_unit_usage_settles_exactly() {
+        assert_eq!(
+            cumulative_after_requests(1_000, 1_000).await,
+            vec![400, 800]
+        );
+    }
+}

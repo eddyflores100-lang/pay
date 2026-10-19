@@ -434,12 +434,19 @@ pub fn upto_actual_amount_from_response(
     };
 
     let units_per_usd = max_amount as f64 / plan.ceiling_usd;
-    // Positive served usage never rounds down to a free settlement.
-    let base_units = ((usd * units_per_usd).round() as u64).max(u64::from(usd > 0.0));
     Ok(UptoActualAmount {
         usd,
-        base_units: base_units.min(max_amount),
+        base_units: usd_to_base_units(usd, units_per_usd, max_amount),
     })
+}
+
+/// Convert measured USD to base units, rounding to nearest like the session
+/// meter, except that positive usage never rounds down to zero.
+fn usd_to_base_units(usd: f64, units_per_usd: f64, max_amount: u64) -> u64 {
+    if usd <= 0.0 || !usd.is_finite() {
+        return 0;
+    }
+    ((usd * units_per_usd).round().max(1.0) as u64).min(max_amount)
 }
 
 fn clamp_actual_usd(metering: &Metering, actual_usd: f64, ceiling_usd: f64) -> f64 {
@@ -2439,6 +2446,76 @@ mod tests {
         .unwrap();
         assert_eq!(high_actual.usd, 0.10);
         assert_eq!(high_actual.base_units, 100_000);
+    }
+
+    fn per_million_token_plan() -> UptoSettlementPlan {
+        let metering = upto_metering(
+            vec![
+                usage_dim(
+                    MeterDirection::Input,
+                    BillingUnit::Tokens,
+                    1_000_000,
+                    0.10,
+                    Some(response_json("/usage/prompt_tokens")),
+                ),
+                usage_dim(
+                    MeterDirection::Output,
+                    BillingUnit::Tokens,
+                    1_000_000,
+                    0.30,
+                    Some(response_json("/usage/completion_tokens")),
+                ),
+            ],
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.02),
+                ..Default::default()
+            }),
+        );
+        settlement_plan(metering, 0.02)
+    }
+
+    fn per_million_amount(body: &[u8]) -> u64 {
+        upto_actual_amount_from_response(
+            &per_million_token_plan(),
+            20_000,
+            &HeaderMap::new(),
+            Some(body),
+        )
+        .unwrap()
+        .base_units
+    }
+
+    #[test]
+    fn positive_sub_base_unit_usage_charges_at_least_one_base_unit() {
+        // 1 + 1 tokens = $0.0000004, i.e. 0.4 base units at six decimals.
+        assert_eq!(
+            per_million_amount(br#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#),
+            1
+        );
+        // 1.5 base units rounds half up.
+        assert_eq!(
+            per_million_amount(br#"{"usage":{"prompt_tokens":3,"completion_tokens":4}}"#),
+            2
+        );
+    }
+
+    #[test]
+    fn exact_and_zero_usage_convert_without_rounding_up() {
+        assert_eq!(
+            per_million_amount(br#"{"usage":{"prompt_tokens":1000,"completion_tokens":1000}}"#),
+            400
+        );
+        assert_eq!(
+            per_million_amount(br#"{"usage":{"prompt_tokens":0,"completion_tokens":0}}"#),
+            0
+        );
+    }
+
+    #[test]
+    fn usd_to_base_units_never_exceeds_the_authorized_amount() {
+        assert_eq!(usd_to_base_units(1.0, 1_000_000.0, 20_000), 20_000);
+        assert_eq!(usd_to_base_units(f64::NAN, 1_000_000.0, 20_000), 0);
+        assert_eq!(usd_to_base_units(-1.0, 1_000_000.0, 20_000), 0);
     }
 
     #[test]
