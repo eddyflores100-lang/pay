@@ -776,12 +776,13 @@ async fn middleware_accepts_session_voucher_then_close() {
     let voucher_resp = client
         .post(format!("{url}/v1/simple/echo"))
         .headers(client_with_host("testapi"))
-        .header("authorization", voucher_header)
+        .header("authorization", &voucher_header)
         .body("{}")
         .send()
         .await
         .unwrap();
     assert_eq!(voucher_resp.status(), 200);
+    handle.record_voucher(&voucher_header).await.unwrap();
 
     let close_header = handle.close_header(Some(price)).await.unwrap();
     let close_resp = client
@@ -863,6 +864,7 @@ async fn middleware_never_forwards_a_replayed_session_voucher() {
 
     let voucher = handle.voucher_header(price).await.unwrap();
     assert_eq!(send(Some(voucher.clone())).await.unwrap().status(), 200);
+    handle.record_voucher(&voucher).await.unwrap();
     for _ in 0..2 {
         let replay = send(Some(voucher.clone())).await.unwrap();
         assert_eq!(

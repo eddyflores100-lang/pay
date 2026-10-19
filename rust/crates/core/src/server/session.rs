@@ -4240,6 +4240,7 @@ mod tests {
         else {
             panic!("expected voucher outcome");
         };
+        handle.record_voucher(&voucher_header).await.unwrap();
         assert_eq!(cumulative, 75);
         assert_eq!(session.committed_watermark(&channel.to_string()), Some(75));
 
@@ -5224,6 +5225,7 @@ mod tests {
             session.process(&voucher_header).await.is_ok(),
             "idle-close must not start while a request owns the lease"
         );
+        handle.record_voucher(&voucher_header).await.unwrap();
 
         drop(lease);
         // Wait out the kit's one-second re-arm window plus a margin so the
