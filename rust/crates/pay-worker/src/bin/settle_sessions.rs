@@ -3044,6 +3044,9 @@ fn transition_due_close(
                 "bound close lease or reservation contended".into(),
             ));
         }
+        if state.final_cumulative.is_none() {
+            state.freeze_watermark_at(state.cumulative);
+        }
         Ok(state)
     } else {
         if policy.is_some() {
@@ -3062,6 +3065,16 @@ fn claim_channel_close(
 ) -> Result<ChannelState, StoreError> {
     let mut state = current.ok_or_else(|| StoreError::Internal("Channel not found".to_string()))?;
     if channel_close_due(&state, now_ms) {
+        // Choose the close amount in the same transition that fences commits:
+        // a live reservation may still commit, so defer until it settles.
+        if state.final_cumulative.is_none() {
+            if state.has_blocking_authorization(now_seconds as i64) {
+                return Err(StoreError::Internal(
+                    "live reservation defers session close".into(),
+                ));
+            }
+            state.freeze_watermark_at(state.cumulative);
+        }
         state.close_requested_at.get_or_insert(now_seconds);
     }
     Ok(state)
@@ -4085,7 +4098,7 @@ mod tests {
                 .close_requested_at
                 .is_none()
         );
-        claim_due_close(
+        let claimed = claim_due_close(
             &store,
             &id,
             2000,
@@ -4096,6 +4109,9 @@ mod tests {
         )
         .await
         .unwrap();
+        // The claim fixes the sealed amount, so an expired reservation that
+        // later tries to commit is refused rather than charged behind the seal.
+        assert_eq!(claimed.final_cumulative, Some(claimed.cumulative));
         // Once close wins the CAS, ordinary SDK admission cannot add work,
         // even after the close lease expires: the close marker is permanent.
         let mut delivery = DeliveryRequest::new(&id, 1);
@@ -5091,6 +5107,128 @@ mod tests {
         state.lifecycle.as_mut().unwrap().close_after = 120_000;
         let claimed = claim_channel_close(Some(state), 120_000, 120).unwrap();
         assert_eq!(claimed.close_requested_at, Some(120));
+    }
+
+    fn legacy_due_state(
+        channel_id: &str,
+        signer: &pay_kit::mpp::client::session::ActiveSession,
+    ) -> ChannelState {
+        let mut state = channel_state();
+        state.channel_id = channel_id.to_string();
+        state.authorized_signer = signer.authorized_signer();
+        state.deposit = 1_000;
+        state.idle_timeout_seconds = Some(60);
+        state.lifecycle = Some(ChannelLifecycle {
+            owner: "legacy-worker".into(),
+            close_after: 1_000,
+        });
+        state
+    }
+
+    fn test_session() -> pay_kit::mpp::client::session::ActiveSession {
+        const KEYPAIR: [u8; 64] = [
+            7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+            7, 7, 7, 234, 74, 108, 99, 226, 156, 82, 10, 190, 245, 80, 123, 19, 46, 197, 249, 149,
+            71, 118, 174, 190, 190, 123, 146, 66, 30, 234, 105, 20, 70, 210, 44,
+        ];
+        let signer = pay_kit::mpp::solana_keychain::MemorySigner::from_bytes(&KEYPAIR).unwrap();
+        pay_kit::mpp::client::session::ActiveSession::new(Pubkey::new_unique(), Box::new(signer))
+    }
+
+    #[tokio::test]
+    async fn legacy_close_waits_for_a_live_delivery_and_seals_its_charge() {
+        use pay_kit::mpp::protocol::intents::session::CommitPayload;
+        use pay_kit::mpp::server::session::{DeliveryRequest, SessionConfig, SessionServer};
+
+        let active = test_session();
+        let channel_id = active.channel_id_str();
+        let store = Arc::new(pay_kit::core::store::MemoryChannelStore::new());
+        store
+            .put_channel(&channel_id, legacy_due_state(&channel_id, &active))
+            .await
+            .unwrap();
+        let server = SessionServer::new(SessionConfig::default(), store.clone());
+        let directive = server
+            .begin_delivery(DeliveryRequest::new(&channel_id, 100))
+            .await
+            .unwrap();
+        let now = unix_now() as u64;
+
+        // The idle deadline has passed but the served delivery is still live.
+        let deferred = claim_due_close(
+            &store,
+            &channel_id,
+            1_000,
+            now,
+            "legacy-worker",
+            Duration::from_secs(10),
+            None,
+        )
+        .await;
+        assert!(deferred.is_err());
+        let stored = store.get_channel(&channel_id).await.unwrap().unwrap();
+        assert!(stored.close_requested_at.is_none());
+        assert!(stored.final_cumulative.is_none());
+
+        let voucher = active.prepare_increment(100).await.unwrap();
+        server
+            .process_commit(&CommitPayload {
+                delivery_id: directive.delivery_id,
+                voucher,
+            })
+            .await
+            .unwrap();
+
+        // The commit was activity; claim once the refreshed idle deadline passes.
+        let claimed = claim_due_close(
+            &store,
+            &channel_id,
+            (now + 3_600) * 1_000,
+            now,
+            "legacy-worker",
+            Duration::from_secs(10),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed.close_requested_at, Some(now));
+        assert_eq!(claimed.cumulative, 100);
+        assert_eq!(claimed.final_cumulative, Some(100));
+        let signer: Pubkey = claimed.authorized_signer.parse().unwrap();
+        let (_, target, _) = close_voucher(&claimed, 0, &signer, now as i64).unwrap();
+        assert_eq!(target, 100);
+    }
+
+    #[test]
+    fn legacy_close_freezes_once_and_ignores_expired_reservations() {
+        let mut state = channel_state();
+        state.cumulative = 40;
+        state.lifecycle = Some(ChannelLifecycle {
+            owner: "legacy-worker".into(),
+            close_after: 1_000,
+        });
+        state
+            .pending_deliveries
+            .push(pay_kit::core::store::PendingDelivery {
+                delivery_id: "abandoned".into(),
+                amount: 10,
+                sequence: 0,
+                expires_at: 5,
+                request_fingerprint: None,
+                handler_succeeded: false,
+            });
+        // A reservation whose lease ran out cannot commit and never blocks.
+        let claimed = claim_channel_close(Some(state.clone()), 1_000, 5).unwrap();
+        assert_eq!(claimed.final_cumulative, Some(40));
+        assert_eq!(claimed.close_requested_at, Some(5));
+        // One second earlier the same reservation is live and defers the close.
+        assert!(claim_channel_close(Some(state.clone()), 1_000, 4).is_err());
+
+        // A fenced record keeps its frozen amount on later passes.
+        let mut fenced = claimed;
+        fenced.pending_deliveries[0].expires_at = 100;
+        let again = claim_channel_close(Some(fenced), 1_000, 6).unwrap();
+        assert_eq!(again.final_cumulative, Some(40));
     }
 
     #[test]
