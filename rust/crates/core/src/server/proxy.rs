@@ -298,7 +298,9 @@ pub async fn forward_request_with_session_metering_and_identity(
         .any(|part| part.trim().eq_ignore_ascii_case("text/event-stream"));
 
     let stream = upstream_resp.bytes_stream();
-    if let Some(meter) = build_session_stream_meter(api, &method, uri, headers, session_context) {
+    if let Some(meter) = build_session_stream_meter(api, &method, uri, headers, session_context)
+        .map(|meter| meter.with_request_body_bytes(body.len() as u64))
+    {
         return Ok(resp
             .body(Body::from_stream(session_stream::meter_response_stream(
                 stream, meter, is_sse,

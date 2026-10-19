@@ -618,8 +618,16 @@ impl<S: PaymentState> Http402Gate<S> {
                 )
                 .await
                 .map_err(|_| batch_commit_failed_error())?;
-            self.stream_buffered_upstream(session, ctx, status, response_headers, upstream, extra)
-                .await?;
+            self.stream_buffered_upstream(
+                session,
+                ctx,
+                status,
+                response_headers,
+                upstream,
+                extra,
+                body.len() as u64,
+            )
+            .await?;
             tracing::debug!(
                 path,
                 "served streaming response via body-signing proxy path"
@@ -692,6 +700,7 @@ impl<S: PaymentState> Http402Gate<S> {
         Ok(true)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn stream_buffered_upstream(
         &self,
         session: &mut Session,
@@ -700,18 +709,21 @@ impl<S: PaymentState> Http402Gate<S> {
         headers: HeaderMap,
         upstream: reqwest::Response,
         extra: Vec<(HeaderName, HeaderValue)>,
+        request_body_bytes: u64,
     ) -> pingora::Result<()> {
         let is_sse = is_sse_response(&headers);
         let mut delegated_meter = match ctx.session.take() {
-            Some(forward) => Some(DelegatedSessionStreamMeter::from_forward(forward).map_err(
-                |error| {
-                    pingora::Error::because(
-                        pingora::ErrorType::InternalError,
-                        "configure delegated response stream metering",
-                        error,
-                    )
-                },
-            )?),
+            Some(forward) => Some(
+                DelegatedSessionStreamMeter::from_forward(forward)
+                    .map_err(|error| {
+                        pingora::Error::because(
+                            pingora::ErrorType::InternalError,
+                            "configure delegated response stream metering",
+                            error,
+                        )
+                    })?
+                    .with_request_body_bytes(request_body_bytes),
+            ),
             None => None,
         };
         let mut out = ResponseHeader::build(status.as_u16(), None)?;

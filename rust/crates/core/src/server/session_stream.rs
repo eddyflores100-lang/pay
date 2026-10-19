@@ -84,6 +84,9 @@ impl SessionStreamContext {
 #[derive(Debug, Clone, Default)]
 pub struct SessionUsageHints {
     quota_units: Vec<QuotaUnitHint>,
+    /// Request body size: an upper bound on prompt tokens when the provider
+    /// never reports input usage.
+    request_body_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -113,7 +116,10 @@ impl SessionUsageHints {
             })
             .collect();
 
-        Self { quota_units }
+        Self {
+            quota_units,
+            request_body_bytes: request_properties.body_size,
+        }
     }
 
     fn tokens_per_quota_unit(&self, direction: MeterDirection) -> Option<u64> {
@@ -207,6 +213,12 @@ impl DelegatedSessionStreamMeter {
             authorization_exhausted: false,
             next_lifecycle_touch: Instant::now() + LIFECYCLE_TOUCH_INTERVAL,
         })
+    }
+
+    /// Use the exact forwarded request body size as the missing-input bound.
+    pub fn with_request_body_bytes(mut self, bytes: u64) -> Self {
+        self.accumulator.hints.request_body_bytes = Some(bytes);
+        self
     }
 
     pub fn supports(forward: &SessionForward) -> bool {
@@ -392,6 +404,12 @@ impl SessionStreamMeter {
         })
     }
 
+    /// Use the exact forwarded request body size as the missing-input bound.
+    pub fn with_request_body_bytes(mut self, bytes: u64) -> Self {
+        self.accumulator.hints.request_body_bytes = Some(bytes);
+        self
+    }
+
     pub fn observe_chunk(
         &mut self,
         chunk: &[u8],
@@ -542,6 +560,7 @@ struct StreamUsageAccumulator {
     input_tokens: u64,
     output_tokens: u64,
     provider_output_tokens: bool,
+    provider_input_tokens: bool,
     finished: bool,
     request_seen: bool,
     observed: bool,
@@ -562,6 +581,7 @@ impl StreamUsageAccumulator {
             input_tokens: 0,
             output_tokens: 0,
             provider_output_tokens: false,
+            provider_input_tokens: false,
             finished: false,
             request_seen: false,
             observed: false,
@@ -626,7 +646,20 @@ impl StreamUsageAccumulator {
             self.finish_ndjson()?
         };
         self.finished = true;
-        let changed = changed || (!self.provider_output_tokens && self.output_text_bytes > 0);
+        let mut changed = changed || (!self.provider_output_tokens && self.output_text_bytes > 0);
+        if !self.provider_input_tokens
+            && let Some(unit) = self.charged_input_token_unit()
+        {
+            let Some(body_bytes) = self.hints.request_body_bytes else {
+                return Err(
+                    crate::server::session_metering::SessionMeteringError::MissingRequiredObservation {
+                        direction: MeterDirection::Input,
+                        unit,
+                    },
+                );
+            };
+            changed |= body_bytes > self.input_tokens;
+        }
         self.observed |= changed;
         Ok(changed)
     }
@@ -667,6 +700,7 @@ impl StreamUsageAccumulator {
         }
         if let Some(input) = provider_token_quantity(value, MeterDirection::Input) {
             self.input_tokens = self.input_tokens.max(input);
+            self.provider_input_tokens = true;
             changed = true;
         }
         if let Some(output) = provider_token_quantity(value, MeterDirection::Output) {
@@ -675,6 +709,31 @@ impl StreamUsageAccumulator {
             changed = true;
         }
         changed
+    }
+
+    /// Input tokens to rate. Without a provider observation by end of stream,
+    /// the request body size bounds the prompt from above.
+    fn input_token_amount(&self) -> u64 {
+        if self.finished && !self.provider_input_tokens {
+            self.input_tokens
+                .max(self.hints.request_body_bytes.unwrap_or(0))
+        } else {
+            self.input_tokens
+        }
+    }
+
+    fn charged_input_token_unit(&self) -> Option<BillingUnit> {
+        self.spec
+            .dimensions
+            .iter()
+            .find(|dimension| {
+                dimension.direction == MeterDirection::Input
+                    && matches!(
+                        dimension.unit,
+                        BillingUnit::Tokens | BillingUnit::QuotaUnits
+                    )
+            })
+            .map(|dimension| dimension.unit)
     }
 
     /// Output tokens to rate. Whitespace words are only a live lower bound;
@@ -703,13 +762,15 @@ impl StreamUsageAccumulator {
             (MeterDirection::Usage, BillingUnit::Requests) => u64::from(self.request_seen),
             (MeterDirection::Output, BillingUnit::Bytes) => self.output_bytes,
             (MeterDirection::Output, BillingUnit::Characters) => self.output_chars,
-            (MeterDirection::Input, BillingUnit::Tokens) => self.input_tokens,
+            (MeterDirection::Input, BillingUnit::Tokens) => self.input_token_amount(),
             (MeterDirection::Output, BillingUnit::Tokens) => self.output_token_amount(),
-            (MeterDirection::Input, BillingUnit::QuotaUnits) => self
-                .hints
-                .tokens_per_quota_unit(MeterDirection::Input)
-                .map(|scale| ceil_div_u64(self.input_tokens, scale))
-                .unwrap_or(self.input_tokens),
+            (MeterDirection::Input, BillingUnit::QuotaUnits) => {
+                let input_tokens = self.input_token_amount();
+                self.hints
+                    .tokens_per_quota_unit(MeterDirection::Input)
+                    .map(|scale| ceil_div_u64(input_tokens, scale))
+                    .unwrap_or(input_tokens)
+            }
             (MeterDirection::Output, BillingUnit::QuotaUnits) => {
                 let output_tokens = self.output_token_amount();
                 self.hints
@@ -730,8 +791,10 @@ impl StreamUsageAccumulator {
     }
 
     fn reconfigure(&mut self, spec: SessionMeterSpec, hints: SessionUsageHints) {
+        let request_body_bytes = self.hints.request_body_bytes;
         self.spec = spec;
         self.hints = hints;
+        self.hints.request_body_bytes = request_body_bytes.or(self.hints.request_body_bytes);
     }
 }
 
@@ -2048,6 +2111,68 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
                 .observation()
                 .get(MeterDirection::Output, BillingUnit::Tokens),
             Some("héllo wörld".len() as u64)
+        );
+    }
+
+    fn input_output_token_dimensions() -> Vec<MeterDimension> {
+        vec![
+            token_dimension(MeterDirection::Input, "/usage/prompt_tokens"),
+            token_dimension(MeterDirection::Output, "/usage/completion_tokens"),
+        ]
+    }
+
+    const OUTPUT_ONLY_USAGE: &[u8] =
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"one two three four five\"}}],\"usage\":{\"completion_tokens\":5}}\n\n";
+
+    #[tokio::test]
+    async fn missing_prompt_usage_settles_the_request_body_bound() {
+        let (session, channel_id, meter) =
+            delegated_test_meter(input_output_token_dimensions(), "missing-prompt-usage").await;
+
+        drain_delegated(
+            vec![OUTPUT_ONLY_USAGE.to_vec()],
+            meter.with_request_body_bytes(600),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            session.committed_watermark(&channel_id),
+            Some(605),
+            "a missing prompt observation must not be rated as zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn reported_prompt_usage_is_authoritative() {
+        let (session, channel_id, meter) =
+            delegated_test_meter(input_output_token_dimensions(), "reported-prompt-usage").await;
+
+        drain_delegated(
+            vec![
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5}}\n\n"
+                    .to_vec(),
+            ],
+            meter.with_request_body_bytes(600),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(session.committed_watermark(&channel_id), Some(105));
+    }
+
+    #[tokio::test]
+    async fn missing_prompt_usage_without_a_body_bound_fails_the_stream() {
+        let (_session, _channel_id, meter) =
+            delegated_test_meter(input_output_token_dimensions(), "unbounded-prompt").await;
+
+        let error = drain_delegated(vec![OUTPUT_ONLY_USAGE.to_vec()], meter)
+            .await
+            .expect_err("unrated input must not complete cleanly");
+
+        assert!(
+            error.to_string().contains("missing required observation"),
+            "{error}"
         );
     }
 }
