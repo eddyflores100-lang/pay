@@ -7,6 +7,7 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
 use crate::driver::{DataError, Result};
+use crate::types::StoreBinding;
 
 pub const CAPABILITY_HEADER: &str = "x-pay-data-capability";
 pub const INTERNAL_PROOF_HEADER: &str = "x-pay-data-binding-proof";
@@ -25,6 +26,8 @@ pub struct BindingIssuer {
 #[derive(Clone, Debug, Deserialize)]
 pub struct CreateBindingRequest {
     pub payer: String,
+    /// Verified channel of the control-plane call requesting the binding.
+    pub channel_id: String,
     pub binding_name: String,
     pub driver: String,
     pub store_id: String,
@@ -70,6 +73,8 @@ pub struct Capability {
     pub store_id: String,
     /// Provider creation identity of the bound store incarnation.
     pub generation: String,
+    /// Lease key of the channel funding the bound store.
+    pub channel_lease: String,
     workload_id: String,
     pub read: bool,
     pub write: bool,
@@ -105,7 +110,7 @@ impl BindingIssuer {
     pub fn issue(
         &self,
         tenant: String,
-        generation: String,
+        store: StoreBinding,
         request: &CreateBindingRequest,
     ) -> Result<IssuedBinding> {
         if !request.read && !request.write {
@@ -121,9 +126,9 @@ impl BindingIssuer {
             )));
         }
         let expires_at = now_seconds()?.saturating_add(u64::from(lease));
-        if generation.is_empty() {
+        if store.generation.is_empty() || store.channel_lease.is_empty() {
             return Err(DataError::InvalidRequest(
-                "binding requires a store creation identity".into(),
+                "binding requires a store creation identity and channel lease".into(),
             ));
         }
         let capability = Capability {
@@ -131,7 +136,8 @@ impl BindingIssuer {
             tenant,
             driver: request.driver.clone(),
             store_id: request.store_id.clone(),
-            generation,
+            generation: store.generation,
+            channel_lease: store.channel_lease,
             workload_id: request.workload_id.clone(),
             read: request.read,
             write: request.write,
@@ -206,11 +212,19 @@ fn validate_workload_id(value: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn lease(generation: &str) -> StoreBinding {
+        StoreBinding {
+            generation: generation.into(),
+            channel_lease: "lease".into(),
+        }
+    }
+
     #[test]
     fn capabilities_are_scoped_and_tamper_evident() {
         let issuer = BindingIssuer::new(vec![7; 32], vec![9; 32]).unwrap();
         let request = CreateBindingRequest {
             payer: "payer".into(),
+            channel_id: "channel".into(),
             binding_name: "weather".into(),
             driver: "gcp-firestore".into(),
             store_id: "fds-0123456789abcdef-weather".into(),
@@ -220,7 +234,7 @@ mod tests {
             lease_seconds: Some(300),
         };
         let binding = issuer
-            .issue("0123456789abcdef".into(), "created-1".into(), &request)
+            .issue("0123456789abcdef".into(), lease("created-1"), &request)
             .unwrap();
         assert_eq!(
             issuer
@@ -231,7 +245,7 @@ mod tests {
         );
         assert!(
             issuer
-                .issue("0123456789abcdef".into(), String::new(), &request)
+                .issue("0123456789abcdef".into(), lease(""), &request)
                 .is_err()
         );
         assert!(

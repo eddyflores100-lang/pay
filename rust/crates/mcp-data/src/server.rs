@@ -21,7 +21,7 @@ use crate::binding::{
     BindingIssuer, CAPABILITY_HEADER, CreateBindingRequest, CreateBindingResponse,
     INTERNAL_PROOF_HEADER,
 };
-use crate::driver::{DataError, DriverRegistry};
+use crate::driver::{DataError, DriverRegistry, channel_lease_key};
 use crate::types::{
     CreateDocumentStoreRequest, DocumentRequest, DocumentStoreRequest, GatewayReadRequest,
     ListDocumentStoresRequest, PutDocumentRequest, StoreBinding, Tenant,
@@ -280,7 +280,7 @@ async fn create_binding(
             .and_then(|value| value.to_str().ok())
             .ok_or_else(|| DataError::InvalidRequest("binding proof is required".into()))?;
         state.bindings.verify_internal_proof(proof)?;
-        let tenant = tenant_from_payer(&request.payer)?;
+        let tenant = tenant_from_verified_session(&request.payer, &request.channel_id)?;
         let driver = state.drivers.get(&request.driver)?;
         let store = driver
             .get_document_store(
@@ -295,10 +295,11 @@ async fn create_binding(
             DataError::Provider("document store omitted its creation identity".into())
         })?;
         request.store_id = store.id;
-        Ok(state
-            .bindings
-            .issue(tenant.key, generation, &request)?
-            .into())
+        let lease = StoreBinding {
+            generation,
+            channel_lease: channel_lease_key(&tenant.channel_id)?,
+        };
+        Ok(state.bindings.issue(tenant.key, lease, &request)?.into())
     }
     .await;
     internal_response(result)
@@ -325,6 +326,7 @@ async fn binding_get_document(
                     channel_id: String::new(),
                     binding: Some(StoreBinding {
                         generation: capability.generation,
+                        channel_lease: capability.channel_lease,
                     }),
                 },
                 DocumentRequest {
@@ -361,6 +363,7 @@ async fn binding_put_document(
                     channel_id: String::new(),
                     binding: Some(StoreBinding {
                         generation: capability.generation,
+                        channel_lease: capability.channel_lease,
                     }),
                 },
                 PutDocumentRequest {
@@ -397,6 +400,7 @@ async fn binding_delete_document(
                     channel_id: String::new(),
                     binding: Some(StoreBinding {
                         generation: capability.generation,
+                        channel_lease: capability.channel_lease,
                     }),
                 },
                 DocumentRequest {
@@ -755,6 +759,45 @@ mod tests {
         assert_eq!(body["store_id"], STORE_ID);
         assert_eq!(body["value"]["secret"], "published");
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn binding_issuance_requires_a_verified_channel() {
+        let app = router(
+            DriverRegistry::default(),
+            "data.example".into(),
+            Vec::new(),
+            BindingIssuer::new(vec![7; 32], PROXY_PROOF.as_bytes().to_vec()).unwrap(),
+        );
+        let payer = bs58::encode([11_u8; 32]).into_string();
+        for (channel, expected) in [
+            (Some(""), StatusCode::BAD_REQUEST),
+            (Some("bad/channel"), StatusCode::BAD_REQUEST),
+            (None, StatusCode::UNPROCESSABLE_ENTITY),
+            // A valid channel passes identity checks and reaches driver lookup.
+            (Some("verifiedchannel"), StatusCode::NOT_FOUND),
+        ] {
+            let mut body = serde_json::json!({
+                "payer": payer, "binding_name": "weather", "driver": "gcp-firestore",
+                "store_id": "weather", "workload_id": "gcf-0123456789abcdef-weather",
+                "read": true
+            });
+            if let Some(channel) = channel {
+                body["channel_id"] = channel.into();
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/__402/bind")
+                        .header(INTERNAL_PROOF_HEADER, PROXY_PROOF)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{channel:?}");
+        }
     }
 
     #[tokio::test]

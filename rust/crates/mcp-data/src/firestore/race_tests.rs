@@ -104,6 +104,11 @@ impl Fixture {
                     .filter(|(key, _)| key.starts_with(&format!("{name}/")))
                     .map(|(_, doc)| doc).collect::<Vec<_>>()}))
             }
+        } else if method == "GET" && path.ends_with("/documentStores") {
+            ok(json!({"documents": state.documents.iter()
+                .filter(|(key, _)| key.strip_prefix(&format!("{name}/"))
+                    .is_some_and(|rest| !rest.contains('/')))
+                .map(|(_, doc)| doc).collect::<Vec<_>>()}))
         } else if method == "GET" {
             match state.documents.get(name) {
                 Some(doc) => ok(doc.clone()),
@@ -395,9 +400,13 @@ async fn capabilities_do_not_survive_store_recreation() {
         issuer
             .issue(
                 owner.key.clone(),
-                store.created_at.unwrap(),
+                crate::types::StoreBinding {
+                    generation: store.created_at.unwrap(),
+                    channel_lease: channel_lease_key("channelA").unwrap(),
+                },
                 &CreateBindingRequest {
                     payer: "payer".into(),
+                    channel_id: "channelA".into(),
                     binding_name: "weather".into(),
                     driver: DRIVER_ID.into(),
                     store_id: store.id,
@@ -467,6 +476,97 @@ async fn capabilities_do_not_survive_store_recreation() {
     let (status, body) = call("GET", &fresh, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["value"], "replacement");
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn store_crud_is_scoped_to_the_funding_channel() {
+    let (driver, _fixture, server) = fixture().await;
+    let owner = tenant("channelA");
+    let sibling = tenant("channelB");
+    create_and_write(&driver, &owner, json!("original")).await;
+    let document = || DocumentRequest {
+        driver: DRIVER_ID.into(),
+        store_id: "weather".into(),
+        key: "key".into(),
+    };
+    let put = || PutDocumentRequest {
+        driver: DRIVER_ID.into(),
+        store_id: "weather".into(),
+        key: "key".into(),
+        value: json!("overwritten"),
+    };
+    let list = || ListDocumentStoresRequest {
+        driver: DRIVER_ID.into(),
+        page_size: 50,
+        page_token: None,
+    };
+    for tenant in [sibling.clone(), tenant("")] {
+        assert!(driver.get_document(&tenant, document()).await.is_err());
+        assert!(driver.put_document(&tenant, put()).await.is_err());
+        assert!(driver.delete_document(&tenant, document()).await.is_err());
+        assert!(
+            driver
+                .get_document_store(&tenant, store_request())
+                .await
+                .is_err()
+        );
+        assert!(
+            driver
+                .delete_document_store(&tenant, store_request())
+                .await
+                .is_err()
+        );
+        assert!(
+            driver
+                .list_document_stores(&tenant, list())
+                .await
+                .unwrap()
+                .stores
+                .is_empty()
+        );
+    }
+    // A capability-bound tenant must present the store's own lease.
+    let generation = driver
+        .get_document_store(&owner, store_request())
+        .await
+        .unwrap()
+        .created_at
+        .unwrap();
+    let mut bound = tenant("");
+    bound.binding = Some(crate::types::StoreBinding {
+        generation: generation.clone(),
+        channel_lease: channel_lease_key("channelB").unwrap(),
+    });
+    assert!(driver.get_document(&bound, document()).await.is_err());
+    bound.binding = Some(crate::types::StoreBinding {
+        generation,
+        channel_lease: channel_lease_key("channelA").unwrap(),
+    });
+    assert_eq!(
+        driver.get_document(&bound, document()).await.unwrap().value,
+        json!("original")
+    );
+
+    assert_eq!(
+        driver.get_document(&owner, document()).await.unwrap().value,
+        json!("original")
+    );
+    assert_eq!(
+        driver
+            .list_document_stores(&owner, list())
+            .await
+            .unwrap()
+            .stores
+            .len(),
+        1
+    );
+    driver.put_document(&owner, put()).await.unwrap();
+    driver
+        .delete_document_store(&owner, store_request())
+        .await
+        .unwrap();
     server.abort();
     let _ = server.await;
 }

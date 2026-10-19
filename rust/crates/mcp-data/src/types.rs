@@ -15,6 +15,8 @@ pub struct Tenant {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoreBinding {
     pub generation: String,
+    /// Lease key of the channel that funded the bound store.
+    pub channel_lease: String,
 }
 
 fn default_driver() -> String {
