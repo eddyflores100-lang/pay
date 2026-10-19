@@ -163,6 +163,18 @@ fn session_close_needs_reconciliation(message: &str) -> bool {
     message.contains("Close already requested") || message.contains("Channel is already sealed")
 }
 
+/// The per-request price a voucher must pay: the authenticated challenge
+/// amount, never the static session config amount.
+fn voucher_request_amount(request: &SessionRequest) -> Result<u64> {
+    match request.amount.parse::<u64>() {
+        Ok(amount) if amount > 0 => Ok(amount),
+        _ => Err(Error::PaymentRejected(format!(
+            "session challenge amount `{}` is not a positive base-unit amount",
+            request.amount
+        ))),
+    }
+}
+
 // ── Session outcome ────────────────────────────────────────────────────────
 
 /// The result of processing a session action.
@@ -2510,11 +2522,12 @@ impl SessionMpp {
                 // Reuse: adopt a prior-run channel from chain before verifying,
                 // so a voucher for a channel this process never opened is honored
                 // instead of rejected as unknown.
+                let amount = voucher_request_amount(&request)?;
                 self.ensure_channel_loaded(&p.voucher.data.channel_id)
                     .await?;
                 let acceptance = self
                     .server
-                    .verify_voucher(p)
+                    .verify_voucher_for_amount(p, amount)
                     .await
                     .map_err(|e| Error::PaymentRejected(e.to_string()))?;
                 let cumulative = acceptance.cumulative;
@@ -3976,6 +3989,95 @@ mod tests {
                 .contains("Unrecognized session action payload"),
             "got: {err}"
         );
+    }
+
+    fn signer_for(key: &ed25519_dalek::SigningKey) -> Box<dyn TransactionSigner> {
+        let mut keypair = [0u8; 64];
+        keypair[..32].copy_from_slice(key.as_bytes());
+        keypair[32..].copy_from_slice(key.verifying_key().as_bytes());
+        Box::new(MemorySigner::from_bytes(&keypair).unwrap())
+    }
+
+    /// A client channel seeded for `challenge`, plus a factory for fresh
+    /// client handles that start signing from cumulative zero.
+    async fn client_voucher_channel(
+        session: &SessionMpp,
+        challenge: &PaymentChallenge,
+    ) -> (String, impl Fn() -> SessionHandle) {
+        let channel = solana_pubkey::Pubkey::new_unique();
+        let (voucher_key, signer) = test_keypair();
+        seed_channel(
+            session,
+            &channel.to_string(),
+            CAP,
+            &signer.pubkey().to_string(),
+            "client",
+            &challenge.id,
+            &solana_pubkey::Pubkey::new_unique().to_string(),
+            None,
+        )
+        .await;
+        let challenge = challenge.clone();
+        let handle = move || {
+            SessionHandle::new(channel, signer_for(&voucher_key), challenge.clone())
+                .with_voucher_key(voucher_key.clone())
+        };
+        (channel.to_string(), handle)
+    }
+
+    async fn stored_channel(session: &SessionMpp, channel_id: &str) -> ChannelState {
+        session
+            .operator_runtime
+            .channel_store
+            .get_channel(channel_id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn voucher_must_pay_the_challenged_request_amount() {
+        // The static session amount is 25; this route was challenged at 100.
+        let session = test_session_mpp();
+        let challenge = session.challenge(Some(100)).unwrap();
+        let (channel_id, handle) = client_voucher_channel(&session, &challenge).await;
+
+        for under in [1, 25, 99] {
+            let header = handle().voucher_header(under).await.unwrap();
+            let error = session.process(&header).await.unwrap_err();
+            assert!(
+                matches!(error, Error::PaymentRejected(_)),
+                "+{under} must not pay a 100 request: {error}"
+            );
+        }
+        let state = stored_channel(&session, &channel_id).await;
+        assert_eq!((state.cumulative, state.spent_amount), (0, 0));
+
+        let header = handle().voucher_header(100).await.unwrap();
+        let SessionOutcome::Voucher { cumulative, .. } = session.process(&header).await.unwrap()
+        else {
+            panic!("expected voucher outcome");
+        };
+        assert_eq!(cumulative, 100);
+        let state = stored_channel(&session, &channel_id).await;
+        assert_eq!((state.cumulative, state.spent_amount), (100, 100));
+    }
+
+    #[tokio::test]
+    async fn voucher_rejects_a_zero_challenge_amount() {
+        let session = test_session_mpp();
+        let challenge = session.challenge(Some(0)).unwrap();
+        let (channel_id, handle) = client_voucher_channel(&session, &challenge).await;
+
+        let header = handle().voucher_header(25).await.unwrap();
+        let error = session.process(&header).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not a positive base-unit amount"),
+            "{error}"
+        );
+        assert_eq!(stored_channel(&session, &channel_id).await.cumulative, 0);
     }
 
     #[tokio::test]

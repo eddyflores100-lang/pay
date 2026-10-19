@@ -784,7 +784,9 @@ async fn push_session_full_flow() {
     );
 
     // ── Step 3: Voucher (subsequent API call) ──────────────────────────────
-    let voucher_action = active.voucher_action(1_000).await.unwrap(); // 0.001 USDC
+    // Each voucher pays the challenged per-request price.
+    let price: u64 = challenged_request.amount.parse().unwrap();
+    let voucher_action = active.voucher_action(price).await.unwrap();
     let auth =
         format_authorization(&PaymentCredential::new(challenge.to_echo(), voucher_action)).unwrap();
 
@@ -804,7 +806,7 @@ async fn push_session_full_flow() {
     );
 
     // Second voucher — watermark advances
-    let voucher_action = active.voucher_action(1_000).await.unwrap();
+    let voucher_action = active.voucher_action(price).await.unwrap();
     let auth =
         format_authorization(&PaymentCredential::new(challenge.to_echo(), voucher_action)).unwrap();
 

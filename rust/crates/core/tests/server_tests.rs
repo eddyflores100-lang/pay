@@ -727,9 +727,43 @@ async fn middleware_accepts_session_voucher_then_close() {
         .await
         .unwrap();
     let handle = pay_core::session::SessionHandle::new(channel, signer, challenge.clone())
-        .with_voucher_key(voucher_key);
+        .with_voucher_key(voucher_key.clone());
+    let price: u64 = challenge
+        .request
+        .decode::<pay_kit::mpp::SessionRequest>()
+        .unwrap()
+        .amount
+        .parse()
+        .unwrap();
 
-    let voucher_header = handle.voucher_header(25).await.unwrap();
+    // A voucher below the challenged route price is refused before upstream.
+    let under = pay_core::session::SessionHandle::new(
+        channel,
+        Box::new(
+            pay_kit::mpp::solana_keychain::memory::MemorySigner::from_bytes(&{
+                let mut kp = [0u8; 64];
+                kp[..32].copy_from_slice(voucher_key.as_bytes());
+                kp[32..].copy_from_slice(voucher_key.verifying_key().as_bytes());
+                kp
+            })
+            .unwrap(),
+        ),
+        challenge.clone(),
+    );
+    let under_resp = client
+        .post(format!("{url}/v1/simple/echo"))
+        .headers(client_with_host("testapi"))
+        .header(
+            "authorization",
+            under.voucher_header(price - 1).await.unwrap(),
+        )
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(under_resp.status(), 402);
+
+    let voucher_header = handle.voucher_header(price).await.unwrap();
     let voucher_resp = client
         .post(format!("{url}/v1/simple/echo"))
         .headers(client_with_host("testapi"))
@@ -740,7 +774,7 @@ async fn middleware_accepts_session_voucher_then_close() {
         .unwrap();
     assert_eq!(voucher_resp.status(), 200);
 
-    let close_header = handle.close_header(Some(25)).await.unwrap();
+    let close_header = handle.close_header(Some(price)).await.unwrap();
     let close_resp = client
         .post(format!("{url}/v1/simple/echo"))
         .headers(client_with_host("testapi"))
