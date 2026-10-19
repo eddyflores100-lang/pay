@@ -479,7 +479,7 @@ pub async fn prepare_upstream_with_identity(
                     tracing::error!(error = %e, "Failed to fetch OAuth2 token");
                     return Err(error_response(
                         StatusCode::BAD_GATEWAY,
-                        &format!("OAuth2 token error: {e}"),
+                        "OAuth2 token request failed",
                     ));
                 }
             }
@@ -498,7 +498,8 @@ pub async fn prepare_upstream_with_identity(
                         &upstream_url_for_logging(&prepared.url),
                         &e,
                     );
-                    error_response(StatusCode::BAD_GATEWAY, &e)
+                    tracing::error!(error = %e, "Failed to fetch access token");
+                    error_response(StatusCode::BAD_GATEWAY, "Access token request failed")
                 })?;
         }
         _ => {}
@@ -1178,15 +1179,19 @@ async fn fetch_access_token(fetch: &AccessTokenFetchConfig) -> Result<FetchedTok
         request = request.header(name.as_str(), value);
     }
 
-    let response = request
-        .send()
-        .await
-        .map_err(|e| format!("Access token request failed: {e}"))?;
+    let response = request.send().await.map_err(|e| {
+        format!(
+            "Access token request failed: {}",
+            upstream_error_for_logging(&e)
+        )
+    })?;
     let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|e| format!("Access token response read failed: {e}"))?;
+    let text = response.text().await.map_err(|e| {
+        format!(
+            "Access token response read failed: {}",
+            upstream_error_for_logging(&e)
+        )
+    })?;
     if !status.is_success() {
         return Err(format!("Access token request failed with {status}"));
     }
@@ -1400,12 +1405,19 @@ async fn fetch_oauth2_token(
         .form(&params)
         .send()
         .await
-        .map_err(|e| format!("OAuth2 token request failed: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "OAuth2 token request failed: {}",
+                upstream_error_for_logging(&e)
+            )
+        })?;
 
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Invalid OAuth2 response: {e}"))?;
+    let body: serde_json::Value = resp.json().await.map_err(|e| {
+        format!(
+            "Invalid OAuth2 response: {}",
+            upstream_error_for_logging(&e)
+        )
+    })?;
 
     let access_token = body["access_token"]
         .as_str()
@@ -1478,12 +1490,17 @@ async fn fetch_gcp_metadata_token(
         ])
         .send()
         .await
-        .map_err(|e| format!("ADC token refresh failed: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "ADC token refresh failed: {}",
+                upstream_error_for_logging(&e)
+            )
+        })?;
 
     let body: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| format!("Invalid token response: {e}"))?;
+        .map_err(|e| format!("Invalid token response: {}", upstream_error_for_logging(&e)))?;
 
     let access_token = body["access_token"]
         .as_str()
@@ -1530,6 +1547,7 @@ pub(super) async fn fetch_gcp_metadata_identity_token_at(
         .send()
         .await
         .map_err(|e| {
+            let e = upstream_error_for_logging(&e);
             format!(
                 "GCP metadata server unreachable ({e}): identity tokens require running on GCP (Cloud Run/GCE); there is no ADC fallback"
             )
@@ -2950,12 +2968,7 @@ mod tests {
         assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
         let body = axum::body::to_bytes(err.into_body(), 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            json["message"]
-                .as_str()
-                .unwrap()
-                .contains("client_id env var not set")
-        );
+        assert_eq!(json["message"], "OAuth2 token request failed");
     }
 
     #[tokio::test]
@@ -2984,12 +2997,7 @@ mod tests {
         assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
         let body = axum::body::to_bytes(err.into_body(), 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            json["message"]
-                .as_str()
-                .unwrap()
-                .contains("oauth2.audience is required")
-        );
+        assert_eq!(json["message"], "OAuth2 token request failed");
     }
 
     // ── jwt_exp_claim ────────────────────────────────────────────────────
@@ -3419,5 +3427,110 @@ mod tests {
 
         assert_eq!(result.unwrap_err().status(), StatusCode::BAD_GATEWAY);
         assert!(hits.lock().unwrap().is_empty());
+    }
+
+    async fn error_message(response: Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        json["message"].as_str().unwrap().to_string()
+    }
+
+    fn closed_local_port() -> u16 {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    #[tokio::test]
+    async fn access_token_fetch_failure_never_exposes_token_url_or_query_secret() {
+        let port = closed_local_port();
+        // SAFETY: test-only env mutation scoped to this test.
+        unsafe { std::env::set_var("_TEST_NESTED_QUERY_SECRET", "nested-query-secret") };
+        let api = api_with_auth(Some(AuthConfig::AccessToken {
+            prepare: vec![],
+            fetch: AccessTokenFetchConfig {
+                url: format!("http://127.0.0.1:{port}/token?existing=1"),
+                method: HttpMethod::Get,
+                prepare: vec![],
+                auth: Some(Box::new(AuthConfig::QueryParam {
+                    key: "api_key".to_string(),
+                    value_from_env: "_TEST_NESTED_QUERY_SECRET".to_string(),
+                })),
+                response: AccessTokenResponseConfig {
+                    token_json_pointer: "/access_token".to_string(),
+                    expires_at_json_pointer: None,
+                    expires_in_json_pointer: Some("/expires_in".to_string()),
+                    expires_at_format: Default::default(),
+                    refresh_skew_seconds: 0,
+                },
+            },
+            inject: AccessTokenInjectConfig {
+                target: HmacTarget {
+                    kind: HmacTargetType::Header,
+                    name: "X-Access-Token".to_string(),
+                },
+                template: "{token}".to_string(),
+            },
+        }));
+
+        let uri: Uri = "/v1/protected".parse().unwrap();
+        let result =
+            forward_request(&api, Method::GET, &uri, &HeaderMap::new(), Bytes::new()).await;
+        unsafe { std::env::remove_var("_TEST_NESTED_QUERY_SECRET") };
+
+        let response = result.unwrap_err();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let message = error_message(response).await;
+        assert_eq!(message, "Access token request failed");
+        assert!(!message.contains("nested-query-secret"));
+        assert!(!message.contains("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn oauth2_token_fetch_failure_never_exposes_token_url() {
+        let port = closed_local_port();
+        // SAFETY: test-only env mutation scoped to this test.
+        unsafe {
+            std::env::set_var("_TEST_FAILING_OAUTH_ID", "client");
+            std::env::set_var("_TEST_FAILING_OAUTH_SECRET", "secret");
+        }
+        let api = api_with_auth(Some(AuthConfig::Oauth2 {
+            token_url: format!("http://127.0.0.1:{port}/token?tenant=signed-value"),
+            scopes: vec![],
+            audience: None,
+            client_id_from_env: Some("_TEST_FAILING_OAUTH_ID".to_string()),
+            client_secret_from_env: Some("_TEST_FAILING_OAUTH_SECRET".to_string()),
+            headers: HashMap::new(),
+        }));
+
+        let uri: Uri = "/v1/protected".parse().unwrap();
+        let result =
+            forward_request(&api, Method::GET, &uri, &HeaderMap::new(), Bytes::new()).await;
+        unsafe {
+            std::env::remove_var("_TEST_FAILING_OAUTH_ID");
+            std::env::remove_var("_TEST_FAILING_OAUTH_SECRET");
+        }
+
+        let response = result.unwrap_err();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let message = error_message(response).await;
+        assert_eq!(message, "OAuth2 token request failed");
+        assert!(!message.contains("signed-value"));
+    }
+
+    #[tokio::test]
+    async fn nested_token_request_errors_redact_query_values_for_logging() {
+        let port = closed_local_port();
+        let error = upstream_http_client()
+            .get(format!(
+                "http://127.0.0.1:{port}/token?api_key=nested-secret"
+            ))
+            .send()
+            .await
+            .unwrap_err();
+        let safe = upstream_error_for_logging(&error);
+        assert!(!safe.contains("nested-secret"));
+        assert!(safe.contains("api_key=%5BREDACTED%5D"));
     }
 }
