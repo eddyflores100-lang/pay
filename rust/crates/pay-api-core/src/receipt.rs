@@ -589,6 +589,17 @@ pub fn build_receipt_skeleton(
         // settle/distribute in particular — still surface instead of an empty receipt.
         transfers = extract_transfers_from_balances(rpc_value, stablecoins);
         balance_fallback_count = transfers.len();
+    } else {
+        // Parsed instructions name token accounts; report their owners like
+        // the balance-delta path does.
+        let owners = collect_ata_owners(rpc_value);
+        for transfer in &mut transfers {
+            for party in [&mut transfer.sender, &mut transfer.receiver] {
+                if let Some(owner) = owners.get(party.as_str()) {
+                    *party = owner.clone();
+                }
+            }
+        }
     }
     transfers.extend(extract_sol_transfers(
         &top_instructions,
@@ -2495,7 +2506,7 @@ mod tests {
         assert_eq!(session.events[0].kind, "distribute");
         assert_eq!(session.events[1].kind, "refund");
         assert_eq!(session.distributed.len(), 1);
-        assert_eq!(session.distributed[0].recipient, "BeneficiaryATA");
+        assert_eq!(session.distributed[0].recipient, "BeneficiaryWallet");
     }
 
     #[test]
@@ -2527,6 +2538,90 @@ mod tests {
         assert!(session.consumed.is_none());
         assert!(session.distributed.is_empty());
         assert!(session.events.iter().all(|event| event.kind != "refund"));
+    }
+
+    fn owner_balance(account_index: u64, owner: &str, amount: &str) -> Value {
+        json!({
+            "accountIndex": account_index,
+            "owner": owner,
+            "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "uiTokenAmount": {"amount": amount, "decimals": 6}
+        })
+    }
+
+    #[test]
+    fn parsed_transfers_report_token_account_owners() {
+        let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        let charge = parse(json!({
+            "meta": {
+                "err": null, "fee": 5000, "innerInstructions": [],
+                "preTokenBalances": [owner_balance(2, "MerchantA", "0"), owner_balance(3, "MerchantB", "0")],
+                "postTokenBalances": [owner_balance(2, "MerchantA", "700000"), owner_balance(3, "MerchantB", "300000")]
+            },
+            "transaction": {"message": {
+                "accountKeys": ["FeePayer", "SourceATA", "MerchantA_ATA", "MerchantB_ATA"],
+                "instructions": [
+                    token_transfer("PayerWallet", "MerchantA_ATA", mint, "700000", 6),
+                    token_transfer("PayerWallet", "MerchantB_ATA", mint, "300000", 6)
+                ]
+            }}
+        }));
+        assert!(matches!(charge.intent.kind, ReceiptIntentKind::MppCharge));
+        assert_eq!(charge.transfers[0].receiver, "MerchantA");
+        assert_eq!(charge.transfers[1].receiver, "MerchantB");
+        assert_eq!(
+            charge
+                .splits
+                .iter()
+                .map(|split| split.recipient.as_str())
+                .collect::<Vec<_>>(),
+            vec!["MerchantA", "MerchantB"]
+        );
+
+        let x402 = parse(json!({
+            "meta": {"err": null, "fee": 5000, "innerInstructions": [],
+                "postTokenBalances": [owner_balance(2, "MerchantWallet", "1000000")]},
+            "transaction": {"message": {
+                "accountKeys": ["FeePayer", "SourceATA", "Merchant_ATA"],
+                "instructions": [
+                    token_transfer("PayerWallet", "Merchant_ATA", mint, "1000000", 6),
+                    {"programId": MEMO_PROGRAM, "program": "spl-memo", "parsed": "nonce"}
+                ]
+            }}
+        }));
+        assert!(matches!(x402.intent.kind, ReceiptIntentKind::X402Exact));
+        assert_eq!(x402.transfers[0].receiver, "MerchantWallet");
+
+        let subscription = parse(json!({
+            "meta": {"err": null, "fee": 5000, "innerInstructions": [],
+                "postTokenBalances": [owner_balance(2, "MerchantWallet", "5000000")]},
+            "transaction": {"message": {
+                "accountKeys": ["FeePayer", "SourceATA", "Merchant_ATA"],
+                "instructions": [
+                    {"programId": SUBSCRIPTIONS_PROGRAM, "accounts": ["Subscriber", "Plan"],
+                     "data": bs58::encode([11u8]).into_string()},
+                    token_transfer("PayerWallet", "Merchant_ATA", mint, "5000000", 6)
+                ]
+            }}
+        }));
+        assert_eq!(
+            subscription.subscription.unwrap().recipient.as_deref(),
+            Some("MerchantWallet")
+        );
+    }
+
+    #[test]
+    fn parsed_transfer_keeps_token_account_without_owner_metadata() {
+        let receipt = parse(json!({
+            "meta": {"err": null, "fee": 5000, "innerInstructions": [],
+                "postTokenBalances": [{"accountIndex": 2, "mint": "M"}]},
+            "transaction": {"message": {
+                "accountKeys": ["FeePayer", "SourceATA", "Merchant_ATA"],
+                "instructions": [token_transfer("PayerWallet", "Merchant_ATA", "M", "1", 6)]
+            }}
+        }));
+        assert_eq!(receipt.transfers[0].receiver, "Merchant_ATA");
+        assert_eq!(receipt.transfers[0].sender, "PayerWallet");
     }
 
     // ── Plain transfer / SOL / Token-2022 ─────────────────────────────────
@@ -3150,7 +3245,7 @@ mod tests {
         assert_eq!(s.consumed.as_ref().unwrap().raw_amount, "100");
         // refund leg is excluded from distributed[]
         assert_eq!(s.distributed.len(), 1);
-        assert_eq!(s.distributed[0].recipient, "OperatorATA");
+        assert_eq!(s.distributed[0].recipient, "OperatorWallet");
     }
 
     #[test]
