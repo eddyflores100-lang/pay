@@ -113,6 +113,9 @@ struct TokenRecord {
     subject: String,
     scope: String,
     session: Option<String>,
+    /// The authorization grant this pair descends from; revoking any token
+    /// of the family revokes all of it.
+    family: String,
     expires_at: Instant,
 }
 
@@ -127,6 +130,9 @@ pub struct Store {
     pending: Mutex<HashMap<String, PendingAuthorization>>,
     codes: Mutex<HashMap<String, CodeGrant>>,
     tokens: Mutex<HashMap<String, TokenRecord>>,
+    /// Rotated-out refresh tokens, by hash: their family and expiry, so a
+    /// replay revokes the family.
+    retired: Mutex<HashMap<String, (String, Instant)>>,
 }
 
 /// Why a token request failed, in RFC 6749 vocabulary.
@@ -210,6 +216,7 @@ impl Store {
             pending: Mutex::default(),
             codes: Mutex::default(),
             tokens: Mutex::default(),
+            retired: Mutex::default(),
         }
     }
 
@@ -460,6 +467,7 @@ impl Store {
             &grant.subject,
             &grant.scope,
             grant.session.as_deref(),
+            &random_token(),
         ) {
             Ok(tokens) => Ok(tokens),
             Err(err) => {
@@ -480,9 +488,17 @@ impl Store {
     ) -> Result<TokenResponse, TokenError> {
         let mut tokens = self.tokens.lock().unwrap();
         let refresh_hash = sha256_hex(refresh_token);
-        let record = tokens
-            .remove(&refresh_hash)
-            .ok_or_else(|| TokenError::invalid_grant("unknown or already used refresh token"))?;
+        let Some(record) = tokens.remove(&refresh_hash) else {
+            // A rotated-out token coming back means it leaked: end its family.
+            let retired = self.retired.lock().unwrap().remove(&refresh_hash);
+            if let Some((family, _)) = retired {
+                tokens.retain(|_, token| token.family != family);
+                tracing::warn!("refresh token reused; its grant family is revoked");
+            }
+            return Err(TokenError::invalid_grant(
+                "unknown or already used refresh token",
+            ));
+        };
         if record.kind != TokenKind::Refresh {
             return Err(TokenError::invalid_grant("not a refresh token"));
         }
@@ -501,8 +517,19 @@ impl Store {
             &record.subject,
             &record.scope,
             record.session.as_deref(),
+            &record.family,
         ) {
-            Ok(tokens) => Ok(tokens),
+            Ok(issued) => {
+                let now = self.now();
+                let mut retired = self.retired.lock().unwrap();
+                insert_bounded(
+                    &mut retired,
+                    refresh_hash,
+                    (record.family.clone(), record.expires_at),
+                    |(_, expires_at)| now > *expires_at,
+                );
+                Ok(issued)
+            }
             Err(err) => {
                 tokens.insert(refresh_hash, record);
                 Err(err)
@@ -516,6 +543,7 @@ impl Store {
         subject: &str,
         scope: &str,
         session: Option<&str>,
+        family: &str,
     ) -> Result<TokenResponse, TokenError> {
         Self::issue_into(
             &mut self.tokens.lock().unwrap(),
@@ -524,6 +552,7 @@ impl Store {
             subject,
             scope,
             session,
+            family,
         )
     }
 
@@ -534,6 +563,7 @@ impl Store {
         subject: &str,
         scope: &str,
         session: Option<&str>,
+        family: &str,
     ) -> Result<TokenResponse, TokenError> {
         tokens.retain(|_, token| now <= token.expires_at);
         if tokens.len() > MAX_ROWS.saturating_sub(2) {
@@ -555,6 +585,7 @@ impl Store {
                     subject: subject.to_string(),
                     scope: scope.to_string(),
                     session: session.map(str::to_string),
+                    family: family.to_string(),
                     expires_at: now + ttl,
                 },
             );
@@ -593,9 +624,13 @@ impl Store {
             .retain(|_, token| !ours(&token.session));
     }
 
-    /// Forget a token of either kind. Unknown tokens are fine (RFC 7009).
+    /// Revoke a token of either kind and every token of its grant family
+    /// (RFC 7009 §2.1). Unknown tokens are fine.
     pub fn revoke(&self, token: &str) {
-        self.tokens.lock().unwrap().remove(&sha256_hex(token));
+        let mut tokens = self.tokens.lock().unwrap();
+        if let Some(record) = tokens.remove(&sha256_hex(token)) {
+            tokens.retain(|_, other| other.family != record.family);
+        }
     }
 
     /// The tenant an access token stands for, if it is live.
@@ -1647,6 +1682,79 @@ mod tests {
         }
     }
 
+    fn issued_pair(store: &Store, client: &Client) -> TokenResponse {
+        let request = pending_for(client);
+        let id = request.id.clone();
+        store.create_pending(request).unwrap();
+        let (_, code) = store.approve(&id, "sub_1").unwrap();
+        store
+            .exchange_code(&client.client_id, &code, VERIFIER, None)
+            .unwrap()
+    }
+
+    #[test]
+    fn revoking_either_token_revokes_the_whole_grant_family() {
+        let store = Store::new("https://cloud.test/");
+        let (client, _) = store.register(grok_registration()).unwrap();
+
+        // Revoking the access token kills its refresh token.
+        let pair = issued_pair(&store, &client);
+        let other = issued_pair(&store, &client);
+        store.revoke(&pair.access_token);
+        assert!(store.authenticate(&pair.access_token).is_none());
+        assert!(
+            store
+                .refresh(&client.client_id, &pair.refresh_token)
+                .is_err()
+        );
+        assert!(
+            store.authenticate(&other.access_token).is_some(),
+            "other grants live"
+        );
+
+        // Revoking the refresh token kills its access token.
+        let pair = issued_pair(&store, &client);
+        store.revoke(&pair.refresh_token);
+        assert!(store.authenticate(&pair.access_token).is_none());
+
+        // The family survives rotation: revoking a descendant ends the
+        // original access token too.
+        let pair = issued_pair(&store, &client);
+        let rotated = store
+            .refresh(&client.client_id, &pair.refresh_token)
+            .unwrap();
+        store.revoke(&rotated.access_token);
+        assert!(store.authenticate(&pair.access_token).is_none());
+        assert!(
+            store
+                .refresh(&client.client_id, &rotated.refresh_token)
+                .is_err()
+        );
+        assert!(store.authenticate(&other.access_token).is_some());
+    }
+
+    #[test]
+    fn a_replayed_refresh_token_revokes_its_family() {
+        let store = Store::new("https://cloud.test/");
+        let (client, _) = store.register(grok_registration()).unwrap();
+        let pair = issued_pair(&store, &client);
+        let rotated = store
+            .refresh(&client.client_id, &pair.refresh_token)
+            .unwrap();
+        assert!(store.authenticate(&rotated.access_token).is_some());
+        assert!(
+            store
+                .refresh(&client.client_id, &pair.refresh_token)
+                .is_err()
+        );
+        assert!(store.authenticate(&rotated.access_token).is_none());
+        assert!(
+            store
+                .refresh(&client.client_id, &rotated.refresh_token)
+                .is_err()
+        );
+    }
+
     #[test]
     fn revoking_a_session_ends_its_codes_and_tokens_only() {
         let store = Store::new("https://cloud.test/");
@@ -1803,6 +1911,7 @@ mod tests {
                     client_id: client.client_id.clone(),
                     subject: "sub_other".to_string(),
                     scope: SCOPE.to_string(),
+                    family: format!("family_{i}"),
                     expires_at,
                 },
             );
