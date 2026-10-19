@@ -74,6 +74,12 @@ pub struct TenantRecord {
 }
 
 impl TenantRecord {
+    /// The spend-ledger key: the provider wallet, not the subject, so every
+    /// connection linked to one wallet shares one allowance.
+    pub fn ledger_key(&self) -> String {
+        format!("wallet:{}:{}", self.provider, self.wallet_id)
+    }
+
     /// The `accounts.yml` entry this tenant would have on a laptop: a remote
     /// account gated by policy (`auth_required` on, so the override applies).
     fn account(&self) -> Account {
@@ -169,7 +175,8 @@ impl TenantRegistry {
         let whole = amount_minor / USD_MINOR_UNITS_PER_DOLLAR;
         let fraction = amount_minor % USD_MINOR_UNITS_PER_DOLLAR;
         let amount = format!("${whole}.{fraction:04}");
-        PolicyGate::new(&tenant.subject, tenant.policy, self.ledger.clone())
+        let key = tenant.ledger_key();
+        PolicyGate::new(&key, tenant.policy, self.ledger.clone())
             .authenticate(&AuthIntent::authorize_payment_details(
                 &amount,
                 "hosted CLI transaction",
@@ -177,7 +184,7 @@ impl TenantRegistry {
             ))
             .map_err(|error| error.to_string())?;
         Ok(SpendReservation {
-            subject: tenant.subject.clone(),
+            subject: key,
             amount: amount_minor,
             ledger: self.ledger.clone(),
             committed: false,
@@ -533,6 +540,16 @@ impl CloudContext {
     }
 }
 
+impl CloudContext {
+    fn approval(&self, record: &TenantRecord) -> PolicyApproval {
+        PolicyApproval {
+            subject: record.ledger_key(),
+            policy: record.policy,
+            ledger: self.registry.ledger.clone(),
+        }
+    }
+}
+
 /// The tenant the bearer middleware attached to this request.
 fn tenant_of(call: &RequestContext<RoleServer>) -> Option<Tenant> {
     call.extensions
@@ -558,11 +575,7 @@ impl PayContext for CloudContext {
             network_override: Some(MAINNET_NETWORK.to_string()),
             account_override: Some(record.account_name.clone()),
             rpc_url_override: None,
-            approval: Arc::new(PolicyApproval {
-                subject: record.subject.clone(),
-                policy: record.policy,
-                ledger: self.registry.ledger.clone(),
-            }),
+            approval: Arc::new(self.approval(&record)),
             payment_permissions: None,
             // The server has no access to the caller's files.
             body_files: false,
@@ -760,15 +773,62 @@ mod tests {
 
         {
             let _failed = registry.reserve_cli_transaction(&tenant, 10_000).unwrap();
-            assert_eq!(ledger.spent_today("sub_1"), 10_000);
+            assert_eq!(ledger.spent_today(&tenant.ledger_key()), 10_000);
         }
-        assert_eq!(ledger.spent_today("sub_1"), 0);
+        assert_eq!(ledger.spent_today(&tenant.ledger_key()), 0);
 
         registry
             .reserve_cli_transaction(&tenant, 10_000)
             .unwrap()
             .commit();
-        assert_eq!(ledger.spent_today("sub_1"), 10_000);
+        assert_eq!(ledger.spent_today(&tenant.ledger_key()), 10_000);
+    }
+
+    #[test]
+    fn linked_subjects_share_one_wallet_allowance() {
+        let registry = TenantRegistry::new();
+        let stable = record("sub_owner");
+        // What `link_complete` binds: the stable record under a guest subject.
+        let mut guest_one = stable.clone();
+        guest_one.subject = "guest_one".to_string();
+        let mut guest_two = stable.clone();
+        guest_two.subject = "guest_two".to_string();
+
+        // $1 per call, $5 per day, across every alias of the wallet.
+        for tenant in [&stable, &guest_one, &guest_two, &guest_one, &stable] {
+            registry
+                .reserve_cli_transaction(tenant, 10_000)
+                .unwrap()
+                .commit();
+        }
+        for tenant in [&stable, &guest_one, &guest_two] {
+            assert!(registry.reserve_cli_transaction(tenant, 1).is_err());
+        }
+
+        // A different wallet has its own allowance.
+        let mut other = record("guest_three");
+        other.wallet_id = "acc_2".to_string();
+        registry
+            .reserve_cli_transaction(&other, 10_000)
+            .unwrap()
+            .commit();
+    }
+
+    #[test]
+    fn hosted_mcp_approval_shares_the_cli_wallet_allowance() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let registry = Arc::new(TenantRegistry::with_ledger(ledger.clone()));
+        let context = CloudContext::new(registry.clone());
+        let stable = record("sub_owner");
+        let mut guest = stable.clone();
+        guest.subject = "guest_one".to_string();
+        let approval = context.approval(&guest);
+        assert_eq!(approval.subject, stable.ledger_key());
+        registry
+            .reserve_cli_transaction(&stable, 10_000)
+            .unwrap()
+            .commit();
+        assert_eq!(ledger.spent_today(&approval.subject), 10_000);
     }
 
     // ── Through /mcp ───────────────────────────────────────────────────
