@@ -85,7 +85,8 @@ pub async fn build_receipt(
     // the same getTransaction response.
     if matches!(receipt.intent.kind, ReceiptIntentKind::MppSession) {
         let ata_owners = collect_ata_owners(rpc_value);
-        reconcile_session_via_balances(&mut receipt, &ata_owners);
+        let payer = payment_channel_payer(rpc_value);
+        reconcile_session_via_balances(&mut receipt, &ata_owners, payer.as_ref());
 
         // Best-effort: if the channel is still open, decode its state to
         // attach the on-chain `payer`, `payee`, and `status`.
@@ -154,34 +155,77 @@ fn collect_ata_owners(rpc_value: &Value) -> BTreeMap<String, String> {
     map
 }
 
-/// Reclassify session events using `ata_owners` so we can tell apart:
+/// The channel payer as named by a payment-channels instruction's account
+/// roles, with the payer token account when the instruction moves funds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChannelPayer {
+    wallet: String,
+    token_account: Option<String>,
+}
+
+/// Resolve the payer from the first top-level payment-channels instruction
+/// that names it.
+fn payment_channel_payer(rpc_value: &Value) -> Option<ChannelPayer> {
+    use pay_kit::generated::payment_channels::instructions::{
+        DISTRIBUTE_DISCRIMINATOR, OPEN_DISCRIMINATOR, REQUEST_CLOSE_DISCRIMINATOR,
+        TOP_UP_DISCRIMINATOR, WITHDRAW_PAYER_DISCRIMINATOR,
+    };
+    let top = rpc_value
+        .pointer("/transaction/message/instructions")
+        .and_then(Value::as_array)?;
+    for ix in top {
+        if ix.get("programId").and_then(Value::as_str) != Some(PAYMENT_CHANNELS_PROGRAM) {
+            continue;
+        }
+        let Some(discriminator) = ix
+            .get("data")
+            .and_then(Value::as_str)
+            .and_then(first_data_byte)
+        else {
+            continue;
+        };
+        let (wallet_index, token_account_index) = match discriminator {
+            OPEN_DISCRIMINATOR => (0, Some(6)),
+            TOP_UP_DISCRIMINATOR => (0, Some(2)),
+            REQUEST_CLOSE_DISCRIMINATOR => (0, None),
+            DISTRIBUTE_DISCRIMINATOR => (1, Some(4)),
+            WITHDRAW_PAYER_DISCRIMINATOR => (0, Some(3)),
+            _ => continue,
+        };
+        let accounts = ix.get("accounts").and_then(Value::as_array)?;
+        let account = |index: usize| {
+            accounts
+                .get(index)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        return Some(ChannelPayer {
+            wallet: account(wallet_index)?,
+            token_account: token_account_index.and_then(account),
+        });
+    }
+    None
+}
+
+/// Reclassify session events using `ata_owners` and the instruction-bound
+/// `payer` so we can tell apart:
 ///
+/// - original payer refund (legs to the payer's token account or wallet)
 /// - operator's payee (fee_payer's wallet receives)
-/// - original payer refund (any non-operator wallet receiving from the channel)
 /// - platform splits / treasury (other recipients)
-fn reconcile_session_via_balances(receipt: &mut Receipt, ata_owners: &BTreeMap<String, String>) {
+///
+/// Without a payer role the refund cannot be told apart from payouts, so the
+/// payer and totals are left unresolved rather than guessed.
+fn reconcile_session_via_balances(
+    receipt: &mut Receipt,
+    ata_owners: &BTreeMap<String, String>,
+    payer: Option<&ChannelPayer>,
+) {
     let Some(session) = receipt.session.as_mut() else {
         return;
     };
     let operator = receipt.fee_payer.clone();
-
-    // First pass: classify based on operator/non-operator and accumulate
-    // totals per wallet to identify the largest non-operator refund.
-    let mut wallet_total: BTreeMap<String, u128> = BTreeMap::new();
-    for ev in &session.events {
-        let raw: u128 = ev.raw_amount.parse().unwrap_or(0);
-        let owner = ata_owners
-            .get(&ev.receiver)
-            .cloned()
-            .unwrap_or_else(|| ev.receiver.clone());
-        *wallet_total.entry(owner).or_default() += raw;
-    }
-
-    let payer_wallet = wallet_total
-        .iter()
-        .filter(|(w, _)| *w != &operator)
-        .max_by_key(|(_, raw)| **raw)
-        .map(|(w, _)| w.clone());
+    let payer_wallet = payer.map(|payer| payer.wallet.clone());
 
     let mut consumed_total: u128 = 0;
     let mut refunded_total: u128 = 0;
@@ -208,7 +252,9 @@ fn reconcile_session_via_balances(receipt: &mut Receipt, ata_owners: &BTreeMap<S
             .get(&ev.receiver)
             .cloned()
             .unwrap_or_else(|| ev.receiver.clone());
-        let is_refund = matches!(&payer_wallet, Some(p) if p == &owner);
+        let is_refund = payer.is_some_and(|payer| {
+            payer.wallet == owner || payer.token_account.as_deref() == Some(ev.receiver.as_str())
+        });
         let is_consume = owner == operator;
         if is_refund {
             ev.kind = "refund".to_string();
@@ -234,6 +280,11 @@ fn reconcile_session_via_balances(receipt: &mut Receipt, ata_owners: &BTreeMap<S
         }
     }
 
+    let unresolved = payer.is_none() && session.events.iter().any(|ev| ev.kind == "distribute");
+    if unresolved {
+        consumed_total = 0;
+        refunded_total = 0;
+    }
     session.payer = payer_wallet.clone();
     // For settle / seal / distribute, the wallet receiving the operator's
     // leg is the fee_payer — they signed the transaction. For open / topUp
@@ -266,10 +317,12 @@ fn reconcile_session_via_balances(receipt: &mut Receipt, ata_owners: &BTreeMap<S
     // Re-derive distributed[] from the consume + distribute events so the
     // refund leg is excluded from the operator-side breakdown.
     let mut by_recipient: BTreeMap<String, u128> = BTreeMap::new();
-    for ev in &session.events {
-        if ev.kind == "consume" || ev.kind == "distribute" {
-            let raw: u128 = ev.raw_amount.parse().unwrap_or(0);
-            *by_recipient.entry(ev.receiver.clone()).or_default() += raw;
+    if !unresolved {
+        for ev in &session.events {
+            if ev.kind == "consume" || ev.kind == "distribute" {
+                let raw: u128 = ev.raw_amount.parse().unwrap_or(0);
+                *by_recipient.entry(ev.receiver.clone()).or_default() += raw;
+            }
         }
     }
     let grand = consumed_total.max(1);
@@ -2377,6 +2430,105 @@ mod tests {
         })
     }
 
+    fn reconcile(receipt: &mut Receipt, rpc: &Value) {
+        reconcile_session_via_balances(
+            receipt,
+            &collect_ata_owners(rpc),
+            payment_channel_payer(rpc).as_ref(),
+        );
+    }
+
+    /// A payment-channels `distribute` naming `payer` and its token account.
+    fn distribute_ix(channel: &str, payer: &str, payer_token_account: &str) -> Value {
+        json!({
+            "programId": PAYMENT_CHANNELS_PROGRAM,
+            "accounts": [
+                channel, payer, "RentPayer", "ChannelATA", payer_token_account,
+                "PayeeATA", "TreasuryATA", "Mint", SPL_TOKEN_PROGRAM
+            ],
+            "data": bs58::encode([7u8]).into_string()
+        })
+    }
+
+    fn high_usage_distribute(instructions: Vec<Value>) -> Value {
+        let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        json!({
+            "slot": 100,
+            "blockTime": 1_700_000_000_i64,
+            "meta": {
+                "err": null,
+                "fee": 5000_u64,
+                "innerInstructions": [{
+                    "index": 0,
+                    "instructions": [
+                        token_transfer("ChannelPDA", "BeneficiaryATA", mint, "9000", 6),
+                        token_transfer("ChannelPDA", "PayerATA", mint, "1000", 6)
+                    ]
+                }],
+                "postTokenBalances": [
+                    {"accountIndex": 2, "owner": "BeneficiaryWallet", "mint": mint},
+                    {"accountIndex": 3, "owner": "PayerWallet", "mint": mint}
+                ]
+            },
+            "transaction": {"message": {
+                "accountKeys": [
+                    {"pubkey": "OperatorWallet", "signer": true},
+                    {"pubkey": "ChannelPDA"},
+                    {"pubkey": "BeneficiaryATA"},
+                    {"pubkey": "PayerATA"}
+                ],
+                "instructions": instructions
+            }}
+        })
+    }
+
+    #[test]
+    fn largest_beneficiary_payout_is_not_reported_as_the_payer_refund() {
+        let rpc =
+            high_usage_distribute(vec![distribute_ix("ChannelPDA", "PayerWallet", "PayerATA")]);
+        let mut receipt = parse(rpc.clone());
+        reconcile(&mut receipt, &rpc);
+        let session = receipt.session.unwrap();
+        assert_eq!(session.payer.as_deref(), Some("PayerWallet"));
+        assert_eq!(session.refunded.unwrap().raw_amount, "1000");
+        assert_eq!(session.consumed.unwrap().raw_amount, "9000");
+        assert_eq!(session.events[0].kind, "distribute");
+        assert_eq!(session.events[1].kind, "refund");
+        assert_eq!(session.distributed.len(), 1);
+        assert_eq!(session.distributed[0].recipient, "BeneficiaryATA");
+    }
+
+    #[test]
+    fn refund_matches_the_payer_token_account_without_owner_metadata() {
+        let mut rpc =
+            high_usage_distribute(vec![distribute_ix("ChannelPDA", "PayerWallet", "PayerATA")]);
+        rpc["meta"]["postTokenBalances"] = json!([]);
+        let mut receipt = parse(rpc.clone());
+        reconcile(&mut receipt, &rpc);
+        let session = receipt.session.unwrap();
+        assert_eq!(session.payer.as_deref(), Some("PayerWallet"));
+        assert_eq!(session.refunded.unwrap().raw_amount, "1000");
+        assert_eq!(session.consumed.unwrap().raw_amount, "9000");
+    }
+
+    #[test]
+    fn payout_without_a_payer_role_leaves_payer_and_totals_unresolved() {
+        // settleAndSeal alone names no payer account.
+        let rpc = high_usage_distribute(vec![json!({
+            "programId": PAYMENT_CHANNELS_PROGRAM,
+            "accounts": ["OperatorWallet", "ChannelPDA"],
+            "data": bs58::encode([4u8]).into_string()
+        })]);
+        let mut receipt = parse(rpc.clone());
+        reconcile(&mut receipt, &rpc);
+        let session = receipt.session.unwrap();
+        assert_eq!(session.payer, None);
+        assert!(session.refunded.is_none());
+        assert!(session.consumed.is_none());
+        assert!(session.distributed.is_empty());
+        assert!(session.events.iter().all(|event| event.kind != "refund"));
+    }
+
     // ── Plain transfer / SOL / Token-2022 ─────────────────────────────────
 
     #[test]
@@ -2981,7 +3133,7 @@ mod tests {
                         "programId": PAYMENT_CHANNELS_PROGRAM,
                         "accounts": ["OperatorWallet", "ChannelPDA"],
                         "data": bs58::encode([4u8]).into_string()
-                    }]
+                    }, distribute_ix("ChannelPDA", "PayerWallet", "PayerATA")]
                 }
             }
         });
@@ -2989,8 +3141,7 @@ mod tests {
         // Build the skeleton, then manually invoke the reconciler with the
         // ata→owner map (the async path does this internally).
         let mut receipt = build_receipt_skeleton("sig", Network::Sandbox, &rpc, &[]).unwrap();
-        let owners = collect_ata_owners(&rpc);
-        reconcile_session_via_balances(&mut receipt, &owners);
+        reconcile(&mut receipt, &rpc);
 
         let s = receipt.session.expect("session present");
         assert_eq!(s.payer.as_deref(), Some("PayerWallet"));
@@ -3039,7 +3190,7 @@ mod tests {
                         "programId": PAYMENT_CHANNELS_PROGRAM,
                         "accounts": ["OperatorWallet", "ChannelPDA"],
                         "data": bs58::encode([4u8]).into_string()
-                    }]
+                    }, distribute_ix("ChannelPDA", "PayerWallet", "PayerATA")]
                 }
             }
         });
@@ -3052,8 +3203,7 @@ mod tests {
             "expected wallet-keyed receiver from balance extraction"
         );
 
-        let owners = collect_ata_owners(&rpc);
-        reconcile_session_via_balances(&mut receipt, &owners);
+        reconcile(&mut receipt, &rpc);
 
         let s = receipt.session.expect("session present");
         assert_eq!(s.payer.as_deref(), Some("PayerWallet"));
@@ -3095,11 +3245,11 @@ mod tests {
                     "programId": PAYMENT_CHANNELS_PROGRAM,
                     "accounts": ["OperatorWallet"],
                     "data": bs58::encode([4u8]).into_string()
-                }]
+                }, distribute_ix("PDA", "PayerWallet", "PayerATA")]
             }}
         });
         let mut r = build_receipt_skeleton("sig", Network::Sandbox, &rpc, &[]).unwrap();
-        reconcile_session_via_balances(&mut r, &collect_ata_owners(&rpc));
+        reconcile(&mut r, &rpc);
         let s = r.session.unwrap();
         let kinds: Vec<&str> = s.events.iter().map(|e| e.kind.as_str()).collect();
         assert!(kinds.contains(&"refund"));
@@ -3133,7 +3283,7 @@ mod tests {
                     "programId": PAYMENT_CHANNELS_PROGRAM,
                     "accounts": ["Op"],
                     "data": bs58::encode([4u8]).into_string()
-                }]
+                }, distribute_ix("PDA", "PayerWallet", "PayerATA")]
             }}
         });
         let mut r = build_receipt_skeleton("sig", Network::Sandbox, &rpc, &[]).unwrap();
@@ -3142,12 +3292,13 @@ mod tests {
             owners.is_empty(),
             "no postTokenBalances should give empty map"
         );
-        reconcile_session_via_balances(&mut r, &owners);
+        reconcile(&mut r, &rpc);
         let s = r.session.expect("session still present");
         assert_eq!(s.payee.as_deref(), Some("Op"));
-        // Without owner data the only "non-operator wallet" the reconciler can
-        // see is the destination ATA itself, so it surfaces as the payer.
-        assert!(s.payer.is_some());
+        // The payer comes from the distribute instruction, not the legs.
+        assert_eq!(s.payer.as_deref(), Some("PayerWallet"));
+        assert!(s.refunded.is_none());
+        assert_eq!(s.consumed.unwrap().raw_amount, "100");
     }
 
     // ── Account creation detection (ATAs) ─────────────────────────────────
@@ -3410,7 +3561,7 @@ mod tests {
             }}
         });
         let mut r = build_receipt_skeleton("sig", Network::Sandbox, &rpc, &[]).unwrap();
-        reconcile_session_via_balances(&mut r, &collect_ata_owners(&rpc));
+        reconcile(&mut r, &rpc);
         let s = r.session.unwrap();
         assert_eq!(s.channel_status, Some(WireChannelStatus::Sealed));
     }
