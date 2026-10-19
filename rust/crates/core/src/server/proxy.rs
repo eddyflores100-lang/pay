@@ -88,6 +88,17 @@ pub fn upstream_error_for_logging(error: &reqwest::Error) -> String {
     safe
 }
 
+/// HTTP client for every credential-bearing upstream and token request.
+///
+/// Redirects are never followed: a 3xx is returned to the caller as-is so
+/// operator credentials and request bodies cannot reach another origin.
+pub fn upstream_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("reqwest client with default TLS config must build")
+}
+
 /// Remove query values from an arbitrary error string that may embed `url`.
 pub fn redact_url_in_error(error: &str, url: &reqwest::Url) -> String {
     error.replace(url.as_str(), &upstream_url_for_logging(url))
@@ -221,7 +232,7 @@ pub async fn forward_request_with_session_metering_and_identity(
         UpstreamPlan::Forward(prepared) => prepared,
     };
 
-    let client = reqwest::Client::new();
+    let client = upstream_http_client();
     let mut upstream_req = client.request(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap(),
         prepared.url.clone(),
@@ -1158,7 +1169,7 @@ async fn fetch_access_token(fetch: &AccessTokenFetchConfig) -> Result<FetchedTok
         apply_prepared_request_auth(&mut prepared, &method, &[], auth)?;
     }
 
-    let client = reqwest::Client::new();
+    let client = upstream_http_client();
     let mut request = client.request(
         reqwest_method_from_spec(&fetch.method),
         prepared.url.clone(),
@@ -1354,7 +1365,7 @@ async fn fetch_oauth2_token(
     client_id_env: Option<&str>,
     client_secret_env: Option<&str>,
 ) -> Result<FetchedToken, String> {
-    let client = reqwest::Client::new();
+    let client = upstream_http_client();
 
     // Special: GCP metadata server.
     if token_url == "gcp_metadata" {
@@ -3287,5 +3298,126 @@ mod tests {
         assert_eq!(resp2.status(), StatusCode::OK);
         let body2 = axum::body::to_bytes(resp2.into_body(), 1024).await.unwrap();
         assert_eq!(&body2[..], b"from upstream");
+    }
+
+    /// Upstream that redirects every request to `target`, plus a collector that
+    /// records whether any request (and which credential) reached it.
+    async fn spawn_redirect_and_collector(
+        status: StatusCode,
+    ) -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+        let hits: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&hits);
+        let collector = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+            let capture = Arc::clone(&capture);
+            async move {
+                capture.lock().unwrap().push(
+                    headers
+                        .get("x-api-key")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string),
+                );
+                "collected"
+            }
+        });
+        let (collector_url, _collector) = spawn_upstream(collector).await;
+        let location = format!(
+            "{}/capture",
+            collector_url.replace("127.0.0.1", "localhost")
+        );
+        let redirect = axum::Router::new().fallback(move || {
+            let location = location.clone();
+            async move {
+                (
+                    status,
+                    [(axum::http::header::LOCATION, location)],
+                    "redirecting",
+                )
+            }
+        });
+        let (redirect_url, _redirect) = spawn_upstream(redirect).await;
+        (redirect_url, hits)
+    }
+
+    #[tokio::test]
+    async fn forward_request_does_not_follow_cross_origin_redirects() {
+        for status in [
+            StatusCode::MOVED_PERMANENTLY,
+            StatusCode::FOUND,
+            StatusCode::SEE_OTHER,
+            StatusCode::TEMPORARY_REDIRECT,
+            StatusCode::PERMANENT_REDIRECT,
+        ] {
+            let (redirect_url, hits) = spawn_redirect_and_collector(status).await;
+            // SAFETY: test-only env mutation scoped to this test.
+            unsafe { std::env::set_var("_TEST_PROXY_REDIRECT_KEY", "operator-secret") };
+            let api = ApiSpec {
+                routing: RoutingConfig::Proxy {
+                    url: redirect_url,
+                    path_rewrites: vec![],
+                    auth: Some(Box::new(AuthConfig::Header {
+                        key: "x-api-key".to_string(),
+                        prefix: None,
+                        value_from_env: "_TEST_PROXY_REDIRECT_KEY".to_string(),
+                    })),
+                },
+                ..make_api("test")
+            };
+
+            let uri: Uri = "/v1/redirect".parse().unwrap();
+            let resp = forward_request(
+                &api,
+                Method::POST,
+                &uri,
+                &HeaderMap::new(),
+                Bytes::from_static(b"paid-protected-body"),
+            )
+            .await
+            .unwrap();
+            unsafe { std::env::remove_var("_TEST_PROXY_REDIRECT_KEY") };
+
+            assert_eq!(resp.status(), status, "3xx must be relayed, not followed");
+            assert!(resp.headers().get("location").is_some());
+            assert!(
+                hits.lock().unwrap().is_empty(),
+                "{status}: redirect target must never receive the request"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth2_token_fetch_does_not_follow_redirects() {
+        let (redirect_url, hits) =
+            spawn_redirect_and_collector(StatusCode::TEMPORARY_REDIRECT).await;
+        // SAFETY: test-only env mutation scoped to this test.
+        unsafe {
+            std::env::set_var("_TEST_REDIRECT_OAUTH_ID", "client");
+            std::env::set_var("_TEST_REDIRECT_OAUTH_SECRET", "secret");
+        }
+        let api = ApiSpec {
+            routing: RoutingConfig::Proxy {
+                url: "http://127.0.0.1:9".to_string(),
+                path_rewrites: vec![],
+                auth: Some(Box::new(AuthConfig::Oauth2 {
+                    token_url: format!("{redirect_url}/token"),
+                    scopes: vec![],
+                    audience: None,
+                    client_id_from_env: Some("_TEST_REDIRECT_OAUTH_ID".to_string()),
+                    client_secret_from_env: Some("_TEST_REDIRECT_OAUTH_SECRET".to_string()),
+                    headers: HashMap::new(),
+                })),
+            },
+            ..make_api("test")
+        };
+
+        let uri: Uri = "/v1/protected".parse().unwrap();
+        let result =
+            forward_request(&api, Method::GET, &uri, &HeaderMap::new(), Bytes::new()).await;
+        unsafe {
+            std::env::remove_var("_TEST_REDIRECT_OAUTH_ID");
+            std::env::remove_var("_TEST_REDIRECT_OAUTH_SECRET");
+        }
+
+        assert_eq!(result.unwrap_err().status(), StatusCode::BAD_GATEWAY);
+        assert!(hits.lock().unwrap().is_empty());
     }
 }

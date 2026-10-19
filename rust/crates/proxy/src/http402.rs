@@ -35,7 +35,8 @@ use pay_core::server::metering::{self, UptoSettlementPlan};
 use pay_core::server::payment::{TrustedPaymentIdentity, strip_internal_identity_headers};
 use pay_core::server::proxy::{
     STRIP_HEADERS, UpstreamPlan, prepare_upstream_with_identity, redact_url_in_error,
-    routing_signs_request_body, upstream_error_for_logging, upstream_url_for_logging,
+    routing_signs_request_body, upstream_error_for_logging, upstream_http_client,
+    upstream_url_for_logging,
 };
 use pay_core::server::session_stream::DelegatedSessionStreamMeter;
 use pay_core::server::telemetry;
@@ -512,7 +513,7 @@ impl<S: PaymentState> Http402Gate<S> {
             // bounded size as their requests.
             .unwrap_or(BUFFERED_REQUEST_BODY_LIMIT);
 
-        let client = reqwest::Client::new();
+        let client = upstream_http_client();
         let mut upstream_req = client.request(
             reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap(),
             prepared.url.clone(),
