@@ -128,7 +128,7 @@ async fn redeem(
     };
 
     // 1. Dedup scan.
-    match find_prior_burn(&hot_wallet, &req.code, cfg).await {
+    match find_prior_burn(state, &rpc_url, &hot_wallet, &req.code, cfg).await {
         Ok(Some(sig)) => {
             return err_resp_with_extra(
                 StatusCode::CONFLICT,
@@ -480,12 +480,18 @@ enum DedupScanError {
     PageCap,
     #[error("redemption dedup is not configured")]
     NotConfigured,
+    #[error("prior redemption candidate could not be verified: {0}")]
+    Unverifiable(String),
 }
 
 /// Walk the hot wallet's transaction-history provider "transactions for address" history
 /// looking for any prior tx whose memo program ix decodes to
-/// `pay-redeem:<code>`. Returns the matching signature when found.
+/// `Redeem code <code>`. History matches are only candidates: each is fetched
+/// from the trusted RPC and must be a successful hot-wallet payout carrying
+/// the memo. Returns the verified signature when found.
 async fn find_prior_burn(
+    state: &AppState,
+    rpc_url: &str,
     hot_wallet: &Pubkey,
     code: &str,
     cfg: &RedemptionState,
@@ -535,6 +541,8 @@ async fn find_prior_burn(
                     && let Some(decoded_bytes) = bs58::decode(&ix.data).into_vec().ok()
                     && let Ok(decoded) = std::str::from_utf8(&decoded_bytes)
                     && decoded == needle
+                    && verify_prior_payout(state, rpc_url, hot_wallet, &tx.signature, &needle, cfg)
+                        .await?
                 {
                     return Ok(Some(tx.signature.clone()));
                 }
@@ -558,6 +566,83 @@ async fn find_prior_burn(
         }
     }
     Err(DedupScanError::PageCap)
+}
+
+/// Whether `signature` is a successful payout signed by the hot wallet that
+/// moves the configured mint out of its token account and carries `memo`.
+async fn verify_prior_payout(
+    state: &AppState,
+    rpc_url: &str,
+    hot_wallet: &Pubkey,
+    signature: &str,
+    memo: &str,
+    cfg: &RedemptionState,
+) -> Result<bool, DedupScanError> {
+    let tx = state
+        .rpc
+        .get_transaction_json_parsed(rpc_url, signature)
+        .await
+        .map_err(|error| DedupScanError::Unverifiable(error.to_string()))?
+        .ok_or_else(|| DedupScanError::Unverifiable(format!("{signature} not found")))?;
+    Ok(is_hot_wallet_payout(&tx, hot_wallet, memo, cfg))
+}
+
+fn is_hot_wallet_payout(
+    tx: &serde_json::Value,
+    hot_wallet: &Pubkey,
+    memo: &str,
+    cfg: &RedemptionState,
+) -> bool {
+    use serde_json::Value;
+
+    if tx.pointer("/meta/err").is_none_or(|err| !err.is_null()) {
+        return false;
+    }
+    let hot_ata = associated_token_address(hot_wallet, &cfg.mint, &cfg.token_program).to_string();
+    let hot_wallet = hot_wallet.to_string();
+    let message = tx.pointer("/transaction/message");
+    let signed = message
+        .and_then(|message| message.get("accountKeys"))
+        .and_then(Value::as_array)
+        .is_some_and(|keys| {
+            keys.iter().any(|key| {
+                key.get("pubkey").and_then(Value::as_str) == Some(hot_wallet.as_str())
+                    && key.get("signer").and_then(Value::as_bool) == Some(true)
+            })
+        });
+    if !signed {
+        return false;
+    }
+    let Some(instructions) = message
+        .and_then(|message| message.get("instructions"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    let mint = cfg.mint.to_string();
+    let token_program = cfg.token_program.to_string();
+    let has_memo = instructions.iter().any(|ix| {
+        ix.get("programId").and_then(Value::as_str) == Some(MEMO_PROGRAM)
+            && (ix.get("parsed").and_then(Value::as_str) == Some(memo)
+                || ix
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .and_then(|data| bs58::decode(data).into_vec().ok())
+                    .is_some_and(|bytes| bytes == memo.as_bytes()))
+    });
+    let has_transfer = instructions.iter().any(|ix| {
+        let info = ix.pointer("/parsed/info");
+        let field = |name: &str| info.and_then(|info| info.get(name)).and_then(Value::as_str);
+        ix.get("programId").and_then(Value::as_str) == Some(token_program.as_str())
+            && matches!(
+                ix.pointer("/parsed/type").and_then(Value::as_str),
+                Some("transfer" | "transferChecked")
+            )
+            && field("source") == Some(hot_ata.as_str())
+            && field("authority") == Some(hot_wallet.as_str())
+            && field("mint").is_none_or(|m| m == mint)
+    });
+    has_memo && has_transfer
 }
 
 fn redemption_claim_key(code: &str) -> String {
@@ -1159,6 +1244,7 @@ mod tests {
             pub(super) next_status: Option<Value>,
             pub(super) block_height: u64,
             pub(super) last_valid_block_height: u64,
+            pub(super) transactions: HashMap<String, Value>,
         }
 
         impl Default for MockRpc {
@@ -1170,6 +1256,7 @@ mod tests {
                     next_status: Some(confirmed()),
                     block_height: 50,
                     last_valid_block_height: 100,
+                    transactions: HashMap::new(),
                 }
             }
         }
@@ -1234,6 +1321,13 @@ mod tests {
                     })
                 }
                 "getBlockHeight" => json!(mock.block_height),
+                "getTransaction" => {
+                    let signature = body["params"][0].as_str().unwrap_or_default();
+                    mock.transactions
+                        .get(signature)
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                }
                 other => panic!("unexpected RPC method {other}"),
             };
             (
@@ -1251,6 +1345,7 @@ mod tests {
             pub(super) cfg: RedemptionState,
             pub(super) signer: Arc<dyn TransactionSigner>,
             pub(super) rpc: Shared,
+            pub(super) history: Arc<Mutex<Vec<Value>>>,
             _redis: RedisProcess,
         }
 
@@ -1323,6 +1418,7 @@ mod tests {
                     cfg,
                     signer,
                     rpc,
+                    history,
                     _redis: redis,
                 })
             }
@@ -1361,6 +1457,73 @@ mod tests {
                     .await
                     .unwrap();
                 raw.map(|raw| ClaimState::decode(&raw).expect("claim decodes"))
+            }
+
+            pub(super) fn hot_wallet(&self) -> Pubkey {
+                self.signer.pubkey()
+            }
+
+            /// Index `signature` in the address history with the redemption memo
+            /// and serve `transaction` for it from the RPC.
+            pub(super) fn index_candidate(&self, signature: &str, transaction: Value) {
+                self.history.lock().unwrap().push(json!({
+                    "signature": signature,
+                    "timestamp": 1_700_000_000,
+                    "instructions": [{
+                        "programId": pay_api_core::receipt::MEMO_PROGRAM,
+                        "data": bs58::encode(format!("Redeem code {CODE}")).into_string(),
+                    }],
+                }));
+                if !transaction.is_null() {
+                    self.rpc
+                        .lock()
+                        .unwrap()
+                        .transactions
+                        .insert(signature.to_string(), transaction);
+                }
+            }
+
+            /// A jsonParsed transaction with `fee_payer` signing a transfer of
+            /// the campaign mint from `source_owner`'s token account.
+            pub(super) fn payout_tx(
+                &self,
+                fee_payer: &Pubkey,
+                source_owner: &Pubkey,
+                err: Value,
+            ) -> Value {
+                let source = pay_api_core::ata::associated_token_address(
+                    source_owner,
+                    &self.cfg.mint,
+                    &self.cfg.token_program,
+                );
+                json!({
+                    "slot": 1,
+                    "meta": { "err": err },
+                    "transaction": { "message": {
+                        "accountKeys": [
+                            { "pubkey": fee_payer.to_string(), "signer": true, "writable": true },
+                            { "pubkey": self.hot_wallet().to_string(), "signer": fee_payer == &self.hot_wallet(), "writable": true },
+                        ],
+                        "instructions": [
+                            {
+                                "programId": self.cfg.token_program.to_string(),
+                                "program": "spl-token",
+                                "parsed": { "type": "transferChecked", "info": {
+                                    "source": source.to_string(),
+                                    "authority": source_owner.to_string(),
+                                    "destination": Pubkey::new_unique().to_string(),
+                                    "mint": self.cfg.mint.to_string(),
+                                    "tokenAmount": { "amount": "5000000", "decimals": 6 },
+                                }},
+                            },
+                            {
+                                "programId": pay_api_core::receipt::MEMO_PROGRAM,
+                                "program": "spl-memo",
+                                "parsed": format!("Redeem code {CODE}"),
+                            },
+                        ],
+                    }},
+                })
             }
 
             pub(super) fn sent(&self) -> Vec<Signature> {
@@ -1493,6 +1656,77 @@ mod tests {
             let (status, _) = h.redeem(&Pubkey::new_unique()).await;
             assert_eq!(status, StatusCode::BAD_GATEWAY);
             assert_eq!(h.claim().await, None);
+        }
+
+        #[tokio::test]
+        async fn memo_from_an_unrelated_transaction_does_not_block_the_code() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            let attacker = Pubkey::new_unique();
+            // Attacker-signed, mentions the hot wallet, carries the exact memo.
+            let mut tx = h.payout_tx(&attacker, &attacker, Value::Null);
+            tx["transaction"]["message"]["instructions"]
+                .as_array_mut()
+                .unwrap()
+                .remove(0);
+            h.index_candidate("AttackerSig", tx);
+            let (status, body) = h.redeem(&Pubkey::new_unique()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(h.sent().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn attacker_signed_token_transfer_with_the_memo_is_not_a_payout() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            let attacker = Pubkey::new_unique();
+            h.index_candidate(
+                "AttackerSig",
+                h.payout_tx(&attacker, &attacker, Value::Null),
+            );
+            let (status, body) = h.redeem(&Pubkey::new_unique()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+
+        #[tokio::test]
+        async fn failed_hot_wallet_payout_does_not_count_as_redeemed() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            let hot = h.hot_wallet();
+            h.index_candidate(
+                "FailedSig",
+                h.payout_tx(&hot, &hot, json!({ "InstructionError": [0, "Custom"] })),
+            );
+            let (status, body) = h.redeem(&Pubkey::new_unique()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+
+        #[tokio::test]
+        async fn verified_hot_wallet_payout_blocks_a_second_redemption() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            let hot = h.hot_wallet();
+            h.index_candidate("PriorSig", h.payout_tx(&hot, &hot, Value::Null));
+            let (status, body) = h.redeem(&Pubkey::new_unique()).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["signature"], "PriorSig");
+            assert!(h.sent().is_empty());
+            assert_eq!(h.claim().await, None);
+        }
+
+        #[tokio::test]
+        async fn unverifiable_candidate_fails_closed() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            h.index_candidate("UnknownSig", Value::Null);
+            let (status, _) = h.redeem(&Pubkey::new_unique()).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert!(h.sent().is_empty());
         }
     }
 }
