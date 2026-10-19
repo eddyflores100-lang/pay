@@ -1929,7 +1929,9 @@ fn build_session(
         ),
         "initMultiDelegate" | "createFixedDelegation" => (Some(fee_payer.to_string()), None),
         "settle" | "settleAndSeal" | "distribute" => (None, primary_recipient(&token_transfers)),
-        "seal" | "requestClose" | "withdrawPayer" => (
+        // The withdrawal goes back to the payer; there is no payee leg.
+        "withdrawPayer" => (None, None),
+        "seal" | "requestClose" => (
             // On close, the channel sends the remainder back to the payer.
             // We can't know which leg is the refund without account-info
             // lookups; leave `payer` empty and surface the breakdown via
@@ -3109,6 +3111,63 @@ mod tests {
         ]);
         let session = parse(rpc).session.expect("single channel session");
         assert_eq!(session.channel.as_deref(), Some("ChannelA"));
+    }
+
+    #[tokio::test]
+    async fn payer_withdrawal_is_reported_as_a_refund() {
+        let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        let rpc = crate::test_rpc::StubRpc::start().await;
+        // withdrawPayer: [payer, channel, channelTokenAccount, payerTokenAccount, ...],
+        // signed and fee-paid by the payer.
+        let value = json!({
+            "slot": 100,
+            "blockTime": 1_700_000_000_i64,
+            "meta": {
+                "err": null,
+                "fee": 5000_u64,
+                "innerInstructions": [{
+                    "index": 0,
+                    "instructions": [token_transfer("ChannelPDA", "PayerATA", mint, "9900", 6)]
+                }],
+                "postTokenBalances": [{
+                    "accountIndex": 2,
+                    "owner": "PayerWallet",
+                    "mint": mint,
+                    "uiTokenAmount": {"amount": "9900", "decimals": 6}
+                }]
+            },
+            "transaction": {"message": {
+                "accountKeys": [
+                    {"pubkey": "PayerWallet", "signer": true},
+                    {"pubkey": "ChannelPDA"},
+                    {"pubkey": "PayerATA"}
+                ],
+                "instructions": [{
+                    "programId": PAYMENT_CHANNELS_PROGRAM,
+                    "accounts": ["PayerWallet", "ChannelPDA", "ChannelATA", "PayerATA"],
+                    "data": bs58::encode([8u8]).into_string()
+                }]
+            }}
+        });
+        let receipt = build_receipt(
+            &RpcClient::new(std::time::Duration::from_secs(5)).unwrap(),
+            &rpc.url,
+            "sig",
+            Network::Sandbox,
+            &value,
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.intent.action.as_deref(), Some("withdrawPayer"));
+        let session = receipt.session.unwrap();
+        assert_eq!(session.events[0].kind, "refund");
+        assert_eq!(session.refunded.unwrap().raw_amount, "9900");
+        assert!(session.consumed.is_none());
+        assert_eq!(session.payer.as_deref(), Some("PayerWallet"));
+        assert_eq!(session.payee, None);
+        assert_eq!(session.channel.as_deref(), Some("ChannelPDA"));
+        assert_eq!(session.channel_status, Some(WireChannelStatus::Sealed));
     }
 
     // ── Plain transfer / SOL / Token-2022 ─────────────────────────────────
