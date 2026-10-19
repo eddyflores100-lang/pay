@@ -281,6 +281,38 @@ impl RpcClient {
         Ok(out)
     }
 
+    /// [`Self::get_signatures_for_address`] keeping each entry's slot and
+    /// whether the transaction failed, so history scans can skip entries
+    /// that cannot be what they look for without fetching them.
+    pub async fn get_signature_infos_for_address(
+        &self,
+        rpc_url: &str,
+        address: &str,
+        before: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<SignatureInfo>> {
+        let mut opts = json!({
+            "limit": limit,
+            "commitment": "confirmed",
+        });
+        if let Some(before) = before {
+            opts["before"] = Value::String(before.to_string());
+        }
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [address, opts],
+        });
+        let result = self.post_rpc_value(rpc_url, body).await?;
+        result
+            .as_array()
+            .ok_or(Error::RpcMalformed)?
+            .iter()
+            .map(parse_signature_info)
+            .collect()
+    }
+
     /// `getTransaction` with `jsonParsed` encoding. Returns the entire RPC
     /// result so callers can pick the fields they need.
     ///
@@ -602,6 +634,30 @@ fn asset_price_request_body(asset_id: &str) -> Value {
     })
 }
 
+/// One `getSignaturesForAddress` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignatureInfo {
+    pub signature: String,
+    pub slot: u64,
+    /// The transaction landed but its execution failed.
+    pub failed: bool,
+}
+
+fn parse_signature_info(entry: &Value) -> Result<SignatureInfo> {
+    Ok(SignatureInfo {
+        signature: entry
+            .get("signature")
+            .and_then(Value::as_str)
+            .ok_or(Error::RpcMalformed)?
+            .to_string(),
+        slot: entry
+            .get("slot")
+            .and_then(Value::as_u64)
+            .ok_or(Error::RpcMalformed)?,
+        failed: entry.get("err").is_some_and(|err| !err.is_null()),
+    })
+}
+
 /// RPC commitment level for a read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Commitment {
@@ -724,6 +780,25 @@ fn json_number(value: &Value) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signature_infos_keep_slot_and_failure() {
+        let ok = parse_signature_info(&json!({"signature": "s", "slot": 7, "err": null})).unwrap();
+        assert_eq!(
+            ok,
+            SignatureInfo {
+                signature: "s".into(),
+                slot: 7,
+                failed: false
+            }
+        );
+        assert!(
+            parse_signature_info(&json!({"signature": "s", "slot": 7, "err": {"x": 1}}))
+                .unwrap()
+                .failed
+        );
+        assert!(parse_signature_info(&json!({"signature": "s"})).is_err());
+    }
 
     #[test]
     fn account_reads_carry_the_requested_commitment_and_parse_owners() {

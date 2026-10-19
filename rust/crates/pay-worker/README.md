@@ -278,14 +278,17 @@ wallet proofs, Redis URLs, KMS keys, or chain RPC secrets to this job.
 `sha256` hash is stored on-chain. The job recovers the preimage from the
 channel's **open** (creation) transaction:
 
-1. `getSignaturesForAddress(channel)`, paginated to the OLDEST signature — that
-   is the `open`.
-2. `getTransaction(sig, base64)`, bincode-decoded; find the instruction whose
-   program id is the payment-channels program and whose `data[0] == 1` (the
-   `open` discriminator).
-3. The `open` ix data is `[disc(1)][salt(8)][deposit(8)][grace(4)][open_slot(8)][count(4)][entries(count×34)]`.
-   The preimage = `ix_data[29..]` = `count || entries` (each entry =
-   `recipient(32) || bps(2 LE)`), which is exactly the borsh encoding of the
+1. `getSignaturesForAddress(channel)`, paginated, keeping only successful
+   transactions in the slots an open can land in
+   (`open_slot ..= open_slot + OPEN_SLOT_WINDOW`). Anyone can mention the PDA
+   before it exists, so the oldest mention is not assumed to be the open.
+2. Oldest first, `getTransaction(sig, base64)` is decoded and accepted only if
+   an instruction is the payment-channels `open` that names this channel and
+   whose own accounts and arguments derive its PDA
+   (`payment_channels::decode_open_for_channel`). Anything else is skipped;
+   exhausting the candidates is `OpenTxNotFound`.
+3. The preimage is the borsh encoding of the open's `recipients`
+   (`count || entries`, each entry `recipient(32) || bps(2 LE)`), exactly the
    `DistributeArgs.recipients` vector.
 4. The recipient-ATA remaining-accounts tail = `ATA(recipient, mint, token_program)`
    per entry, in order.
