@@ -1,5 +1,6 @@
 //! Decode the on-chain `SubscriptionDelegation` (and its parent `Plan`)
-//! published by the canonical subscriptions program.
+//! published by the canonical subscriptions program or its legacy
+//! multi-delegator deployment, which shares the account layout.
 //!
 //! The layouts are the codama-generated borsh structs from pay-kit
 //! (`subscriptions-client`). Borsh leaves trailing bytes unread, so every
@@ -15,7 +16,7 @@ use solana_pubkey::Pubkey;
 use tracing::debug;
 
 use crate::error::{Error, Result};
-use crate::receipt::SUBSCRIPTIONS_PROGRAM;
+use crate::receipt::{MULTI_DELEGATOR_PROGRAM, SUBSCRIPTIONS_PROGRAM};
 use crate::rpc::RpcClient;
 
 /// `AccountDiscriminator::Plan`.
@@ -42,16 +43,22 @@ pub struct SubscriptionDelegationState {
     pub expires_at_ts: i64,
 }
 
-/// Fetch and validate the subscription delegation an instruction names at
-/// `subscription` for `plan`. Returns `Ok(None)` when the account is missing
-/// or is not a valid delegation for that plan.
+/// Fetch and validate the subscription delegation an instruction of
+/// `program_id` names at `subscription` for `plan`. The account must be owned
+/// by that same program (canonical or legacy deployment) and sit at the PDA
+/// derived under it. Returns `Ok(None)` when the account is missing or is not
+/// a valid delegation for that plan.
 pub async fn fetch_subscription_delegation(
     rpc: &RpcClient,
     rpc_url: &str,
+    program_id: &str,
     subscription: &str,
     plan: &str,
 ) -> Result<Option<SubscriptionDelegationState>> {
-    let program = Pubkey::from_str(SUBSCRIPTIONS_PROGRAM).map_err(|_| Error::RpcMalformed)?;
+    if program_id != SUBSCRIPTIONS_PROGRAM && program_id != MULTI_DELEGATOR_PROGRAM {
+        return Ok(None);
+    }
+    let program = Pubkey::from_str(program_id).map_err(|_| Error::RpcMalformed)?;
     let (Ok(subscription_key), Ok(plan_key)) =
         (Pubkey::from_str(subscription), Pubkey::from_str(plan))
     else {
@@ -64,7 +71,7 @@ pub async fn fetch_subscription_delegation(
     let Some(Some(delegation)) = accounts.next() else {
         return Ok(None);
     };
-    if delegation.owner != SUBSCRIPTIONS_PROGRAM {
+    if delegation.owner != program_id {
         return Ok(None);
     }
     let mut state = match decode_subscription_delegation(
@@ -84,7 +91,7 @@ pub async fn fetch_subscription_delegation(
         }
     };
     if let Some(Some(plan_account)) = accounts.next()
-        && plan_account.owner == SUBSCRIPTIONS_PROGRAM
+        && plan_account.owner == program_id
     {
         state.mint = decode_plan_mint(&plan_account.data);
     }

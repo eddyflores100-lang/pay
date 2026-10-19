@@ -109,8 +109,9 @@ pub async fn build_receipt(
         // Decode the SubscriptionDelegation the instruction names by role.
         if let Some((subscription, plan)) =
             subscription_delegation_accounts(rpc_value, receipt.intent.program_id.as_deref())
+            && let Some(program_id) = receipt.intent.program_id.clone()
             && let Ok(Some(state)) =
-                fetch_subscription_delegation(rpc, rpc_url, &subscription, &plan).await
+                fetch_subscription_delegation(rpc, rpc_url, &program_id, &subscription, &plan).await
         {
             if let Some(mint) = state.mint.map(|mint| mint.to_string())
                 && !metadata.contains_key(&mint)
@@ -449,7 +450,7 @@ fn subscription_delegation_accounts(
     program_id: Option<&str>,
 ) -> Option<(String, String)> {
     let program_id = program_id?;
-    if program_id != SUBSCRIPTIONS_PROGRAM {
+    if program_id != SUBSCRIPTIONS_PROGRAM && program_id != MULTI_DELEGATOR_PROGRAM {
         return None;
     }
     let top = rpc_value
@@ -2113,6 +2114,7 @@ mod tests {
             plan_bytes, subscription_delegation_bytes, subscription_pda, subscriptions_program,
         };
         use crate::test_rpc::StubRpc;
+        use std::str::FromStr;
 
         pub(crate) struct Fixture {
             pub(crate) subscriber: Pubkey,
@@ -2293,6 +2295,75 @@ mod tests {
                 Some(f.subscription.to_string())
             );
             assert_eq!(subscription.expires_at_ts, Some(1_800_000_000));
+        }
+
+        #[tokio::test]
+        async fn legacy_program_receipts_decode_legacy_owned_delegations() {
+            let legacy = Pubkey::from_str(MULTI_DELEGATOR_PROGRAM).unwrap();
+            let rpc = StubRpc::start().await;
+            let f = Fixture::new(&legacy);
+            f.install(&rpc, MULTI_DELEGATOR_PROGRAM);
+            let value = tx(
+                MULTI_DELEGATOR_PROGRAM,
+                12,
+                &[
+                    f.subscriber.to_string(),
+                    f.plan.to_string(),
+                    f.subscription.to_string(),
+                ],
+            );
+            let receipt = build(&rpc, &value).await;
+            assert_eq!(receipt.intent.name, "subscription");
+            let subscription = receipt.subscription.unwrap();
+            assert_eq!(
+                subscription.subscription_id,
+                Some(f.subscription.to_string())
+            );
+            assert_eq!(subscription.period_hours, Some(720));
+            assert_eq!(subscription.period_amount.unwrap().raw_amount, "10000000");
+        }
+
+        #[tokio::test]
+        async fn delegation_owner_must_match_the_instruction_program() {
+            let rpc = StubRpc::start().await;
+            // Canonical-derived and canonical-owned, named by a legacy instruction.
+            let f = Fixture::new(&subscriptions_program());
+            f.install(&rpc, SUBSCRIPTIONS_PROGRAM);
+            let accounts = [
+                f.subscriber.to_string(),
+                f.plan.to_string(),
+                f.subscription.to_string(),
+            ];
+            let value = tx(MULTI_DELEGATOR_PROGRAM, 12, &accounts);
+            assert_eq!(
+                build(&rpc, &value)
+                    .await
+                    .subscription
+                    .unwrap()
+                    .subscription_id,
+                None
+            );
+
+            // Legacy-owned but derived under the canonical program.
+            let f = Fixture::new(&subscriptions_program());
+            f.install(&rpc, MULTI_DELEGATOR_PROGRAM);
+            let accounts = [
+                f.subscriber.to_string(),
+                f.plan.to_string(),
+                f.subscription.to_string(),
+            ];
+            for program in [MULTI_DELEGATOR_PROGRAM, SUBSCRIPTIONS_PROGRAM] {
+                let value = tx(program, 12, &accounts);
+                assert_eq!(
+                    build(&rpc, &value)
+                        .await
+                        .subscription
+                        .unwrap()
+                        .subscription_id,
+                    None,
+                    "{program}"
+                );
+            }
         }
 
         #[tokio::test]
