@@ -1033,10 +1033,7 @@ impl<S: PaymentState> PaymentGate<S> {
             ));
         }
 
-        let amount_usd = price
-            .as_ref()
-            .and_then(|p| p.dimensions.first())
-            .map(|d| d.price_usd / d.scale.max(1) as f64);
+        let amount_usd = fixed_price.as_ref().map(metering::per_call_usd);
         let challenge_protocol = if advertised.len() == 1 {
             advertised[0]
         } else {

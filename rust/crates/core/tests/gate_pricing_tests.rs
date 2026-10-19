@@ -435,3 +435,26 @@ async fn chunked_request_through_middleware_is_quoted_at_the_large_tier() {
     assert_eq!(charge.amount, "100000000");
     server.abort();
 }
+
+// ── Multi-dimension fixed charges (SOLA1-155) ──────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fixed_charge_covers_every_request_dimension() {
+    let mut api = upload_api();
+    let endpoint = api
+        .endpoints
+        .iter_mut()
+        .find(|endpoint| endpoint.path == "v1/simple/echo")
+        .unwrap();
+    let metering = endpoint.metering.as_mut().unwrap();
+    metering.schemes = Some(vec![pay_types::metering::Scheme::MppCharge]);
+    let mut second = metering.dimensions[0].clone();
+    second.tiers[0].price_usd = 0.5;
+    metering.dimensions.push(second);
+
+    // $0.001 + $0.500 in SOL base units.
+    assert_eq!(
+        charge_amount(&api, "v1/simple/echo", Some(2)).await,
+        "501000000"
+    );
+}

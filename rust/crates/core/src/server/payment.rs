@@ -627,13 +627,15 @@ pub(crate) fn price_unit_base_amount(price: &metering::ResolvedPrice, decimals: 
 /// by the 402-issuing and verify paths so the advertised and expected amounts
 /// always match.
 pub(crate) fn charge_amount_from_price(price: Option<&metering::ResolvedPrice>) -> String {
-    price
-        .and_then(|p| p.dimensions.first())
-        .map(|d| {
-            let per_unit = d.price_usd / d.scale.max(1) as f64;
-            format!("{}", per_unit)
-        })
-        .unwrap_or_else(|| "0.01".to_string())
+    let Some(price) = price else {
+        return "0.01".to_string();
+    };
+    // Round away float noise from summing dimensions (0.1 + 0.2).
+    let fixed = format!("{:.12}", metering::per_call_usd(price));
+    fixed
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
 }
 
 pub(crate) fn resolve_charge_splits(
@@ -836,6 +838,33 @@ mod tests {
     use super::*;
 
     const SPLIT_RECIPIENT: &str = "CNR1b172rotbSG6kCpfR76KB2ios2y7X4p8yEEc7pjLu";
+
+    #[test]
+    fn charge_amount_sums_dimensions_without_float_noise() {
+        let dim = |price_usd, scale| metering::ResolvedDimension {
+            direction: "usage".into(),
+            unit: "requests".into(),
+            scale,
+            price_usd,
+        };
+        let price = |dimensions| metering::ResolvedPrice { dimensions };
+        assert_eq!(
+            charge_amount_from_price(Some(&price(vec![dim(0.1, 1), dim(0.2, 1)]))),
+            "0.3"
+        );
+        assert_eq!(
+            charge_amount_from_price(Some(&price(vec![dim(0.001, 1), dim(0.5, 1)]))),
+            "0.501"
+        );
+        assert_eq!(
+            charge_amount_from_price(Some(&price(vec![dim(1.5, 1000)]))),
+            "0.0015"
+        );
+        assert_eq!(
+            charge_amount_from_price(Some(&price(vec![dim(2.0, 1)]))),
+            "2"
+        );
+    }
 
     #[test]
     fn currency_symbols_normalize_but_mint_addresses_remain_case_sensitive() {

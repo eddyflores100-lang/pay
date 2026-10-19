@@ -256,13 +256,14 @@ fn fixed_charge_dimensions<'a>(
         .unwrap_or(&metering.dimensions)
 }
 
-/// Per-call USD amount charged for a resolved fixed price.
+/// Per-call USD amount charged for a resolved fixed price: every dimension
+/// contributes its unit price.
 pub fn per_call_usd(price: &ResolvedPrice) -> f64 {
     price
         .dimensions
-        .first()
+        .iter()
         .map(|d| d.price_usd / d.scale.max(1) as f64)
-        .unwrap_or(0.0)
+        .sum()
 }
 
 pub fn effective_dimensions<'a>(
@@ -3145,5 +3146,14 @@ mod tests {
         );
         let price = resolve_price(&explicit, &RequestProperties::default(), None, None);
         assert_eq!(upto_max_usd(&explicit, price.as_ref()), Some(2.0));
+    }
+
+    #[test]
+    fn fixed_price_sums_every_dimension() {
+        let metering = yaml_metering(
+            "dimensions:\n  - direction: usage\n    unit: requests\n    scale: 1\n    tiers: [{price_usd: 0.001}]\n  - direction: usage\n    unit: requests\n    scale: 1\n    tiers: [{price_usd: 0.5}]\n",
+        );
+        let price = resolve_fixed_price(&metering, &RequestProperties::default(), None).unwrap();
+        assert!((per_call_usd(&price) - 0.501).abs() < 1e-12);
     }
 }
