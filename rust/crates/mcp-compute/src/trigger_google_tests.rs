@@ -22,6 +22,7 @@ pub(super) struct MockState {
     pub(super) jobs: BTreeMap<String, Value>,
     pub(super) functions: BTreeMap<String, Value>,
     pub(super) invocations: Vec<String>,
+    pub(super) fail_job_delete: Option<String>,
 }
 
 struct RedisProcess(Child);
@@ -129,6 +130,9 @@ fn handle(state: &Mutex<MockState>, method: &str, path: &str, body: Value) -> Re
             }
             None => json_response(StatusCode::NOT_FOUND, json!({})),
         },
+        "DELETE" if state.fail_job_delete.as_deref() == Some(resource.as_str()) => {
+            json_response(StatusCode::SERVICE_UNAVAILABLE, json!({}))
+        }
         "DELETE" => match state.jobs.remove(&resource) {
             Some(_) => json_response(StatusCode::OK, json!({})),
             None => json_response(StatusCode::NOT_FOUND, json!({})),
@@ -295,6 +299,14 @@ impl Harness {
             .unwrap()
             .functions
             .insert(resource, function);
+    }
+
+    pub(super) fn remove_function(&self, name: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .functions
+            .remove(&Self::function_resource(name));
     }
 
     pub(super) async fn remaining(&mut self, resource: &str) -> Option<i64> {
@@ -541,4 +553,65 @@ async fn triggers_cannot_target_another_channels_deployment() {
         harness.remaining(&trigger.id).await,
         Some(i64::from(PREPAID_RUNS) - 1)
     );
+}
+
+#[tokio::test]
+#[ignore = "requires redis-server on PATH; run with --ignored"]
+async fn stale_schedules_cannot_invoke_a_recreated_function() {
+    let mut harness = Harness::new().await;
+    harness.add_function(FUNCTION, "channelA", "2026-01-01T00:00:00Z");
+    let owner = tenant("channelA");
+    let trigger = harness
+        .driver
+        .create(&owner, create_request("refresh", "weather", "*/5 * * * *"))
+        .await
+        .unwrap();
+    let request = harness.executor_request(&trigger.id);
+    assert_eq!(request.target_created_at, "2026-01-01T00:00:00Z");
+    harness.driver.execute(request.clone()).await.unwrap();
+    assert_eq!(harness.invocations(), 1);
+
+    // Same payer, same channel, same name: a different incarnation.
+    harness.remove_function(FUNCTION);
+    harness.add_function(FUNCTION, "channelA", "2026-02-01T00:00:00Z");
+    assert!(harness.driver.execute(request.clone()).await.is_err());
+    let mut legacy = request;
+    legacy.target_created_at = String::new();
+    assert!(harness.driver.execute(legacy).await.is_err());
+    assert_eq!(harness.invocations(), 1);
+    assert_eq!(
+        harness.remaining(&trigger.id).await,
+        Some(i64::from(PREPAID_RUNS) - 1)
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires redis-server on PATH; run with --ignored"]
+async fn channel_cleanup_revokes_every_budget_despite_job_deletion_failures() {
+    let mut harness = Harness::new().await;
+    harness.add_function(FUNCTION, "channelA", "2026-01-01T00:00:00Z");
+    let owner = tenant("channelA");
+    let first = harness
+        .driver
+        .create(&owner, create_request("first", "weather", "*/5 * * * *"))
+        .await
+        .unwrap();
+    let second = harness
+        .driver
+        .create(&owner, create_request("second", "weather", "*/5 * * * *"))
+        .await
+        .unwrap();
+    harness.state.lock().unwrap().fail_job_delete = Some(first.id.clone());
+    assert!(harness.driver.cleanup_channel("channelA").await.is_err());
+    assert_eq!(harness.remaining(&first.id).await, None);
+    assert_eq!(harness.remaining(&second.id).await, None);
+    assert!(!harness.state.lock().unwrap().jobs.contains_key(&second.id));
+    // The surviving job has no budget left to execute with.
+    let request = harness.executor_request(&first.id);
+    assert!(harness.driver.execute(request).await.is_err());
+    assert_eq!(harness.invocations(), 0);
+
+    harness.state.lock().unwrap().fail_job_delete = None;
+    assert_eq!(harness.driver.cleanup_channel("channelA").await.unwrap(), 1);
+    assert!(harness.state.lock().unwrap().jobs.is_empty());
 }

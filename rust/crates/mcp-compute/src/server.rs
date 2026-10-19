@@ -1098,6 +1098,7 @@ mod tests {
             "trigger_resource": "projects/project/locations/us-central1/jobs/trigger-test",
             "channel_lease": "lease",
             "target_channel_lease": "target-lease",
+            "target_created_at": "2025-01-01T00:00:00Z",
             "target_resource": "projects/project/locations/us-central1/functions/gcf-tenant-test",
             "tenant_key": "tenant",
             "path": "/refresh"

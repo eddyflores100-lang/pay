@@ -5403,6 +5403,7 @@ dependencies = [
 name = "pay-worker"
 version = "0.30.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "bs58",

@@ -129,33 +129,224 @@ impl ResourceCleaner {
         !self.compute.is_empty() || !self.data.is_empty() || !self.triggers.is_empty()
     }
 
+    /// Triggers are revoked first so a failure below cannot leave a schedule
+    /// able to invoke a reused target. Every driver runs; the first error is
+    /// returned so the lifecycle worker retries.
     pub async fn cleanup_channel(&self, channel_id: &str) -> Result<CleanupSummary, JobError> {
         let mut summary = CleanupSummary::default();
+        let mut failure = None;
+        for driver in &self.triggers {
+            match driver.cleanup_channel(channel_id).await {
+                Ok(count) => summary.trigger_resources += count,
+                Err(error) => {
+                    failure.get_or_insert(JobError::Config(format!("trigger cleanup: {error}")));
+                }
+            }
+        }
         for driver in &self.compute {
-            summary.compute_resources += driver
-                .cleanup_channel(channel_id)
-                .await
-                .map_err(|error| JobError::Config(format!("compute cleanup: {error}")))?;
+            match driver.cleanup_channel(channel_id).await {
+                Ok(count) => summary.compute_resources += count,
+                Err(error) => {
+                    failure.get_or_insert(JobError::Config(format!("compute cleanup: {error}")));
+                }
+            }
         }
         for driver in &self.data {
-            summary.data_resources += driver
-                .cleanup_channel(channel_id)
-                .await
-                .map_err(|error| JobError::Config(format!("data cleanup: {error}")))?;
+            match driver.cleanup_channel(channel_id).await {
+                Ok(count) => summary.data_resources += count,
+                Err(error) => {
+                    failure.get_or_insert(JobError::Config(format!("data cleanup: {error}")));
+                }
+            }
         }
-        for driver in &self.triggers {
-            summary.trigger_resources += driver
-                .cleanup_channel(channel_id)
-                .await
-                .map_err(|error| JobError::Config(format!("trigger cleanup: {error}")))?;
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(summary),
         }
-        Ok(summary)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FailingCompute;
+
+    #[async_trait::async_trait]
+    impl ComputeDriver for FailingCompute {
+        fn id(&self) -> &'static str {
+            "failing"
+        }
+        fn gateway_prefix(&self) -> &'static str {
+            "failing-"
+        }
+        fn capabilities(&self) -> mcp_compute::types::DriverCapabilities {
+            unreachable!()
+        }
+        async fn deploy(
+            &self,
+            _: &mcp_compute::types::Tenant,
+            _: mcp_compute::types::DeployRequest,
+        ) -> mcp_compute::driver::Result<mcp_compute::types::ComputeOperation> {
+            unreachable!()
+        }
+        async fn get(
+            &self,
+            _: &mcp_compute::types::Tenant,
+            _: mcp_compute::types::ResourceRequest,
+        ) -> mcp_compute::driver::Result<mcp_compute::types::Deployment> {
+            unreachable!()
+        }
+        async fn list(
+            &self,
+            _: &mcp_compute::types::Tenant,
+            _: mcp_compute::types::ListRequest,
+        ) -> mcp_compute::driver::Result<mcp_compute::types::DeploymentList> {
+            unreachable!()
+        }
+        async fn delete(
+            &self,
+            _: &mcp_compute::types::Tenant,
+            _: mcp_compute::types::ResourceRequest,
+        ) -> mcp_compute::driver::Result<mcp_compute::types::ComputeOperation> {
+            unreachable!()
+        }
+        async fn operation(
+            &self,
+            _: &mcp_compute::types::Tenant,
+            _: &str,
+        ) -> mcp_compute::driver::Result<mcp_compute::types::ComputeOperation> {
+            unreachable!()
+        }
+        async fn invoke(
+            &self,
+            _: &mcp_compute::types::Tenant,
+            _: mcp_compute::types::InvokeRequest,
+        ) -> mcp_compute::driver::Result<mcp_compute::types::InvocationResult> {
+            unreachable!()
+        }
+        async fn invoke_gateway(
+            &self,
+            _: mcp_compute::types::GatewayInvokeRequest,
+        ) -> mcp_compute::driver::Result<mcp_compute::types::GatewayInvocation> {
+            unreachable!()
+        }
+        async fn cleanup_channel(&self, _: &str) -> mcp_compute::driver::Result<usize> {
+            Err(mcp_compute::driver::ComputeError::Provider(
+                "unavailable".into(),
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingTriggers(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl TriggerDriver for CountingTriggers {
+        fn id(&self) -> &'static str {
+            "counting"
+        }
+        fn capabilities(&self) -> mcp_compute::trigger_types::TriggerDriverCapabilities {
+            unreachable!()
+        }
+        async fn create(
+            &self,
+            _: &mcp_compute::types::Tenant,
+            _: mcp_compute::trigger_types::CreateTriggerRequest,
+        ) -> mcp_compute::trigger_driver::Result<mcp_compute::trigger_types::Trigger> {
+            unreachable!()
+        }
+        async fn get(
+            &self,
+            _: &mcp_compute::types::Tenant,
+            _: mcp_compute::trigger_types::TriggerRequest,
+        ) -> mcp_compute::trigger_driver::Result<mcp_compute::trigger_types::Trigger> {
+            unreachable!()
+        }
+        async fn list(
+            &self,
+            _: &mcp_compute::types::Tenant,
+            _: mcp_compute::trigger_types::ListTriggersRequest,
+        ) -> mcp_compute::trigger_driver::Result<mcp_compute::trigger_types::TriggerList> {
+            unreachable!()
+        }
+        async fn pause(
+            &self,
+            _: &mcp_compute::types::Tenant,
+            _: mcp_compute::trigger_types::TriggerRequest,
+        ) -> mcp_compute::trigger_driver::Result<mcp_compute::trigger_types::Trigger> {
+            unreachable!()
+        }
+        async fn resume(
+            &self,
+            _: &mcp_compute::types::Tenant,
+            _: mcp_compute::trigger_types::TriggerRequest,
+        ) -> mcp_compute::trigger_driver::Result<mcp_compute::trigger_types::Trigger> {
+            unreachable!()
+        }
+        async fn run_now(
+            &self,
+            _: &mcp_compute::types::Tenant,
+            _: mcp_compute::trigger_types::TriggerRequest,
+        ) -> mcp_compute::trigger_driver::Result<mcp_compute::trigger_types::Trigger> {
+            unreachable!()
+        }
+        async fn delete(
+            &self,
+            _: &mcp_compute::types::Tenant,
+            _: mcp_compute::trigger_types::TriggerRequest,
+        ) -> mcp_compute::trigger_driver::Result<()> {
+            unreachable!()
+        }
+        async fn cleanup_target(
+            &self,
+            _: &mcp_compute::types::Tenant,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+        ) -> mcp_compute::trigger_driver::Result<usize> {
+            unreachable!()
+        }
+        async fn cleanup_channel(&self, _: &str) -> mcp_compute::trigger_driver::Result<usize> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(2)
+        }
+        async fn execute(
+            &self,
+            _: mcp_compute::trigger_types::ExecuteTriggerRequest,
+        ) -> mcp_compute::trigger_driver::Result<
+            mcp_compute::trigger_driver::TriggerExecutionResponse,
+        > {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn compute_failures_do_not_skip_trigger_revocation() {
+        let triggers = Arc::new(CountingTriggers::default());
+        let cleaner = ResourceCleaner {
+            compute: vec![Arc::new(FailingCompute)],
+            data: Vec::new(),
+            triggers: vec![triggers.clone()],
+        };
+        assert!(cleaner.cleanup_channel("channel").await.is_err());
+        assert_eq!(triggers.0.load(Ordering::SeqCst), 1);
+
+        let cleaner = ResourceCleaner {
+            compute: Vec::new(),
+            data: Vec::new(),
+            triggers: vec![triggers.clone()],
+        };
+        assert_eq!(
+            cleaner.cleanup_channel("channel").await.unwrap(),
+            CleanupSummary {
+                trigger_resources: 2,
+                ..Default::default()
+            }
+        );
+    }
 
     #[test]
     fn empty_driver_list_disables_cleanup() {

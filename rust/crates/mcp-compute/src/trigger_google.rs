@@ -354,48 +354,61 @@ return redis.call('HINCRBY', KEYS[1], 'remaining', -1)
         }
 
         let mut deleted = 0;
+        let mut failure = None;
         for name in resources {
-            let (status, current) = self
-                .request(
-                    Method::GET,
-                    format!("{}/v1/{name}", self.config.scheduler_api_base),
-                    None,
-                )
-                .await?;
-            if status == StatusCode::NOT_FOUND {
-                continue;
-            }
-            if !status.is_success() {
-                return Err(TriggerError::Provider(format!(
-                    "Google API returned {status}: {current}"
-                )));
-            }
-            if !current
-                .get("description")
-                .and_then(Value::as_str)
-                .is_some_and(|description| {
-                    markers.iter().all(|marker| description.contains(marker))
-                })
-            {
-                continue;
-            }
-            let (status, value) = self
-                .request(
-                    Method::DELETE,
-                    format!("{}/v1/{name}", self.config.scheduler_api_base),
-                    None,
-                )
-                .await?;
-            if status.is_success() || status == StatusCode::NOT_FOUND {
-                self.delete_budget(&name).await?;
-                deleted += 1;
-            } else {
-                return Err(TriggerError::Provider(format!(
-                    "Google API returned {status}: {value}"
-                )));
+            match self.revoke_trigger(&name, markers).await {
+                Ok(true) => deleted += 1,
+                Ok(false) => {}
+                // Keep revoking the remaining triggers; the caller retries.
+                Err(error) => failure = failure.or(Some(error)),
             }
         }
-        Ok(deleted)
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(deleted),
+        }
+    }
+
+    /// Revoke the budget before deleting the job so a job that survives a
+    /// failed deletion can no longer execute.
+    async fn revoke_trigger(&self, name: &str, markers: &[String]) -> Result<bool> {
+        let (status, current) = self
+            .request(
+                Method::GET,
+                format!("{}/v1/{name}", self.config.scheduler_api_base),
+                None,
+            )
+            .await?;
+        if status == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        if !status.is_success() {
+            return Err(TriggerError::Provider(format!(
+                "Google API returned {status}: {current}"
+            )));
+        }
+        if !current
+            .get("description")
+            .and_then(Value::as_str)
+            .is_some_and(|description| markers.iter().all(|marker| description.contains(marker)))
+        {
+            return Ok(false);
+        }
+        self.delete_budget(name).await?;
+        let (status, value) = self
+            .request(
+                Method::DELETE,
+                format!("{}/v1/{name}", self.config.scheduler_api_base),
+                None,
+            )
+            .await?;
+        if status.is_success() || status == StatusCode::NOT_FOUND {
+            Ok(true)
+        } else {
+            Err(TriggerError::Provider(format!(
+                "Google API returned {status}: {value}"
+            )))
+        }
     }
 }
 
@@ -466,6 +479,14 @@ impl TriggerDriver for GoogleTriggerDriver {
         let target_channel_lease = function_lease(&tenant.channel_id)?;
         require_function_lease(&function, &target_channel_lease)?;
         validate_budgeted_function(&function)?;
+        let target_created_at = function
+            .get("createTime")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                TriggerError::Provider("target function omitted its creation identity".into())
+            })?
+            .to_string();
         let physical = self.physical_name(tenant, &request.name)?;
         let resource = self.resource(region, &physical)?;
         let channel = lease_key(&tenant.channel_id)?;
@@ -504,6 +525,7 @@ impl TriggerDriver for GoogleTriggerDriver {
             "channel_lease": channel,
             "target_resource": function_resource,
             "target_channel_lease": target_channel_lease,
+            "target_created_at": target_created_at,
             "tenant_key": tenant.key,
             "path": request.target.path,
             "input": request.input,
@@ -618,13 +640,13 @@ impl TriggerDriver for GoogleTriggerDriver {
     async fn delete(&self, tenant: &Tenant, request: TriggerRequest) -> Result<()> {
         let (region, _) = self.owned_trigger(tenant, &request).await?;
         let resource = self.resource(&region, &request.id)?;
+        self.delete_budget(&resource).await?;
         self.require(
             Method::DELETE,
             format!("{}/v1/{resource}", self.config.scheduler_api_base),
             None,
         )
         .await?;
-        self.delete_budget(&resource).await?;
         Ok(())
     }
 
@@ -707,6 +729,14 @@ impl TriggerDriver for GoogleTriggerDriver {
             .await?;
         require_function_tenant(&function, &request.tenant_key)?;
         require_function_lease(&function, &request.target_channel_lease)?;
+        if request.target_created_at.is_empty()
+            || function.get("createTime").and_then(Value::as_str)
+                != Some(request.target_created_at.as_str())
+        {
+            return Err(TriggerError::InvalidRequest(
+                "target function was recreated after the trigger was created".into(),
+            ));
+        }
         validate_budgeted_function(&function)?;
         if !self
             .consume_budget(&request.trigger_resource, &request.channel_lease)
