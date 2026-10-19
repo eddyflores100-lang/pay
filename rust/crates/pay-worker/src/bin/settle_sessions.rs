@@ -1009,19 +1009,6 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
             bound_close_ownership.insert(state.channel_id.clone(), lost);
         }
         let resource_state = state.clone();
-        let cleanup_ready =
-            match ensure_resource_cleanup(runtime, &session.store, &state, false).await {
-                Ok(ready) => ready,
-                Err(error) => {
-                    failures += 1;
-                    warn!(
-                        channel_id = %state.channel_id,
-                        %error,
-                        "failed to garbage-collect channel-funded resources; will retry"
-                    );
-                    false
-                }
-            };
 
         match reconcile_channel(
             &runtime.rpc,
@@ -1055,6 +1042,26 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
                     );
                 }
                 inventory.record(result.snapshot);
+                // Leased resources outlive a close intent: only a terminal
+                // channel, or one proven absent, releases them.
+                let cleanup_ready = if result.store_disposition == StoreDisposition::Delete
+                    || resource_cleanup_terminal(&resource_state, result.onchain_status)
+                {
+                    match ensure_resource_cleanup(runtime, &session.store, &resource_state).await {
+                        Ok(ready) => ready,
+                        Err(error) => {
+                            failures += 1;
+                            warn!(
+                                channel_id = %result.channel_id,
+                                %error,
+                                "failed to garbage-collect channel-funded resources; will retry"
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
                 match result.store_disposition {
                     StoreDisposition::Keep => {}
                     StoreDisposition::Expire { newly_finalized } => {
@@ -1073,32 +1080,6 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
                     }
                     StoreDisposition::Delete => {
                         finalized += 1;
-                        let cleanup_ready = if resource_cleanup_required(
-                            &resource_state,
-                            unix_now_millis(),
-                        ) {
-                            cleanup_ready
-                        } else {
-                            match ensure_resource_cleanup(
-                                runtime,
-                                &session.store,
-                                &resource_state,
-                                true,
-                            )
-                            .await
-                            {
-                                Ok(ready) => ready,
-                                Err(error) => {
-                                    failures += 1;
-                                    warn!(
-                                        channel_id = %result.channel_id,
-                                        %error,
-                                        "failed to garbage-collect resources for absent channel; will retry"
-                                    );
-                                    false
-                                }
-                            }
-                        };
                         if runtime.dry_run {
                             info!(
                                 channel_id = %result.channel_id,
@@ -1956,16 +1937,11 @@ fn log_summary(metrics: &SettleSessionsMetrics) {
     );
 }
 
-fn resource_cleanup_required(state: &ChannelState, now_ms: u64) -> bool {
-    state.sealed
-        || state.close_requested_at.is_some()
-        || state.final_cumulative.is_some()
-        || (state.deposit > 0
-            && state.cumulative >= state.deposit
-            && state
-                .lifecycle
-                .as_ref()
-                .is_some_and(|lifecycle| lifecycle.close_after <= now_ms))
+/// Whether the channel is past every lifecycle transaction, by the durable
+/// record (sealed only after a confirmed close) or the account just read.
+/// A close request alone is not terminal: its transaction may still fail.
+fn resource_cleanup_terminal(state: &ChannelState, onchain_status: Option<u8>) -> bool {
+    state.sealed || matches!(onchain_status, Some(STATUS_SEALED | STATUS_DISTRIBUTED))
 }
 
 fn cleanup_timestamp(state: &ChannelState, key: &str) -> Option<u64> {
@@ -2002,19 +1978,18 @@ fn record_resource_cleanup(
     state.extra.contains_key(RESOURCE_CLEANUP_COMPLETED_AT)
 }
 
+/// Release resources leased to a terminal channel. Returns whether the record
+/// may be dropped. Callers establish terminality first.
 async fn ensure_resource_cleanup(
     runtime: &SettlementRuntime,
     store: &RedisChannelStore,
     state: &ChannelState,
-    force: bool,
 ) -> Result<bool, JobError> {
     // Deployment sessions fund invocation service, not fleet-owned resources.
     if !channel::is_recorded_legacy(Some(state))? {
         return Ok(false);
     }
-    if (!force && !resource_cleanup_required(state, unix_now_millis()))
-        || !runtime.resource_cleaner.is_enabled()
-    {
+    if !runtime.resource_cleaner.is_enabled() {
         return Ok(true);
     }
     // A recorded completion is revalidated by a fresh provider scan before
@@ -2138,6 +2113,8 @@ struct ChannelInventorySnapshot {
 
 struct ReconcileResult {
     channel_id: String,
+    /// Status of the channel account this pass read, when it decoded one.
+    onchain_status: Option<u8>,
     candidate: Option<SettlementCandidate>,
     store_disposition: StoreDisposition,
     snapshot: ChannelInventorySnapshot,
@@ -2808,6 +2785,7 @@ async fn reconcile_channel(
     let absent_disposition = absent_onchain_store_disposition(&state);
     if absent_disposition == StoreDisposition::Keep {
         return Ok(ReconcileResult {
+            onchain_status: None,
             channel_id: state_channel_id,
             candidate: None,
             store_disposition: StoreDisposition::Keep,
@@ -2851,6 +2829,7 @@ async fn reconcile_channel(
                 StoreDisposition::Keep
             };
             return Ok(ReconcileResult {
+                onchain_status: None,
                 channel_id: state_channel_id,
                 candidate: None,
                 store_disposition,
@@ -2887,6 +2866,7 @@ async fn reconcile_channel(
 
     if onchain.channel.status == STATUS_DISTRIBUTED {
         return Ok(ReconcileResult {
+            onchain_status: Some(onchain.channel.status),
             channel_id: state_channel_id,
             candidate: None,
             store_disposition: if bound_config.is_some() {
@@ -2907,6 +2887,7 @@ async fn reconcile_channel(
 
     if state.sealed {
         return Ok(ReconcileResult {
+            onchain_status: Some(onchain.channel.status),
             channel_id: state_channel_id,
             candidate: None,
             store_disposition: StoreDisposition::Keep,
@@ -2940,6 +2921,7 @@ async fn reconcile_channel(
         )
         .await?;
         return Ok(ReconcileResult {
+            onchain_status: Some(onchain.channel.status),
             channel_id: state_channel_id,
             candidate,
             store_disposition: StoreDisposition::Keep,
@@ -2952,6 +2934,7 @@ async fn reconcile_channel(
 
     if state.cumulative == 0 {
         return Ok(ReconcileResult {
+            onchain_status: Some(onchain.channel.status),
             channel_id: state_channel_id,
             candidate: None,
             store_disposition: StoreDisposition::Keep,
@@ -2966,6 +2949,7 @@ async fn reconcile_channel(
         state.highest_voucher_expires_at,
     ) else {
         return Ok(ReconcileResult {
+            onchain_status: Some(onchain.channel.status),
             channel_id: state_channel_id,
             candidate: None,
             store_disposition: StoreDisposition::Keep,
@@ -2982,6 +2966,7 @@ async fn reconcile_channel(
             "latest unsettled voucher expired"
         );
         return Ok(ReconcileResult {
+            onchain_status: Some(onchain.channel.status),
             channel_id: state_channel_id,
             candidate: None,
             store_disposition: StoreDisposition::Keep,
@@ -2996,6 +2981,7 @@ async fn reconcile_channel(
         || onchain.channel.settlement.settled >= state.cumulative
     {
         return Ok(ReconcileResult {
+            onchain_status: Some(onchain.channel.status),
             channel_id: state_channel_id,
             candidate: None,
             store_disposition: StoreDisposition::Keep,
@@ -3034,6 +3020,7 @@ async fn reconcile_channel(
         &onchain.mint(),
     );
     Ok(ReconcileResult {
+        onchain_status: Some(onchain.channel.status),
         channel_id: state_channel_id,
         candidate: Some(SettlementCandidate {
             channel_id: state.channel_id,
@@ -4877,29 +4864,25 @@ mod tests {
     }
 
     #[test]
-    fn resource_cleanup_is_due_when_channel_is_spent_or_terminal() {
+    fn resource_cleanup_waits_for_a_terminal_channel() {
         let mut state = channel_state();
-        assert!(!resource_cleanup_required(&state, 1_000));
-
+        // An idle close intent, a frozen close amount and a spent deposit are
+        // all reversible until the close transaction lands.
         state.deposit = 10;
         state.cumulative = 10;
         state.lifecycle = Some(ChannelLifecycle {
             owner: "worker".into(),
             close_after: 1_250,
         });
-        assert!(!resource_cleanup_required(&state, 1_000));
-        assert!(resource_cleanup_required(&state, 1_250));
-
-        state.extra.insert(
-            RESOURCE_CLEANUP_COMPLETED_AT.into(),
-            serde_json::Value::from(1),
-        );
-        assert!(resource_cleanup_required(&state, 1_250));
-
-        state.extra.clear();
-        state.cumulative = 0;
         state.close_requested_at = Some(1);
-        assert!(resource_cleanup_required(&state, 1_000));
+        state.final_cumulative = Some(10);
+        for status in [None, Some(STATUS_OPEN), Some(STATUS_CLOSING)] {
+            assert!(!resource_cleanup_terminal(&state, status), "{status:?}");
+        }
+        assert!(resource_cleanup_terminal(&state, Some(STATUS_SEALED)));
+        assert!(resource_cleanup_terminal(&state, Some(STATUS_DISTRIBUTED)));
+        state.sealed = true;
+        assert!(resource_cleanup_terminal(&state, None));
     }
 
     #[test]
@@ -4928,7 +4911,6 @@ mod tests {
         assert!(!record_resource_cleanup(&mut state, 1_600, 500, 1));
         assert!(!state.extra.contains_key(RESOURCE_CLEANUP_COMPLETED_AT));
         assert!(!state.extra.contains_key(RESOURCE_CLEANUP_EMPTY_SINCE));
-        assert!(resource_cleanup_required(&state, 1_600));
 
         assert!(!record_resource_cleanup(&mut state, 1_700, 500, 0));
         assert!(!record_resource_cleanup(&mut state, 2_199, 500, 0));

@@ -144,15 +144,18 @@ and batch namespaces can progress independently.
 
 For legacy MPP sessions it cursor-scans the session namespace, skips sealed and
 pull-mode records, and fetches every candidate channel from Solana. If a
-push-channel account is already absent at confirmed commitment, the worker
-deletes its terminal Redis record after resource cleanup completes. For active
+push-channel account is absent, the worker deletes its Redis record only once a
+finalized read past `open_slot + OPEN_SLOT_WINDOW` (or the program's closed
+tombstone) proves it gone, and after resource cleanup completes. For active
 channels it submits a voucher only when the stored cumulative amount is
 strictly greater than the on-chain watermark. For idle channels it atomically
 claims the still-due Redis deadline, settles the latest voucher, seals, and
 distributes the channel.
 
 The same sweep garbage-collects provider resources leased to an MPP channel
-once it is spent, closing, sealed, or absent on-chain. Compute functions,
+once it is terminal: sealed or distributed on-chain, sealed in Redis after a
+confirmed close, or proven absent. A close request alone never triggers
+cleanup, since its transaction can still fail. Compute functions,
 schedule triggers, and managed document stores carry a one-way hash of the
 verified channel ID. Cleanup is provider-driver based and retry-safe. The
 store-backed close deadline prevents cleanup racing a top-up. The
