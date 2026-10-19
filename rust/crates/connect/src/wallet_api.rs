@@ -65,6 +65,12 @@ pub async fn sign_transaction(
         )
     })?;
     let amount_minor = transaction_spend_minor(&transaction, &tenant.pubkey)?;
+    // The reservation covers exactly this checked message.
+    let checked_message = transaction.message.serialize();
+    let wallet: Pubkey = tenant
+        .pubkey
+        .parse()
+        .map_err(|_| signing_denied("The hosted wallet address is invalid."))?;
     let reservation = state
         .tenants()
         .reserve_cli_transaction(&tenant, amount_minor)
@@ -76,6 +82,7 @@ pub async fn sign_transaction(
         .map_err(provider_error)?;
     let complete = matches!(result, solana_keychain::SignTransactionResult::Complete(_));
     let (transaction_b64, signature) = result.into_signed_transaction();
+    verify_signed(&checked_message, &wallet, &transaction_b64, &signature)?;
     reservation.commit();
     Ok(Json(SignTransactionResponse {
         transaction_b64,
@@ -239,6 +246,36 @@ fn transaction_spend_minor(
     Ok(total_raw.div_ceil(100).max(100))
 }
 
+/// The provider must have signed the exact message the policy checked, as the
+/// hosted wallet; anything else is discarded and its reservation released.
+fn verify_signed(
+    checked_message: &[u8],
+    wallet: &Pubkey,
+    transaction_b64: &str,
+    signature: &impl std::fmt::Display,
+) -> Result<(), ApiError> {
+    let mismatch = || provider_error("provider signed a different transaction");
+    let bytes = STANDARD.decode(transaction_b64).map_err(|_| mismatch())?;
+    let signed: VersionedTransaction = bincode::deserialize(&bytes).map_err(|_| mismatch())?;
+    if signed.message.serialize() != checked_message {
+        return Err(mismatch());
+    }
+    let index = signed
+        .message
+        .static_account_keys()
+        .iter()
+        .position(|key| key == wallet)
+        .ok_or_else(mismatch)?;
+    let signed_by_wallet = signed.signatures.get(index).is_some_and(|signed| {
+        signed.to_string() == signature.to_string()
+            && signed.verify(wallet.as_ref(), checked_message)
+    });
+    if !signed_by_wallet {
+        return Err(mismatch());
+    }
+    Ok(())
+}
+
 fn associated_token_address(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
     use pay_kit::mpp::protocol::solana::programs;
     let ata_program: Pubkey = programs::ASSOCIATED_TOKEN_PROGRAM
@@ -358,13 +395,19 @@ mod tests {
     use solana_message::{Message, MessageHeader, compiled_instruction::CompiledInstruction};
 
     fn payment_transaction(amount: u64) -> (VersionedTransaction, Pubkey) {
+        payment_from(Pubkey::new_unique(), Pubkey::new_unique(), amount)
+    }
+
+    fn payment_from(
+        signer: Pubkey,
+        destination: Pubkey,
+        amount: u64,
+    ) -> (VersionedTransaction, Pubkey) {
         use pay_kit::mpp::protocol::solana::{mints, programs};
 
-        let signer = Pubkey::new_unique();
         let mint: Pubkey = mints::USDC_MAINNET.parse().unwrap();
         let token_program: Pubkey = programs::TOKEN_PROGRAM.parse().unwrap();
         let source = associated_token_address(&signer, &mint, &token_program);
-        let destination = Pubkey::new_unique();
         let mut data = vec![12];
         data.extend_from_slice(&amount.to_le_bytes());
         data.push(6);
@@ -427,5 +470,67 @@ mod tests {
 
         let error = transaction_spend_minor(&transaction, &signer.to_string()).unwrap_err();
         assert_eq!(error.status, StatusCode::FORBIDDEN);
+    }
+
+    fn memory_wallet() -> pay_kit::solana_keychain::MemorySigner {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let mut keypair = [0u8; 64];
+        keypair[..32].copy_from_slice(key.as_bytes());
+        keypair[32..].copy_from_slice(key.verifying_key().as_bytes());
+        pay_kit::solana_keychain::MemorySigner::from_bytes(&keypair).unwrap()
+    }
+
+    async fn provider_sign(
+        wallet: &pay_kit::solana_keychain::MemorySigner,
+        mut transaction: VersionedTransaction,
+    ) -> (String, String) {
+        use pay_kit::solana_keychain::TransactionSigner;
+        let (b64, signature) = wallet
+            .sign_transaction(&mut transaction)
+            .await
+            .unwrap()
+            .into_signed_transaction();
+        (b64, signature.to_string())
+    }
+
+    #[tokio::test]
+    async fn signed_checked_message_is_accepted() {
+        use pay_kit::solana_keychain::SolanaSigner;
+        let wallet = memory_wallet();
+        let (transaction, signer) = payment_from(wallet.pubkey(), Pubkey::new_unique(), 10_000);
+        let checked = transaction.message.serialize();
+        transaction_spend_minor(&transaction, &signer.to_string()).unwrap();
+        let (b64, signature) = provider_sign(&wallet, transaction).await;
+        verify_signed(&checked, &signer, &b64, &signature).unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_signature_over_a_redirected_recipient_is_rejected() {
+        use pay_kit::solana_keychain::SolanaSigner;
+        let wallet = memory_wallet();
+        let (checked_tx, signer) = payment_from(wallet.pubkey(), Pubkey::new_unique(), 10_000);
+        let checked = checked_tx.message.serialize();
+        transaction_spend_minor(&checked_tx, &signer.to_string()).unwrap();
+        // Same amount and source, different destination.
+        let (redirected, _) = payment_from(wallet.pubkey(), Pubkey::new_unique(), 10_000);
+        let (b64, signature) = provider_sign(&wallet, redirected).await;
+        let error = verify_signed(&checked, &signer, &b64, &signature).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn unsigned_or_foreign_signature_is_rejected() {
+        use pay_kit::solana_keychain::SolanaSigner;
+        let wallet = memory_wallet();
+        let (transaction, signer) = payment_from(wallet.pubkey(), Pubkey::new_unique(), 10_000);
+        let checked = transaction.message.serialize();
+        let unsigned = STANDARD.encode(bincode::serialize(&transaction).unwrap());
+        let (_, signature) = provider_sign(&wallet, transaction.clone()).await;
+        assert!(verify_signed(&checked, &signer, &unsigned, &signature).is_err());
+        // A signature that verifies but is not the one in the transaction.
+        let (b64, _) = provider_sign(&wallet, transaction).await;
+        let other = wallet.sign_message(b"other").await.unwrap().to_string();
+        assert!(verify_signed(&checked, &signer, &b64, &other).is_err());
+        assert!(verify_signed(b"", &signer, &b64, &signature).is_err());
     }
 }
