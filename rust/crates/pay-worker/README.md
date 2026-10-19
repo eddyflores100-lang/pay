@@ -62,7 +62,7 @@ hand-copied program logic or account layout.
 | `SETTLEMENT_LOCK_TTL_SECONDS` | no | `300` | TTL for each scheme's independent reconciliation lease. |
 | `RUN_ONCE` | no | `true` | Keep one-shot behavior for manual Cloud Run Job executions. Set to `false` for the continuous worker. |
 | `SETTLEMENT_INTERVAL_SECONDS` | no | `10` | Delay between complete MPP and x402 reconciliation sweeps when `RUN_ONCE=false`. Set this to `240` for a four-minute x402 settlement clock. |
-| `PAY_RESOURCE_CLEANUP_DRIVERS` | no | empty | Comma-separated cleanup drivers: `google-cloud-functions`, `gcp-firestore`. Unknown entries fail startup instead of silently leaking resources. |
+| `PAY_RESOURCE_CLEANUP_DRIVERS` | yes | — | Comma-separated cleanup drivers for every resource-backed service: `google-cloud-functions`, `gcp-firestore`, `google-cloud-scheduler`, or exactly `none` when no service leases resources to channels. Unset, empty, unknown or duplicate entries fail startup instead of silently leaking resources. |
 | `PAY_RESOURCE_CLEANUP_INTERVAL_SECONDS` | no | `60` | Minimum delay between provider cleanup scans for one channel. |
 | `PAY_RESOURCE_CLEANUP_QUIET_SECONDS` | no | `7200` | Repeated-empty-scan window before the Redis retry anchor may be removed. |
 

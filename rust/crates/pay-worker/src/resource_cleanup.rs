@@ -81,17 +81,14 @@ impl ResourceCleaner {
         }
     }
 
-    /// Build exactly the configured provider drivers. An unknown or
-    /// misconfigured driver aborts startup so production cannot silently leak
-    /// resources after a channel becomes unusable.
+    /// Build exactly the configured provider drivers. An unset, empty, unknown
+    /// or misconfigured list aborts startup so production cannot silently leak
+    /// resources after a channel becomes unusable: a deployment without
+    /// resource-backed services must say so with `none`.
     pub async fn from_env() -> Result<Self, JobError> {
-        let configured = std::env::var("PAY_RESOURCE_CLEANUP_DRIVERS").unwrap_or_default();
+        let configured = std::env::var("PAY_RESOURCE_CLEANUP_DRIVERS").ok();
         let mut cleaner = Self::default();
-        for driver in configured
-            .split(',')
-            .map(str::trim)
-            .filter(|driver| !driver.is_empty())
-        {
+        for driver in parse_driver_list(configured.as_deref())? {
             match driver {
                 COMPUTE_DRIVER => cleaner.compute.push(Arc::new(
                     GoogleCloudFunctionsDriver::new(
@@ -164,6 +161,47 @@ impl ResourceCleaner {
             None => Ok(summary),
         }
     }
+}
+
+/// Explicit declaration that no resource-backed service uses this worker.
+const NO_DRIVERS: &str = "none";
+
+/// The configured cleanup drivers. Cleanup cannot be disabled by omission,
+/// since an empty set lets the worker drop a channel's retry anchor while its
+/// resources live on.
+fn parse_driver_list(configured: Option<&str>) -> Result<Vec<&str>, JobError> {
+    let required = || {
+        JobError::Config(format!(
+            "PAY_RESOURCE_CLEANUP_DRIVERS is required: list the cleanup driver of every \
+             resource-backed service ({COMPUTE_DRIVER}, {DATA_DRIVER}, {TRIGGER_DRIVER}) \
+             or `{NO_DRIVERS}`"
+        ))
+    };
+    let drivers = configured
+        .ok_or_else(required)?
+        .split(',')
+        .map(str::trim)
+        .filter(|driver| !driver.is_empty())
+        .collect::<Vec<_>>();
+    if drivers.is_empty() {
+        return Err(required());
+    }
+    if drivers.contains(&NO_DRIVERS) {
+        if drivers.len() != 1 {
+            return Err(JobError::Config(format!(
+                "PAY_RESOURCE_CLEANUP_DRIVERS `{NO_DRIVERS}` cannot be combined with drivers"
+            )));
+        }
+        return Ok(Vec::new());
+    }
+    for (index, driver) in drivers.iter().enumerate() {
+        if drivers[..index].contains(driver) {
+            return Err(JobError::Config(format!(
+                "duplicate PAY_RESOURCE_CLEANUP_DRIVERS entry: {driver}"
+            )));
+        }
+    }
+    Ok(drivers)
 }
 
 #[cfg(test)]
@@ -345,6 +383,28 @@ mod tests {
                 trigger_resources: 2,
                 ..Default::default()
             }
+        );
+    }
+
+    #[test]
+    fn cleanup_drivers_must_be_declared_explicitly() {
+        for missing in [None, Some(""), Some(" , ")] {
+            assert!(
+                parse_driver_list(missing)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("is required"),
+                "{missing:?}"
+            );
+        }
+        assert!(parse_driver_list(Some("none")).unwrap().is_empty());
+        assert!(parse_driver_list(Some(" none ")).unwrap().is_empty());
+        assert!(parse_driver_list(Some("none,gcp-firestore")).is_err());
+        assert!(parse_driver_list(Some("gcp-firestore,gcp-firestore")).is_err());
+        assert_eq!(
+            parse_driver_list(Some("google-cloud-functions, google-cloud-scheduler")).unwrap(),
+            vec![COMPUTE_DRIVER, TRIGGER_DRIVER]
         );
     }
 

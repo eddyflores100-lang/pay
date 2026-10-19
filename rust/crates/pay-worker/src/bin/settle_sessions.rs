@@ -1989,6 +1989,7 @@ async fn ensure_resource_cleanup(
     if !channel::is_recorded_legacy(Some(state))? {
         return Ok(false);
     }
+    // Only an explicit `PAY_RESOURCE_CLEANUP_DRIVERS=none` disables cleanup.
     if !runtime.resource_cleaner.is_enabled() {
         return Ok(true);
     }
