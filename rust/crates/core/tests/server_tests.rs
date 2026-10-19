@@ -788,6 +788,93 @@ async fn middleware_accepts_session_voucher_then_close() {
     assert_eq!(body["status"], "closed");
 }
 
+/// Seed a confirmed client-signed channel for `challenge` and return a handle
+/// that signs its vouchers.
+async fn seed_client_session(
+    store: &Arc<dyn pay_kit::mpp::store::ChannelStore>,
+    challenge: &pay_kit::mpp::PaymentChallenge,
+) -> pay_core::session::SessionHandle {
+    let channel = solana_pubkey::Pubkey::new_unique();
+    let key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+    let mut kp = [0u8; 64];
+    kp[..32].copy_from_slice(key.as_bytes());
+    kp[32..].copy_from_slice(key.verifying_key().as_bytes());
+    let signer: Box<dyn pay_kit::mpp::solana_keychain::TransactionSigner> =
+        Box::new(pay_kit::mpp::solana_keychain::memory::MemorySigner::from_bytes(&kp).unwrap());
+    store
+        .put_channel(
+            &channel.to_string(),
+            pay_core::server::session::test_channel_state(
+                channel.to_string(),
+                1_000_000,
+                signer.pubkey().to_string(),
+                "client",
+                &challenge.id,
+                solana_pubkey::Pubkey::new_unique().to_string(),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    pay_core::session::SessionHandle::new(channel, signer, challenge.clone()).with_voucher_key(key)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn middleware_never_forwards_a_replayed_session_voucher() {
+    let (url, _h, store) = start_session_server().await;
+    let client = reqwest::Client::new();
+    let send = |authorization: Option<String>| {
+        let mut request = client
+            .post(format!("{url}/v1/simple/echo"))
+            .headers(client_with_host("testapi"))
+            .body("{}");
+        if let Some(authorization) = authorization {
+            request = request.header("authorization", authorization);
+        }
+        request.send()
+    };
+    let challenge_resp = send(None).await.unwrap();
+    let challenge = pay_kit::mpp::parse_www_authenticate(
+        challenge_resp
+            .headers()
+            .get("www-authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let price: u64 = challenge
+        .request
+        .decode::<pay_kit::mpp::SessionRequest>()
+        .unwrap()
+        .amount
+        .parse()
+        .unwrap();
+    let handle = seed_client_session(&store, &challenge).await;
+
+    let voucher = handle.voucher_header(price).await.unwrap();
+    assert_eq!(send(Some(voucher.clone())).await.unwrap().status(), 200);
+    for _ in 0..2 {
+        let replay = send(Some(voucher.clone())).await.unwrap();
+        assert_eq!(
+            replay.status(),
+            402,
+            "an exact replay must not reach upstream"
+        );
+        let body: serde_json::Value = replay.json().await.unwrap();
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("already accepted")),
+            "{body}"
+        );
+    }
+
+    // The next request is paid by a fresh voucher.
+    let next = handle.voucher_header(price).await.unwrap();
+    assert_eq!(send(Some(next)).await.unwrap().status(), 200);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn middleware_garbage_auth_includes_message() {
     let (url, _h) = start_test_server(true).await;
