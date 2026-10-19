@@ -224,6 +224,22 @@ fn reconcile_session_via_balances(
     let Some(session) = receipt.session.as_mut() else {
         return;
     };
+    // Infer channel lifecycle from the action when the on-chain state isn't
+    // available (e.g. account already closed).
+    session.channel_status = Some(match session.action.as_str() {
+        "open" | "topUp" => WireChannelStatus::Open,
+        "requestClose" => WireChannelStatus::Closing,
+        "seal" | "settleAndSeal" | "withdrawPayer" => WireChannelStatus::Sealed,
+        "settle" | "distribute" => WireChannelStatus::Open,
+        _ => WireChannelStatus::Unknown,
+    });
+    // Only payouts leave the channel; open / topUp legs are deposits.
+    if !matches!(
+        session.action.as_str(),
+        "settle" | "settleAndSeal" | "distribute" | "seal" | "requestClose" | "withdrawPayer"
+    ) {
+        return;
+    }
     let operator = receipt.fee_payer.clone();
     let payer_wallet = payer.map(|payer| payer.wallet.clone());
 
@@ -287,9 +303,7 @@ fn reconcile_session_via_balances(
     }
     session.payer = payer_wallet.clone();
     // For settle / seal / distribute, the wallet receiving the operator's
-    // leg is the fee_payer — they signed the transaction. For open / topUp
-    // the original `build_session` value already represents the channel-ATA
-    // owner, which is the channel PDA; leave it untouched in that case.
+    // leg is the fee_payer — they signed the transaction.
     let action_acts_as_operator = matches!(
         session.action.as_str(),
         "settle" | "settleAndSeal" | "distribute" | "seal" | "requestClose"
@@ -338,16 +352,6 @@ fn reconcile_session_via_balances(
             }
         })
         .collect();
-
-    // Infer channel lifecycle from the action when the on-chain state isn't
-    // available (e.g. account already closed).
-    session.channel_status = Some(match session.action.as_str() {
-        "open" | "topUp" => WireChannelStatus::Open,
-        "requestClose" => WireChannelStatus::Closing,
-        "seal" | "settleAndSeal" | "withdrawPayer" => WireChannelStatus::Sealed,
-        "settle" | "distribute" => WireChannelStatus::Open,
-        _ => WireChannelStatus::Unknown,
-    });
 }
 
 fn attach_channel_state(receipt: &mut Receipt, channel: &ChannelState) {
@@ -2622,6 +2626,62 @@ mod tests {
         }));
         assert_eq!(receipt.transfers[0].receiver, "Merchant_ATA");
         assert_eq!(receipt.transfers[0].sender, "PayerWallet");
+    }
+
+    #[tokio::test]
+    async fn open_deposit_is_not_reported_as_a_refund() {
+        let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        let rpc = crate::test_rpc::StubRpc::start().await;
+        for (disc, action) in [(1u8, "open"), (3u8, "topUp")] {
+            let value = json!({
+                "slot": 100,
+                "blockTime": 1_700_000_000_i64,
+                "meta": {
+                    "err": null,
+                    "fee": 5000_u64,
+                    "innerInstructions": [{
+                        "index": 0,
+                        "instructions": [token_transfer("PayerWallet", "ChannelATA", mint, "5000000", 6)]
+                    }],
+                    "postTokenBalances": [{
+                        "accountIndex": 2,
+                        "owner": "ChannelPDA",
+                        "mint": mint,
+                        "uiTokenAmount": {"amount": "5000000", "decimals": 6}
+                    }]
+                },
+                "transaction": {"message": {
+                    "accountKeys": [
+                        {"pubkey": "OperatorWallet", "signer": true},
+                        {"pubkey": "PayerWallet"},
+                        {"pubkey": "ChannelATA"}
+                    ],
+                    "instructions": [{
+                        "programId": PAYMENT_CHANNELS_PROGRAM,
+                        "accounts": ["OperatorWallet", "ChannelPDA", "PayerWallet", "ChannelATA"],
+                        "data": bs58::encode([disc]).into_string()
+                    }]
+                }}
+            });
+            let receipt = build_receipt(
+                &RpcClient::new(std::time::Duration::from_secs(5)).unwrap(),
+                &rpc.url,
+                "sig",
+                Network::Sandbox,
+                &value,
+                &[],
+            )
+            .await
+            .unwrap();
+            let session = receipt.session.unwrap();
+            assert_eq!(session.action, action);
+            assert_eq!(session.deposit.unwrap().raw_amount, "5000000");
+            assert!(session.refunded.is_none(), "{action}");
+            assert!(session.consumed.is_none(), "{action}");
+            assert_eq!(session.events[0].kind, "deposit");
+            assert_eq!(session.payer.as_deref(), Some("PayerWallet"));
+            assert_eq!(session.channel_status, Some(WireChannelStatus::Open));
+        }
     }
 
     // ── Plain transfer / SOL / Token-2022 ─────────────────────────────────
