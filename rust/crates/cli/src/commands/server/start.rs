@@ -251,6 +251,12 @@ async fn batch_channel_store()
     .await
 }
 
+/// Accepted batch vouchers live only in the channel store, so a restart of a
+/// memory store would re-serve them. Only local test clusters may run that way.
+fn batch_requires_durable_store(network: &SolanaNetwork, deployment_policy_mode: bool) -> bool {
+    deployment_policy_mode || !matches!(network, SolanaNetwork::Devnet | SolanaNetwork::Localnet)
+}
+
 /// The gateway owns session close/settlement until a separately deployed
 /// durable-store reconciler exists. Redis still persists lifecycle deadlines;
 /// embedded reconciliation ensures those deadlines are actually processed by
@@ -2379,8 +2385,22 @@ impl StartCommand {
                 })
             });
             let x402_batch = match (wants_batch, fee_payer_signer.clone()) {
-                (true, Some(signer)) => {
+                (true, Some(signer)) => 'batch: {
                     let (batch_store, durable_batch_store) = batch_channel_store().await?;
+                    if !durable_batch_store
+                        && batch_requires_durable_store(&network, deployment_policy_mode)
+                    {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                "x402 batch-settlement disabled: {} payments need a durable \
+                                 channel store; set PAY_X402_REDIS_URL",
+                                network.slug()
+                            )
+                            .yellow()
+                        );
+                        break 'batch None;
+                    }
                     if !durable_batch_store {
                         eprintln!(
                             "{}",
@@ -4130,6 +4150,31 @@ mod tests {
     use solana_pubkey::Pubkey;
     use std::collections::HashMap;
     use std::str::FromStr;
+
+    #[test]
+    fn batch_settlement_needs_a_durable_store_outside_test_clusters() {
+        use crate::network::SolanaNetwork;
+        assert!(super::batch_requires_durable_store(
+            &SolanaNetwork::Mainnet,
+            false
+        ));
+        assert!(super::batch_requires_durable_store(
+            &SolanaNetwork::Unknown("custom".into()),
+            false
+        ));
+        assert!(super::batch_requires_durable_store(
+            &SolanaNetwork::Devnet,
+            true
+        ));
+        assert!(!super::batch_requires_durable_store(
+            &SolanaNetwork::Devnet,
+            false
+        ));
+        assert!(!super::batch_requires_durable_store(
+            &SolanaNetwork::Localnet,
+            false
+        ));
+    }
 
     #[tokio::test]
     #[serial]

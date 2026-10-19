@@ -632,7 +632,7 @@ fn view_of(state: &SellState, entry: &EndpointEntry, owner_token: Option<String>
         chat_completions_url: format!("{}/{}", state.public_url, sale.chat_path()),
         model: sale.model.clone(),
         pricing: PricingInput::from(&sale.pricing),
-        schemes: sale.pricing.schemes(),
+        schemes: state.operator.schemes(&sale.pricing),
         recipient: sale.recipient.clone(),
         network: sale.network.clone(),
         currencies: sale.currencies.clone(),
@@ -1315,7 +1315,8 @@ mod tests {
         keypair[..32].copy_from_slice(sk.as_bytes());
         keypair[32..].copy_from_slice(sk.verifying_key().as_bytes());
         let signer = pay_kit::solana_keychain::MemorySigner::from_bytes(&keypair).unwrap();
-        let operator = Operator::new(Arc::new(signer), "http://127.0.0.1:1", SECRET);
+        let operator = Operator::new(Arc::new(signer), "http://127.0.0.1:1", SECRET)
+            .with_batch_store(Arc::new(pay_kit::core::store::MemoryChannelStore::new()));
         // No RPC in tests: challenges read this cached blockhash.
         operator
             .blockhashes

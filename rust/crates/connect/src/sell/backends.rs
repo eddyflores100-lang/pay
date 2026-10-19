@@ -12,6 +12,7 @@ use std::sync::Arc;
 use pay_core::PaymentState;
 use pay_core::sell_inference::SellInference;
 use pay_core::server::session::SessionMpp;
+use pay_kit::core::store::ChannelStore;
 use pay_kit::mpp::blockhash::BlockhashCache;
 use pay_kit::mpp::server::Mpp;
 use pay_kit::solana_keychain::TransactionSigner;
@@ -47,6 +48,10 @@ pub struct Operator {
     pub challenge_binding_secret: String,
     /// Shared by every backend; refreshed by [`Operator::spawn_blockhash_refresh`].
     pub blockhashes: BlockhashCache,
+    /// Durable store for x402 `batch-settlement` vouchers, shared by every
+    /// endpoint. Accepted vouchers exist only here, so without one the
+    /// scheme is not offered.
+    pub batch_store: Option<Arc<dyn ChannelStore>>,
 }
 
 impl Operator {
@@ -60,7 +65,23 @@ impl Operator {
             rpc_url: rpc_url.into(),
             challenge_binding_secret: challenge_binding_secret.into(),
             blockhashes: BlockhashCache::new(),
+            batch_store: None,
         }
+    }
+
+    /// Offer x402 `batch-settlement`, recording vouchers in `store`.
+    pub fn with_batch_store(mut self, store: Arc<dyn ChannelStore>) -> Self {
+        self.batch_store = Some(store);
+        self
+    }
+
+    /// The schemes `pricing` is offered under by this deployment.
+    pub fn schemes(&self, pricing: &pay_core::sell_inference::SellPricing) -> Vec<Scheme> {
+        pricing
+            .schemes()
+            .into_iter()
+            .filter(|scheme| *scheme != Scheme::X402BatchSettlement || self.batch_store.is_some())
+            .collect()
     }
 
     /// `None` when none of the variables is set. All three are required
@@ -174,7 +195,16 @@ impl EndpointBackends {
         if !problems.is_empty() {
             return Err(problems.join("; "));
         }
-        let schemes = sale.pricing.schemes();
+        let schemes = operator.schemes(&sale.pricing);
+        let mut api = sale.api_spec();
+        for meter in api.endpoints.iter_mut().filter_map(|e| e.metering.as_mut()) {
+            if let Some(accepted) = &mut meter.schemes {
+                accepted.retain(|scheme| schemes.contains(scheme));
+            }
+        }
+        if !schemes.contains(&Scheme::X402BatchSettlement) {
+            api.batch_settlement = None;
+        }
         let network = sale.network.as_str();
         let rpc_url = Some(operator.rpc_url.clone());
         let mints: Vec<String> = sale
@@ -317,7 +347,10 @@ impl EndpointBackends {
             None
         };
 
-        let batch = if schemes.contains(&Scheme::X402BatchSettlement) {
+        let batch = if let (true, Some(store)) = (
+            schemes.contains(&Scheme::X402BatchSettlement),
+            operator.batch_store.clone(),
+        ) {
             let mut cfg = pay_kit::x402::server::BatchConfig::new(
                 &sale.recipient,
                 network,
@@ -331,7 +364,7 @@ impl EndpointBackends {
             // The buyer may force-close and recover unspent escrow after this
             // long; the scheme bounds it to 15 minutes .. 30 days.
             cfg.withdraw_delay = pay_kit::x402::batch_settlement::MIN_WITHDRAW_DELAY_SECONDS;
-            let batch = X402BatchSettlement::new(cfg)
+            let batch = X402BatchSettlement::with_store(cfg, store)
                 .map_err(|e| format!("x402 batch-settlement backend: {e}"))?;
             Some(Arc::new(batch))
         } else {
@@ -339,7 +372,7 @@ impl EndpointBackends {
         };
 
         Ok(Self {
-            apis: Arc::new(vec![sale.api_spec()]),
+            apis: Arc::new(vec![api]),
             charge: Arc::new(charge),
             sessions: Arc::new(sessions),
             upto,
@@ -422,6 +455,57 @@ mod tests {
     }
 
     #[test]
+    fn batch_settlement_is_not_offered_without_a_durable_store() {
+        let mut bare = operator();
+        bare.batch_store = None;
+        let pricing = SellPricing::PerRequest { usd: 0.02 };
+        assert!(
+            !bare
+                .schemes(&pricing)
+                .contains(&Scheme::X402BatchSettlement)
+        );
+        assert!(
+            operator()
+                .schemes(&pricing)
+                .contains(&Scheme::X402BatchSettlement)
+        );
+        let backends =
+            EndpointBackends::build(&sale(pricing), &bare, "https://connect.test").unwrap();
+        assert!(backends.x402_batch().is_none());
+        assert!(backends.spec().batch_settlement.is_none());
+        let meter = backends
+            .spec()
+            .endpoints
+            .iter()
+            .find_map(|endpoint| endpoint.metering.as_ref())
+            .unwrap();
+        assert!(
+            !meter
+                .accepted_schemes()
+                .contains(&Scheme::X402BatchSettlement)
+        );
+        assert!(meter.accepted_schemes().contains(&Scheme::MppSession));
+    }
+
+    #[test]
+    fn rebuilt_backends_share_the_operators_batch_store() {
+        let operator = operator();
+        let pricing = SellPricing::PerRequest { usd: 0.02 };
+        let first =
+            EndpointBackends::build(&sale(pricing.clone()), &operator, "https://connect.test")
+                .unwrap();
+        let repriced = EndpointBackends::build(
+            &sale(SellPricing::PerRequest { usd: 0.03 }),
+            &operator,
+            "https://connect.test",
+        )
+        .unwrap();
+        let store = operator.batch_store.as_ref().unwrap();
+        assert!(Arc::ptr_eq(first.x402_batch().unwrap().store(), store));
+        assert!(Arc::ptr_eq(repriced.x402_batch().unwrap().store(), store));
+    }
+
+    #[test]
     fn streaming_view_keeps_channel_backends_but_removes_upto() {
         let backends = EndpointBackends::build(
             &sale(SellPricing::PerRequest { usd: 0.02 }),
@@ -462,7 +546,8 @@ mod tests {
             Arc::new(signer),
             "http://127.0.0.1:1",
             "0123456789abcdef0123456789abcdef0123456789abcdef",
-        );
+        )
+        .with_batch_store(Arc::new(pay_kit::core::store::MemoryChannelStore::new()));
         operator
             .blockhashes
             .set("11111111111111111111111111111111".into(), 1_000, 1);
