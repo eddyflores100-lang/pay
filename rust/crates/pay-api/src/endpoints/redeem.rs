@@ -1056,7 +1056,7 @@ fn err_resp_with_extra(status: StatusCode, message: &str, extra: serde_json::Val
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{ClaimState, RedemptionGrant, RedemptionState, redemption_claim_key};
     use crate::config::{RedemptionCampaignConfig, RedemptionConfig};
     use solana_pubkey::Pubkey;
@@ -1159,7 +1159,7 @@ mod tests {
         assert_eq!(key, redemption_claim_key("SECRET-CODE-123"));
     }
 
-    mod flow {
+    pub(crate) mod flow {
         use std::collections::HashMap;
         use std::process::{Child, Command, Stdio};
         use std::sync::{Arc, Mutex};
@@ -1182,7 +1182,7 @@ mod tests {
         };
         use crate::state::AppState;
 
-        pub(super) struct RedisProcess(Child, pub(super) u16);
+        pub(crate) struct RedisProcess(Child, pub(crate) u16);
 
         impl Drop for RedisProcess {
             fn drop(&mut self) {
@@ -1192,7 +1192,7 @@ mod tests {
         }
 
         /// Spawn a throwaway redis-server, or `None` when it isn't installed.
-        pub(super) async fn spawn_redis() -> Option<RedisProcess> {
+        pub(crate) async fn spawn_redis() -> Option<RedisProcess> {
             let port = std::net::TcpListener::bind("127.0.0.1:0")
                 .ok()?
                 .local_addr()
