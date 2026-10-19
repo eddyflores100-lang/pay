@@ -1748,6 +1748,7 @@ pub fn validate_api_spec(spec: &ApiSpec) -> Vec<String> {
             &mut errs,
         );
         validate_price_precision(metering, path, &mut errs);
+        validate_upto_ceiling(metering, path, &mut errs);
     }
 
     // Channel distribution splits from a top-level `session:` block.
@@ -2459,6 +2460,25 @@ fn validate_session_splits(
             "session splits must leave a positive primary recipient share (total < 100%)"
                 .to_string(),
         );
+    }
+}
+
+/// A multi-dimension `x402-upto` endpoint needs an explicit `upto.max_usd`:
+/// no single dimension's unit price bounds the summed usage.
+fn validate_upto_ceiling(metering: &Metering, path: &str, errs: &mut Vec<String>) {
+    let multi_dimensional =
+        metering.dimensions.len() > 1 || metering.variants.iter().any(|v| v.dimensions.len() > 1);
+    if multi_dimensional
+        && metering.accepted_schemes().contains(&Scheme::X402Upto)
+        && metering
+            .upto
+            .as_ref()
+            .and_then(|upto| upto.max_usd)
+            .is_none()
+    {
+        errs.push(format!(
+            "endpoint `{path}`: x402-upto with several pricing dimensions requires `upto.max_usd`"
+        ));
     }
 }
 
@@ -4306,6 +4326,47 @@ endpoints:
                 .any(|e| e.contains("`v1/multi`") && e.contains("single pricing dimension")),
             "{errs:?}"
         );
+    }
+
+    #[test]
+    fn validate_upto_requires_explicit_ceiling_for_multiple_dimensions() {
+        let yaml = |upto: &str| {
+            format!(
+                r#"
+name: t
+subdomain: t
+title: T
+description: T
+category: data
+version: v1
+routing: {{type: respond}}
+endpoints:
+  - method: POST
+    path: v1/paid
+    metering:
+      schemes: [x402-upto]
+{upto}
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers: [{{price_usd: 0.01}}]
+        - direction: output
+          unit: bytes
+          scale: 1
+          meter: {{source: response_header, header: x-usage-bytes}}
+          tiers: [{{price_usd: 1.00}}]
+"#
+            )
+        };
+        let implicit: ApiSpec = serde_yml::from_str(&yaml("")).unwrap();
+        let errs = validate_api_spec(&implicit);
+        assert!(
+            errs.iter().any(|e| e.contains("requires `upto.max_usd`")),
+            "{errs:?}"
+        );
+        let explicit: ApiSpec = serde_yml::from_str(&yaml("      upto: {max_usd: 2.0}")).unwrap();
+        assert!(validate_api_spec(&explicit).is_empty());
     }
 
     #[test]

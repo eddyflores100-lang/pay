@@ -980,8 +980,13 @@ impl<S: PaymentState> PaymentGate<S> {
             // configs, or the legacy metered charge for older configs. The
             // client funds a channel with this as the deposit; settlement later
             // debits actual usage and refunds the rest.
-            let amount = format!("{}", metering::upto_max_usd(meter, price.as_ref()));
-            match upto.payment_required_header(&amount) {
+            let amount = metering::upto_max_usd(meter, price.as_ref())
+                .map(|usd| format!("{usd}"))
+                .ok_or_else(|| "x402-upto with several dimensions requires upto.max_usd".into());
+            match amount.and_then(|amount| {
+                upto.payment_required_header(&amount)
+                    .map_err(|e| e.to_string())
+            }) {
                 Ok((name, value)) => {
                     if let (Ok(n), Ok(v)) = (
                         HeaderName::from_bytes(name.as_bytes()),
@@ -992,7 +997,7 @@ impl<S: PaymentState> PaymentGate<S> {
                     }
                 }
                 Err(e) => {
-                    telemetry::record_challenge_error("x402/upto", "configured", &e.to_string());
+                    telemetry::record_challenge_error("x402/upto", "configured", &e);
                 }
             }
         }
@@ -1193,7 +1198,15 @@ impl<S: PaymentState> PaymentGate<S> {
         };
         let variant = variant_hint_from_path(path);
         let price = metering::resolve_price(meter, &props, variant.as_deref(), None);
-        let amount = format!("{}", metering::upto_max_usd(meter, price.as_ref()));
+        let Some(ceiling) = metering::upto_max_usd(meter, price.as_ref()) else {
+            return GateDecision::Respond(GateResponse::json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Bytes::from_static(
+                    br#"{"error":"payment_configuration_error","message":"x402-upto with several dimensions requires upto.max_usd"}"#,
+                ),
+            ));
+        };
+        let amount = format!("{ceiling}");
         match upto.verify_open(pay_header, &amount).await {
             Ok(open) => {
                 let ceiling_usd: f64 = amount.parse().unwrap_or(0.0);

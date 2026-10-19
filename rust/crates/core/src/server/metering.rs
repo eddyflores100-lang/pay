@@ -284,17 +284,18 @@ pub fn effective_dimensions<'a>(
     &metering.dimensions
 }
 
-pub fn upto_max_usd(metering: &Metering, resolved_price: Option<&ResolvedPrice>) -> f64 {
-    metering
-        .upto
-        .as_ref()
-        .and_then(|upto| upto.max_usd)
-        .or_else(|| {
-            resolved_price
-                .and_then(|p| p.dimensions.first())
-                .map(|d| d.price_usd / d.scale.max(1) as f64)
-        })
-        .unwrap_or(0.01)
+/// The authorized `x402-upto` ceiling: `upto.max_usd`, or the legacy
+/// single-dimension unit price. `None` when several dimensions are priced
+/// without an explicit ceiling, since no one unit price bounds their sum.
+pub fn upto_max_usd(metering: &Metering, resolved_price: Option<&ResolvedPrice>) -> Option<f64> {
+    if let Some(max_usd) = metering.upto.as_ref().and_then(|upto| upto.max_usd) {
+        return Some(max_usd);
+    }
+    match resolved_price.map(|p| p.dimensions.as_slice()) {
+        Some([d]) => Some(d.price_usd / d.scale.max(1) as f64),
+        Some([]) | None => Some(0.01),
+        Some(_) => None,
+    }
 }
 
 pub fn upto_min_usd(metering: &Metering) -> Option<f64> {
@@ -1898,7 +1899,7 @@ mod tests {
         );
         let price = resolve_price(&metering, &RequestProperties::default(), None, None);
 
-        assert_eq!(upto_max_usd(&metering, price.as_ref()), 0.10);
+        assert_eq!(upto_max_usd(&metering, price.as_ref()), Some(0.10));
     }
 
     #[test]
@@ -1915,7 +1916,7 @@ mod tests {
         );
         let price = resolve_price(&metering, &RequestProperties::default(), None, None);
 
-        assert_eq!(upto_max_usd(&metering, price.as_ref()), 0.00002);
+        assert_eq!(upto_max_usd(&metering, price.as_ref()), Some(0.00002));
     }
 
     #[test]
@@ -3111,5 +3112,38 @@ mod tests {
             per_call_usd(&resolve_price(&metering, &props, None, None).unwrap()),
             0.01
         );
+    }
+
+    #[test]
+    fn upto_max_usd_requires_explicit_ceiling_for_multiple_dimensions() {
+        let dims = || {
+            vec![
+                usage_dim(MeterDirection::Usage, BillingUnit::Requests, 1, 0.01, None),
+                usage_dim(
+                    MeterDirection::Output,
+                    BillingUnit::Bytes,
+                    1,
+                    1.00,
+                    Some(UsageMeter {
+                        source: UsageMeterSource::ResponseHeader,
+                        path: None,
+                        header: Some("x-usage-bytes".into()),
+                    }),
+                ),
+            ]
+        };
+        let implicit = upto_metering(dims(), None);
+        let price = resolve_price(&implicit, &RequestProperties::default(), None, None);
+        assert_eq!(upto_max_usd(&implicit, price.as_ref()), None);
+
+        let explicit = upto_metering(
+            dims(),
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(2.0),
+                ..Default::default()
+            }),
+        );
+        let price = resolve_price(&explicit, &RequestProperties::default(), None, None);
+        assert_eq!(upto_max_usd(&explicit, price.as_ref()), Some(2.0));
     }
 }
