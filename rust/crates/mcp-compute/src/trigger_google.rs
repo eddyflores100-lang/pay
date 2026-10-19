@@ -307,6 +307,7 @@ return redis.call('HINCRBY', KEYS[1], 'remaining', -1)
             )
             .await?;
         require_owner(&value, tenant)?;
+        require_funding_channel(&value, tenant)?;
         Ok((region.into(), value))
     }
 
@@ -586,7 +587,10 @@ impl TriggerDriver for GoogleTriggerDriver {
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .filter(|value| require_owner(value, tenant).is_ok())
+            .filter(|value| {
+                require_owner(value, tenant).is_ok()
+                    && require_funding_channel(value, tenant).is_ok()
+            })
             .filter_map(|value| trigger_from_value(value, region).ok())
             .collect();
         Ok(TriggerList {
@@ -822,6 +826,22 @@ fn require_channel(value: &Value, expected: &str) -> Result<()> {
     } else {
         Err(TriggerError::InvalidRequest(
             "an existing trigger cannot move between funding channels".into(),
+        ))
+    }
+}
+
+/// Every control operation is scoped to the channel lease that funds the job.
+fn require_funding_channel(value: &Value, tenant: &Tenant) -> Result<()> {
+    let marker = format!("pay-channel={};", lease_key(&tenant.channel_id)?);
+    if value
+        .get("description")
+        .and_then(Value::as_str)
+        .is_some_and(|description| description.contains(&marker))
+    {
+        Ok(())
+    } else {
+        Err(TriggerError::InvalidRequest(
+            "trigger is funded by a different payment channel".into(),
         ))
     }
 }
@@ -1130,6 +1150,30 @@ mod tests {
         });
         assert!(require_channel(&value, "old").is_ok());
         assert!(require_channel(&value, "new").is_err());
+    }
+
+    #[test]
+    fn control_operations_require_the_funding_channel() {
+        let owner = Tenant {
+            payer: "payer".into(),
+            key: "0123456789abcdef".into(),
+            channel_id: "channelA".into(),
+        };
+        let value = json!({
+            "description": format!(
+                "managed-by=mcp-compute;resource=trigger;pay-tenant={};pay-channel={};pay-name=weather",
+                owner.key,
+                lease_key("channelA").unwrap()
+            )
+        });
+        assert!(require_funding_channel(&value, &owner).is_ok());
+        let mut sibling = owner.clone();
+        sibling.channel_id = "channelB".into();
+        assert!(require_owner(&value, &sibling).is_ok());
+        assert!(require_funding_channel(&value, &sibling).is_err());
+        sibling.channel_id = String::new();
+        assert!(require_funding_channel(&value, &sibling).is_err());
+        assert!(require_funding_channel(&json!({}), &owner).is_err());
     }
 
     #[test]

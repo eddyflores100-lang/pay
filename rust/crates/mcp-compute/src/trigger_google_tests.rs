@@ -434,3 +434,65 @@ async fn trigger_updates_preserve_the_remaining_prepaid_budget() {
         Some(PREPAID_RUNS.into())
     );
 }
+
+#[tokio::test]
+#[ignore = "requires redis-server on PATH; run with --ignored"]
+async fn trigger_control_is_scoped_to_the_funding_channel() {
+    let mut harness = Harness::new().await;
+    harness.add_function(FUNCTION, "channelA", "2026-01-01T00:00:00Z");
+    let owner = tenant("channelA");
+    let sibling = tenant("channelB");
+    let trigger = harness
+        .driver
+        .create(&owner, create_request("refresh", "weather", "*/5 * * * *"))
+        .await
+        .unwrap();
+    let request = || TriggerRequest {
+        driver: DRIVER_ID.into(),
+        id: trigger.id.clone(),
+        region: None,
+    };
+    assert!(harness.driver.get(&sibling, request()).await.is_err());
+    assert!(harness.driver.pause(&sibling, request()).await.is_err());
+    assert!(harness.driver.resume(&sibling, request()).await.is_err());
+    assert!(harness.driver.run_now(&sibling, request()).await.is_err());
+    assert!(harness.driver.delete(&sibling, request()).await.is_err());
+    let listed = |tenant: Tenant| {
+        let driver = harness.driver.clone();
+        async move {
+            driver
+                .list(
+                    &tenant,
+                    ListTriggersRequest {
+                        driver: DRIVER_ID.into(),
+                        region: None,
+                        page_size: 50,
+                        page_token: None,
+                    },
+                )
+                .await
+                .unwrap()
+                .triggers
+                .len()
+        }
+    };
+    assert_eq!(listed(sibling.clone()).await, 0);
+    assert_eq!(listed(owner.clone()).await, 1);
+    assert!(harness.state.lock().unwrap().jobs.contains_key(&trigger.id));
+    assert_eq!(
+        harness.remaining(&trigger.id).await,
+        Some(PREPAID_RUNS.into())
+    );
+
+    assert_eq!(
+        harness.driver.get(&owner, request()).await.unwrap().id,
+        trigger.id
+    );
+    assert_eq!(
+        harness.driver.pause(&owner, request()).await.unwrap().state,
+        "PAUSED"
+    );
+    harness.driver.run_now(&owner, request()).await.unwrap();
+    harness.driver.delete(&owner, request()).await.unwrap();
+    assert!(!harness.state.lock().unwrap().jobs.contains_key(&trigger.id));
+}
