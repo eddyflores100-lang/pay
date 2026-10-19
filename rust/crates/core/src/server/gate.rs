@@ -841,6 +841,7 @@ impl<S: PaymentState> PaymentGate<S> {
         let variant = variant_hint_from_path(path);
         let price = metering::resolve_price(meter, &props, variant.as_deref(), None);
         let fixed_price = metering::resolve_fixed_price(meter, &props, variant.as_deref());
+        let split_rules = metering::resolve_split_rules(meter, &props, variant.as_deref());
 
         let mut challenge_headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
         let mut advertised: Vec<&str> = Vec::new();
@@ -890,7 +891,11 @@ impl<S: PaymentState> PaymentGate<S> {
                             // same-route payments don't rely on blockhash uniqueness.
                             external_id: external_id.as_deref(),
                             splits: crate::server::payment::resolve_charge_splits(
-                                mpp, meter, api, &uri, &amount,
+                                mpp,
+                                split_rules,
+                                api,
+                                &uri,
+                                &amount,
                             ),
                             ..Default::default()
                         },
@@ -1671,6 +1676,7 @@ impl<S: PaymentState> PaymentGate<S> {
         );
         // Reconstruct a URI for split-rule query params (splits price off the request).
         let uri = reconstruct_uri(path, req.query);
+        let split_rules = metering::resolve_split_rules(meter, &props, variant.as_deref());
         let external_id = match mpp_charge_payment_external_id(&credential, resource) {
             Ok(external_id) => external_id,
             Err(e) => {
@@ -1747,7 +1753,11 @@ impl<S: PaymentState> PaymentGate<S> {
                     // credential, including the per-challenge suffix.
                     external_id: external_id.as_deref(),
                     splits: crate::server::payment::resolve_charge_splits(
-                        mpp, meter, api, &uri, &amount,
+                        mpp,
+                        split_rules,
+                        api,
+                        &uri,
+                        &amount,
                     ),
                     ..Default::default()
                 },

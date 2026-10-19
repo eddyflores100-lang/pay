@@ -234,3 +234,140 @@ async fn overlapping_variant_is_priced_by_the_forwarded_model() {
         "10000000"
     );
 }
+
+// ── Per-tier split beneficiaries (SOLA1-70) ────────────────────────────────
+
+const AFFILIATE_A: &str = "CNR1b172rotbSG6kCpfR76KB2ios2y7X4p8yEEc7pjLu";
+const AFFILIATE_B: &str = "F82JMeQmD7Lfbh6vCJWsz2ABJ5AAthhVjUyqzgHyUtog";
+
+fn tier_split_spec() -> ApiSpec {
+    spec(&format!(
+        r#"
+name: tier-split
+subdomain: tier-split
+title: Tier split
+description: Conditional tiers with tier-specific split beneficiaries
+category: ai_ml
+version: v1
+routing:
+  type: respond
+recipients:
+  affiliate_a:
+    account: "{AFFILIATE_A}"
+  affiliate_b:
+    account: "{AFFILIATE_B}"
+endpoints:
+  - method: POST
+    path: v1/tier
+    metering:
+      schemes: [mpp-charge]
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.01
+              condition: {{field: body_size, op: "<=", value: 1000}}
+              splits:
+                - {{recipient: affiliate_a, amount: 0.001, memo: first-tier}}
+            - price_usd: 1.00
+              condition: {{field: body_size, op: ">", value: 1000}}
+              splits:
+                - {{recipient: affiliate_b, percent: 20, memo: second-tier}}
+  - method: POST
+    path: v1/models/{{modelId}}:generate
+    metering:
+      schemes: [mpp-charge]
+      variants:
+        - param: model
+          value: cheap
+          dimensions:
+            - direction: usage
+              unit: requests
+              scale: 1
+              tiers:
+                - price_usd: 0.01
+                  splits: [{{recipient: affiliate_a, amount: 0.001}}]
+        - param: model
+          value: premium
+          dimensions:
+            - direction: usage
+              unit: requests
+              scale: 1
+              tiers:
+                - price_usd: 1.00
+                  splits: [{{recipient: affiliate_b, percent: 20}}]
+"#
+    ))
+}
+
+fn splits(charge: &ChargeRequest) -> Vec<(String, String)> {
+    charge
+        .method_details
+        .as_ref()
+        .and_then(|details| details.get("splits"))
+        .and_then(|splits| splits.as_array())
+        .map(|splits| {
+            splits
+                .iter()
+                .map(|split| {
+                    (
+                        split["recipient"].as_str().unwrap().to_string(),
+                        split["amount"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn charge(api: &ApiSpec, path: &str, content_length: Option<u64>) -> ChargeRequest {
+    let challenge = challenge(api, path, content_length).await;
+    assert_eq!(
+        challenge.status,
+        StatusCode::PAYMENT_REQUIRED,
+        "{}",
+        challenge.body
+    );
+    challenge.charge.expect("MPP charge challenge")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_conditional_tier_carries_its_own_splits() {
+    let api = tier_split_spec();
+    assert!(
+        pay_types::metering::validate_api_spec(&api).is_empty(),
+        "{:?}",
+        pay_types::metering::validate_api_spec(&api)
+    );
+
+    let large = charge(&api, "v1/tier", Some(1001)).await;
+    assert_eq!(large.amount, "1000000000");
+    assert_eq!(
+        splits(&large),
+        vec![(AFFILIATE_B.to_string(), "200000000".to_string())]
+    );
+
+    let small = charge(&api, "v1/tier", Some(1000)).await;
+    assert_eq!(small.amount, "10000000");
+    assert_eq!(
+        splits(&small),
+        vec![(AFFILIATE_A.to_string(), "1000000".to_string())]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_variant_tier_carries_its_own_splits() {
+    let api = tier_split_spec();
+    let premium = charge(&api, "v1/models/premium:generate", None).await;
+    assert_eq!(premium.amount, "1000000000");
+    assert_eq!(
+        splits(&premium),
+        vec![(AFFILIATE_B.to_string(), "200000000".to_string())]
+    );
+    let cheap = charge(&api, "v1/models/cheap:generate", None).await;
+    assert_eq!(
+        splits(&cheap),
+        vec![(AFFILIATE_A.to_string(), "1000000".to_string())]
+    );
+}

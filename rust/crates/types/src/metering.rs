@@ -2210,7 +2210,38 @@ fn validate_tier_splits(
     path: &str,
     errs: &mut Vec<String>,
 ) {
-    for dim in &metering.dimensions {
+    let mut sets = vec![(String::new(), metering.dimensions.as_slice())];
+    for variant in &metering.variants {
+        sets.push((
+            format!(" (variant {}={})", variant.param, variant.value),
+            variant.dimensions.as_slice(),
+        ));
+    }
+    for (vlabel, dimensions) in sets {
+        validate_tier_splits_in(dimensions, recipients, path, &vlabel, errs);
+    }
+}
+
+fn validate_tier_splits_in(
+    dimensions: &[MeterDimension],
+    recipients: &std::collections::HashMap<String, RecipientAlias>,
+    path: &str,
+    vlabel: &str,
+    errs: &mut Vec<String>,
+) {
+    // One charge carries one split set, so tier overrides need a single
+    // priced dimension to select it unambiguously.
+    if dimensions.len() > 1
+        && dimensions
+            .iter()
+            .any(|dim| dim.tiers.iter().any(|tier| !tier.splits.is_empty()))
+    {
+        errs.push(format!(
+            "endpoint `{path}`{vlabel}: tier `splits` require a single pricing dimension — \
+             move them to the metering-level `splits`"
+        ));
+    }
+    for dim in dimensions {
         let scale = dim.scale.max(1) as f64;
         for tier in &dim.tiers {
             if tier.splits.is_empty() {
@@ -2223,17 +2254,17 @@ fn validate_tier_splits(
             for split in &tier.splits {
                 if !recipients.contains_key(&split.recipient) {
                     errs.push(format!(
-                        "endpoint `{path}` (tier ${per_unit:.6}/unit): split references unknown recipient `{}`",
+                        "endpoint `{path}`{vlabel} (tier ${per_unit:.6}/unit): split references unknown recipient `{}`",
                         split.recipient
                     ));
                 }
                 match (split.amount, split.percent) {
                     (Some(_), Some(_)) => errs.push(format!(
-                        "endpoint `{path}` (tier ${per_unit:.6}/unit): split for `{}` has both amount and percent",
+                        "endpoint `{path}`{vlabel} (tier ${per_unit:.6}/unit): split for `{}` has both amount and percent",
                         split.recipient
                     )),
                     (None, None) => errs.push(format!(
-                        "endpoint `{path}` (tier ${per_unit:.6}/unit): split for `{}` has neither amount nor percent",
+                        "endpoint `{path}`{vlabel} (tier ${per_unit:.6}/unit): split for `{}` has neither amount nor percent",
                         split.recipient
                     )),
                     _ => {}
@@ -2248,7 +2279,7 @@ fn validate_tier_splits(
                 let total = fixed + pct;
                 if total >= per_unit {
                     errs.push(format!(
-                        "endpoint `{path}` (tier ${per_unit:.6}/unit): tier splits total (${total:.6}) >= \
+                        "endpoint `{path}`{vlabel} (tier ${per_unit:.6}/unit): tier splits total (${total:.6}) >= \
                          per-unit price (${per_unit:.6})"
                     ));
                 }
@@ -4219,6 +4250,62 @@ value_from_env: PAY_SIGNER_KEYPAIR
         ]);
         let errs = validate_api_spec(&spec);
         assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
+    }
+
+    #[test]
+    fn validate_tier_splits_cover_variants_and_reject_multi_dimension_sets() {
+        let spec: ApiSpec = serde_yml::from_str(
+            r#"
+name: t
+subdomain: t
+title: T
+description: T
+category: ai_ml
+version: v1
+routing: {type: respond}
+endpoints:
+  - method: POST
+    path: v1/variant
+    metering:
+      variants:
+        - param: model
+          value: a
+          dimensions:
+            - direction: usage
+              unit: requests
+              scale: 1
+              tiers:
+                - price_usd: 1.0
+                  splits: [{recipient: ghost, percent: 10}]
+  - method: POST
+    path: v1/multi
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 1.0
+              splits: [{recipient: ghost, percent: 10}]
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers: [{price_usd: 1.0}]
+"#,
+        )
+        .unwrap();
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("`v1/variant` (variant model=a)")
+                    && e.contains("unknown recipient `ghost`")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("`v1/multi`") && e.contains("single pricing dimension")),
+            "{errs:?}"
+        );
     }
 
     #[test]

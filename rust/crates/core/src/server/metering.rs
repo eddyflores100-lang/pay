@@ -2,7 +2,7 @@ use crate::server::accounting::{AccountingKey, AccountingStore};
 use http::HeaderMap;
 use pay_types::metering::{
     AccountingMode, ApiSpec, BillingUnit, CompareOp, Endpoint, MeterCondition, MeterDimension,
-    MeterDirection, MeterVariant, Metering, MissingUsagePolicy, PriceTier, UsageMeter,
+    MeterDirection, MeterVariant, Metering, MissingUsagePolicy, PriceTier, SplitRule, UsageMeter,
     UsageMeterSource,
 };
 use serde::{Deserialize, Serialize};
@@ -818,22 +818,40 @@ fn parse_usage_quantity(value: &str) -> Result<u64, UptoUsageError> {
     }
 }
 
-/// Resolve the effective split rules for a metering config.
-/// Per-tier splits override the metering-level splits.
-pub fn resolve_split_rules(metering: &Metering) -> &[pay_types::metering::SplitRule] {
-    // Check first tier for per-tier splits
-    let tier_splits = metering
-        .dimensions
-        .first()
-        .and_then(|d| d.tiers.first())
-        .map(|t| t.splits.as_slice())
-        .unwrap_or(&[]);
+/// Split rules for the tier a fixed per-call charge is priced at: the
+/// selected tier's override, else the metering-level splits. Uses the same
+/// variant and tier selection as [`resolve_fixed_price`].
+pub fn resolve_split_rules<'a>(
+    metering: &'a Metering,
+    props: &RequestProperties,
+    variant_hint: Option<&str>,
+) -> &'a [SplitRule] {
+    fixed_charge_dimensions(metering, props, variant_hint)
+        .iter()
+        .filter_map(|dimension| select_price_tier(dimension, props))
+        .map(|tier| tier.splits.as_slice())
+        .find(|splits| !splits.is_empty())
+        .unwrap_or(&metering.splits)
+}
 
-    if !tier_splits.is_empty() {
-        return tier_splits;
+/// Every split rule a metering config can apply, across tiers and variants.
+pub fn all_split_rules(metering: &Metering) -> impl Iterator<Item = &SplitRule> {
+    fn tier_splits(dimensions: &[MeterDimension]) -> impl Iterator<Item = &SplitRule> {
+        dimensions
+            .iter()
+            .flat_map(|dimension| dimension.tiers.iter())
+            .flat_map(|tier| tier.splits.iter())
     }
-
-    &metering.splits
+    metering
+        .splits
+        .iter()
+        .chain(tier_splits(&metering.dimensions))
+        .chain(
+            metering
+                .variants
+                .iter()
+                .flat_map(|variant| tier_splits(&variant.dimensions)),
+        )
 }
 
 /// After a request is forwarded, record the usage and return the actual price charged.

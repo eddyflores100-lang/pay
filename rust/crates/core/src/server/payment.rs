@@ -638,12 +638,11 @@ pub(crate) fn charge_amount_from_price(price: Option<&metering::ResolvedPrice>) 
 
 pub(crate) fn resolve_charge_splits(
     mpp: &pay_kit::mpp::server::Mpp,
-    meter: &pay_types::metering::Metering,
+    split_rules: &[pay_types::metering::SplitRule],
     api: &pay_types::metering::ApiSpec,
     uri: &axum::http::Uri,
     amount: &str,
 ) -> Vec<pay_kit::mpp::protocol::solana::Split> {
-    let split_rules = metering::resolve_split_rules(meter);
     if split_rules.is_empty() {
         return vec![];
     }
@@ -1072,7 +1071,9 @@ apis:
         let (api, meter) = configured_charge_splits();
         let mpp = test_mpp();
         let uri: axum::http::Uri = "/v1/test".parse().unwrap();
-        let splits = resolve_charge_splits(&mpp, &meter, &api, &uri, "0.0015");
+        let split_rules =
+            metering::resolve_split_rules(&meter, &RequestProperties::default(), None);
+        let splits = resolve_charge_splits(&mpp, split_rules, &api, &uri, "0.0015");
 
         let challenge = mpp
             .charge_with_options(

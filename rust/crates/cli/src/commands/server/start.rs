@@ -1346,7 +1346,7 @@ fn charge_split_recipient_targets(api: &ApiSpec) -> pay_core::Result<Vec<PayoutR
             continue;
         }
 
-        for rule in pay_core::server::metering::resolve_split_rules(meter) {
+        for rule in pay_core::server::metering::all_split_rules(meter) {
             let Some(alias) = api.recipients.get(&rule.recipient) else {
                 return Err(pay_core::Error::Config(format!(
                     "{}: split recipient '{}' not declared",
@@ -3801,7 +3801,7 @@ fn ensure_static_split_recipient_accounts_valid(
         let Some(meter) = ep.metering.as_ref() else {
             continue;
         };
-        for rule in pay_core::server::metering::resolve_split_rules(meter) {
+        for rule in pay_core::server::metering::all_split_rules(meter) {
             let endpoint = ep.path.as_str();
             let recipient = rule.recipient.as_str();
             let Some(alias) = api.recipients.get(recipient) else {
