@@ -1592,12 +1592,24 @@ impl<S: PaymentState> PaymentGate<S> {
             }
         };
 
-        // authenticate-intent: stateless SIWMPP verify, no broadcast.
+        // authenticate-intent: SIWMPP identity proof plus an on-chain check
+        // that the wallet holds a live, paid subscription.
         if credential.challenge.intent.as_str() == "authenticate" {
-            if let Ok(Some(server)) =
-                authenticate::build_handler(spec, defaults.clone(), subdomain, &canonical)
-                && server.verify(&credential).is_ok()
+            let verified = authenticate::verify_live_subscriber(
+                spec,
+                defaults.clone(),
+                subdomain,
+                &canonical,
+                description,
+                &credential,
+            )
+            .await;
+            if let Ok(authenticate::LegacyAuthentication::NotSubscribed { message, retryable }) =
+                &verified
             {
+                return challenge_402(Some((message, *retryable)));
+            }
+            if let Ok(authenticate::LegacyAuthentication::Live(_)) = verified {
                 return GateDecision::Forward {
                     session: None,
                     receipt: None,
