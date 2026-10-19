@@ -1151,6 +1151,7 @@ pub(crate) async fn approve_with_privy(
                 && wallet.pay_can_sign
         });
         if unchanged {
+            seed_spend(state, &existing).await?;
             return Ok(PrivyApproval {
                 subject,
                 bound: None,
@@ -1201,14 +1202,36 @@ pub(crate) async fn approve_with_privy(
                 "policy_id": privy.policy_id(),
             })));
         }
+        let record = privy.tenant_record(&subject, &wallet);
+        seed_spend(state, &record).await?;
         tracing::info!(%subject, address = %wallet.address, ?bound, "privy tenant bound");
-        state.tenants().bind(privy.tenant_record(&subject, &wallet));
+        state.tenants().bind(record);
     }
     Ok(PrivyApproval {
         subject,
         bound,
         session: identity.session_id,
     })
+}
+
+/// Count what the wallet already spent today before it can sign here.
+#[cfg(feature = "privy")]
+async fn seed_spend(
+    state: &AppState,
+    record: &crate::tenants::TenantRecord,
+) -> Result<(), ApiError> {
+    state
+        .tenants()
+        .seed_spend(record, state.spend_history())
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, wallet = %record.pubkey, "wallet spend history unavailable");
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "spend_history_unavailable",
+                "Your wallet's spending today could not be checked. Try again shortly.",
+            )
+        })
 }
 
 /// A wallet binding the provider no longer confirms: unbind every subject
@@ -2737,7 +2760,8 @@ mod tests {
             let fake = FakeApp::new(&base);
             let state = AppState::new("https://cloud.test")
                 .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
-                .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap());
+                .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap())
+                .with_spend_history(std::sync::Arc::new(crate::tenants::FixedHistory(0)));
             (crate::router(state.clone()), state, fake, mock)
         }
 
@@ -2881,6 +2905,72 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_wallet_bound_after_a_restart_keeps_todays_spend() {
+            struct Down;
+            #[async_trait::async_trait]
+            impl crate::tenants::SpendHistory for Down {
+                async fn spent_today(&self, _wallet: &str) -> Result<u64, String> {
+                    Err("rpc down".into())
+                }
+            }
+            for (history, cap_left) in [
+                (
+                    Arc::new(crate::tenants::FixedHistory(100_000))
+                        as Arc<dyn crate::tenants::SpendHistory>,
+                    false,
+                ),
+                (Arc::new(crate::tenants::FixedHistory(0)), true),
+            ] {
+                let mock = Arc::new(MockPrivy::default());
+                let fake = FakeApp::new(&mock_privy(mock.clone()).await);
+                let state = AppState::new("https://cloud.test")
+                    .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
+                    .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap())
+                    .with_spend_history(history);
+                let app = crate::router(state.clone());
+                let client_id = register_grok(&app).await;
+                privy_tokens(&app, &client_id, &fake.token_for(USER)).await;
+                let tenant = state
+                    .tenants()
+                    .get(&crate::privy::subject_for_user(USER))
+                    .unwrap();
+                assert_eq!(
+                    state
+                        .tenants()
+                        .reserve_cli_transaction(&tenant, 100)
+                        .is_ok(),
+                    cap_left
+                );
+            }
+
+            // Unknown history: the sign-in fails closed.
+            let mock = Arc::new(MockPrivy::default());
+            let fake = FakeApp::new(&mock_privy(mock.clone()).await);
+            let state = AppState::new("https://cloud.test")
+                .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
+                .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap())
+                .with_spend_history(Arc::new(Down));
+            let app = crate::router(state.clone());
+            let client_id = register_grok(&app).await;
+            let request_id = start_authorization(&app, &client_id, None).await;
+            let refused = post_json_with(
+                &app,
+                &approve_path(&request_id),
+                json!({}),
+                None,
+                Some(&fake.token_for(USER)),
+            )
+            .await;
+            assert_eq!(
+                refused.status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{}",
+                refused.body
+            );
+            assert!(state.tenants().is_empty());
+        }
+
+        #[tokio::test]
         async fn a_reassigned_wallet_invalidates_the_stale_binding() {
             let (app, state, fake, mock) = privy_app().await;
             let client_id = register_grok(&app).await;
@@ -2977,6 +3067,7 @@ mod tests {
             let state = AppState::new("https://cloud.test")
                 .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
                 .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap())
+                .with_spend_history(std::sync::Arc::new(crate::tenants::FixedHistory(0)))
                 // Once created, the wallet is treated as funded.
                 .with_wallet_probe(Arc::new(crate::FixedProbe(false)));
             let app = crate::router(state.clone());
@@ -3154,6 +3245,7 @@ mod tests {
             let state = AppState::new("https://cloud.test")
                 .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
                 .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap())
+                .with_spend_history(std::sync::Arc::new(crate::tenants::FixedHistory(0)))
                 .with_wallet_probe(Arc::new(crate::FixedProbe(true)));
             let app = crate::router(state.clone());
             let client_id = register_grok(&app).await;

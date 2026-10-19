@@ -108,11 +108,32 @@ struct LinkTicket {
     claimed: bool,
 }
 
+/// What a wallet has already paid out, from a record that outlives this
+/// process, so a restart cannot hand out a second daily allowance.
+#[async_trait::async_trait]
+pub trait SpendHistory: Send + Sync {
+    /// USD minor units `wallet` paid out in stablecoins during the current
+    /// UTC day. An error means unknown, and binding fails closed.
+    async fn spent_today(&self, wallet: &str) -> Result<u64, String>;
+}
+
+/// A history with a fixed answer, for tests.
+pub struct FixedHistory(pub u64);
+
+#[async_trait::async_trait]
+impl SpendHistory for FixedHistory {
+    async fn spent_today(&self, _wallet: &str) -> Result<u64, String> {
+        Ok(self.0)
+    }
+}
+
 /// Every bound tenant, by subject, plus the link tickets outstanding.
 pub struct TenantRegistry {
     tenants: Mutex<HashMap<String, Arc<TenantRecord>>>,
     links: Mutex<HashMap<String, LinkTicket>>,
     provisioning: Mutex<HashSet<String>>,
+    /// Ledger keys whose spend before this process started is recorded.
+    seeded: Mutex<HashSet<String>>,
     ledger: Arc<dyn SpendLedger>,
     cookie_key: [u8; 32],
 }
@@ -159,6 +180,7 @@ impl TenantRegistry {
             tenants: Mutex::default(),
             links: Mutex::default(),
             provisioning: Mutex::default(),
+            seeded: Mutex::default(),
             ledger,
             cookie_key,
         }
@@ -189,6 +211,24 @@ impl TenantRegistry {
             ledger: self.ledger.clone(),
             committed: false,
         })
+    }
+
+    /// Record what `tenant`'s wallet already spent today before this process
+    /// saw it, once per wallet. The in-process ledger covers the rest.
+    pub async fn seed_spend(
+        &self,
+        tenant: &TenantRecord,
+        history: &dyn SpendHistory,
+    ) -> Result<(), String> {
+        let key = tenant.ledger_key();
+        if self.seeded.lock().unwrap().contains(&key) {
+            return Ok(());
+        }
+        let spent = history.spent_today(&tenant.pubkey).await?;
+        if self.seeded.lock().unwrap().insert(key.clone()) {
+            let _ = self.ledger.check_and_record(&key, spent, None);
+        }
+        Ok(())
     }
 
     fn mac_hex(&self, purpose: &[u8], value: &str) -> String {
@@ -796,6 +836,66 @@ mod tests {
             .unwrap()
             .commit();
         assert_eq!(ledger.spent_today(&tenant.ledger_key()), 10_000);
+    }
+
+    #[tokio::test]
+    async fn a_restarted_registry_counts_what_the_wallet_already_spent() {
+        // Before the restart: the full $5 daily cap is spent.
+        let before = TenantRegistry::new();
+        let tenant = record("sub_1");
+        for _ in 0..5 {
+            before
+                .reserve_cli_transaction(&tenant, 10_000)
+                .unwrap()
+                .commit();
+        }
+        assert!(before.reserve_cli_transaction(&tenant, 1).is_err());
+
+        // After it: the chain says $5 left the wallet today.
+        let after = TenantRegistry::new();
+        after
+            .seed_spend(&tenant, &FixedHistory(50_000))
+            .await
+            .unwrap();
+        assert!(after.reserve_cli_transaction(&tenant, 1).is_err());
+        // Seeding happens once; a later login does not double count.
+        let partial = TenantRegistry::new();
+        partial
+            .seed_spend(&tenant, &FixedHistory(30_000))
+            .await
+            .unwrap();
+        partial
+            .seed_spend(&tenant, &FixedHistory(30_000))
+            .await
+            .unwrap();
+        partial
+            .reserve_cli_transaction(&tenant, 10_000)
+            .unwrap()
+            .commit();
+        partial
+            .reserve_cli_transaction(&tenant, 10_000)
+            .unwrap()
+            .commit();
+        assert!(partial.reserve_cli_transaction(&tenant, 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_history_seeds_nothing_and_retries() {
+        struct Down;
+        #[async_trait::async_trait]
+        impl SpendHistory for Down {
+            async fn spent_today(&self, _wallet: &str) -> Result<u64, String> {
+                Err("rpc down".into())
+            }
+        }
+        let registry = TenantRegistry::new();
+        let tenant = record("sub_1");
+        assert!(registry.seed_spend(&tenant, &Down).await.is_err());
+        registry
+            .seed_spend(&tenant, &FixedHistory(50_000))
+            .await
+            .unwrap();
+        assert!(registry.reserve_cli_transaction(&tenant, 1).is_err());
     }
 
     #[test]

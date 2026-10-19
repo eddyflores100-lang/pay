@@ -594,6 +594,129 @@ async fn fetch_jwks(http: &reqwest::Client, url: &str) -> Result<String, ConfigE
         .map_err(bad)
 }
 
+/// A wallet's stablecoin outflow today, read from the chain: the record of
+/// what its hosted signatures actually spent.
+pub struct OnChainSpendHistory {
+    rpc_url: String,
+    http: reqwest::Client,
+}
+
+/// Signature pages read per wallet; a wallet past this many transactions
+/// today is reported as unknown rather than undercounted.
+const HISTORY_PAGES: usize = 4;
+const HISTORY_PAGE: usize = 1_000;
+
+impl OnChainSpendHistory {
+    pub fn new(rpc_url: impl Into<String>) -> Self {
+        Self {
+            rpc_url: rpc_url.into(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    async fn rpc(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let response: serde_json::Value = self
+            .http
+            .post(&self.rpc_url)
+            .timeout(Duration::from_secs(10))
+            .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }))
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| format!("{method}: {e}"))?
+            .json()
+            .await
+            .map_err(|e| format!("{method}: {e}"))?;
+        if let Some(error) = response.get("error") {
+            return Err(format!("{method}: {error}"));
+        }
+        Ok(response["result"].clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::tenants::SpendHistory for OnChainSpendHistory {
+    async fn spent_today(&self, wallet: &str) -> Result<u64, String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_secs();
+        let day_start = (now / 86_400 * 86_400) as i64;
+        let mut before: Option<String> = None;
+        let mut raw = 0_u64;
+        for _ in 0..HISTORY_PAGES {
+            let mut config = json!({ "limit": HISTORY_PAGE, "commitment": "confirmed" });
+            if let Some(before) = &before {
+                config["before"] = json!(before);
+            }
+            let page = self
+                .rpc("getSignaturesForAddress", json!([wallet, config]))
+                .await?;
+            let page = page
+                .as_array()
+                .ok_or("getSignaturesForAddress: not a list")?;
+            for entry in page {
+                // An unknown block time counts as today.
+                if entry["blockTime"].as_i64().is_some_and(|t| t < day_start) {
+                    return Ok(raw.div_ceil(100));
+                }
+                let signature = entry["signature"].as_str().ok_or("signature missing")?;
+                before = Some(signature.to_string());
+                if !entry["err"].is_null() {
+                    continue;
+                }
+                let tx = self
+                    .rpc(
+                        "getTransaction",
+                        json!([signature, { "encoding": "json", "commitment": "confirmed",
+                                            "maxSupportedTransactionVersion": 0 }]),
+                    )
+                    .await?;
+                raw = raw.saturating_add(stablecoin_outflow(&tx, wallet));
+            }
+            if page.len() < HISTORY_PAGE {
+                return Ok(raw.div_ceil(100));
+            }
+        }
+        Err(format!("{wallet} has too many transactions today to count"))
+    }
+}
+
+/// Raw six-decimal stablecoin units `owner`'s token accounts lost in `tx`.
+fn stablecoin_outflow(tx: &serde_json::Value, owner: &str) -> u64 {
+    let meta = &tx["meta"];
+    if !meta["err"].is_null() {
+        return 0;
+    }
+    let balances = |key: &str| -> BTreeMap<u64, u64> {
+        meta[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|b| b["owner"].as_str() == Some(owner))
+            .filter(|b| {
+                b["mint"]
+                    .as_str()
+                    .is_some_and(pay_kit::mpp::protocol::solana::is_known_stablecoin_mint)
+            })
+            .filter_map(|b| {
+                Some((
+                    b["accountIndex"].as_u64()?,
+                    b["uiTokenAmount"]["amount"].as_str()?.parse().ok()?,
+                ))
+            })
+            .collect()
+    };
+    let (pre, post) = (balances("preTokenBalances"), balances("postTokenBalances"));
+    pre.iter()
+        .map(|(index, before)| before.saturating_sub(post.get(index).copied().unwrap_or(0)))
+        .fold(0, u64::saturating_add)
+}
+
 /// The tenant subject for a Privy user.
 pub fn subject_for_user(user_id: &str) -> String {
     crate::tenants::subject_for(PROVIDER_ID, user_id)
@@ -1138,6 +1261,91 @@ pub(crate) mod tests {
                 Err(PrivyError::Protocol(_))
             ));
         }
+    }
+
+    #[test]
+    fn outflow_counts_only_the_owners_stablecoin_debits() {
+        use pay_kit::mpp::protocol::solana::mints;
+        let usdc = mints::USDC_MAINNET;
+        let balance = |index: u64, owner: &str, mint: &str, amount: u64| {
+            json!({ "accountIndex": index, "owner": owner, "mint": mint,
+                    "uiTokenAmount": { "amount": amount.to_string(), "decimals": 6 } })
+        };
+        let tx = json!({ "meta": { "err": null,
+            "preTokenBalances": [
+                balance(1, ADDRESS, usdc, 5_000_000),
+                balance(2, "someone", usdc, 0),
+                balance(3, ADDRESS, "So11111111111111111111111111111111111111112", 9_000),
+            ],
+            "postTokenBalances": [
+                balance(1, ADDRESS, usdc, 3_750_000),
+                balance(2, "someone", usdc, 1_250_000),
+                balance(3, ADDRESS, "So11111111111111111111111111111111111111112", 0),
+            ],
+        }});
+        assert_eq!(stablecoin_outflow(&tx, ADDRESS), 1_250_000);
+        assert_eq!(
+            stablecoin_outflow(&tx, "someone"),
+            0,
+            "an inflow is not spend"
+        );
+        let mut failed = tx.clone();
+        failed["meta"]["err"] = json!({ "InstructionError": [0, "Custom"] });
+        assert_eq!(stablecoin_outflow(&failed, ADDRESS), 0);
+        // A closed account (absent afterwards) spent everything it held.
+        let mut closed = tx;
+        closed["meta"]["postTokenBalances"] = json!([]);
+        assert_eq!(stablecoin_outflow(&closed, ADDRESS), 5_000_000);
+    }
+
+    #[tokio::test]
+    async fn on_chain_history_sums_todays_outflows() {
+        use crate::tenants::SpendHistory;
+        use pay_kit::mpp::protocol::solana::mints;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let day_start = now / 86_400 * 86_400;
+        let debit = |amount: u64| {
+            json!({ "meta": { "err": null,
+                "preTokenBalances": [{ "accountIndex": 1, "owner": ADDRESS, "mint": mints::USDC_MAINNET,
+                                       "uiTokenAmount": { "amount": "10000000" } }],
+                "postTokenBalances": [{ "accountIndex": 1, "owner": ADDRESS, "mint": mints::USDC_MAINNET,
+                                        "uiTokenAmount": { "amount": (10_000_000 - amount).to_string() } }] } })
+        };
+        let rpc = move |Json(request): Json<serde_json::Value>| async move {
+            let result = match request["method"].as_str().unwrap() {
+                "getSignaturesForAddress" => json!([
+                    { "signature": "today_1", "blockTime": now, "err": null },
+                    { "signature": "today_failed", "blockTime": now, "err": { "x": 1 } },
+                    { "signature": "today_2", "blockTime": day_start, "err": null },
+                    { "signature": "yesterday", "blockTime": day_start - 1, "err": null },
+                ]),
+                "getTransaction" => match request["params"][0].as_str().unwrap() {
+                    "today_1" => debit(1_000_001),
+                    "today_2" => debit(500_000),
+                    other => panic!("{other} must not be read"),
+                },
+                other => panic!("{other}"),
+            };
+            Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+        };
+        let app = Router::new().route("/", post(rpc));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let history = OnChainSpendHistory::new(format!("http://{addr}/"));
+        // 1.500001 USDC rounds up to 15,001 minor units.
+        assert_eq!(history.spent_today(ADDRESS).await.unwrap(), 15_001);
+        assert!(
+            OnChainSpendHistory::new("http://127.0.0.1:1/")
+                .spent_today(ADDRESS)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
