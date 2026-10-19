@@ -2337,10 +2337,25 @@ async fn reconcile_batch_channel(
 ) -> Result<BatchReconcileResult, JobError> {
     let state_channel_id = state.channel_id.clone();
     let Some(onchain) = onchain else {
+        let delete_absent = match state.open_slot {
+            Some(open_slot) if !state.has_in_flight_authorization() => {
+                let address = Pubkey::from_str(&state.channel_id)
+                    .map_err(|_| JobError::InvalidAddress(state.channel_id.clone()))?;
+                channel::channel_absence_proven(
+                    rpc,
+                    rpc_url,
+                    &address,
+                    &payment_channels::default_program_id(),
+                    open_slot,
+                )
+                .await?
+            }
+            _ => false,
+        };
         return Ok(BatchReconcileResult {
             channel_id: state_channel_id,
             candidate: None,
-            delete_absent: state.open_slot.is_some() && !state.has_in_flight_authorization(),
+            delete_absent,
             snapshot: ChannelInventorySnapshot::default(),
             stablecoin_settled_base_units: None,
             stablecoin_distributed_base_units: None,
@@ -2706,14 +2721,29 @@ async fn reconcile_channel(
     let onchain = match fetched {
         Ok(Some(onchain)) => onchain,
         Ok(None) => {
+            let store_disposition = if bound_config.is_some() {
+                StoreDisposition::Keep
+            } else if channel::channel_absence_proven(
+                rpc,
+                rpc_url,
+                &channel_id,
+                &program,
+                state.open_slot.unwrap_or_default(),
+            )
+            .await?
+            {
+                absent_disposition
+            } else {
+                warn!(
+                    channel_id = %state.channel_id,
+                    "channel absent at confirmed commitment but not proven gone; keeping record"
+                );
+                StoreDisposition::Keep
+            };
             return Ok(ReconcileResult {
                 channel_id: state_channel_id,
                 candidate: None,
-                store_disposition: if bound_config.is_some() {
-                    StoreDisposition::Keep
-                } else {
-                    absent_disposition
-                },
+                store_disposition,
                 snapshot: ChannelInventorySnapshot::default(),
                 stablecoin_settled_base_units: None,
                 stablecoin_distributed_base_units: None,
@@ -5059,6 +5089,98 @@ mod tests {
             absent_onchain_store_disposition(&pull),
             StoreDisposition::Keep
         );
+    }
+
+    /// Serve JSON-RPC from `respond`, which maps a request to its `result`.
+    async fn spawn_rpc(
+        respond: impl Fn(&serde_json::Value) -> serde_json::Value + Clone + Send + Sync + 'static,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+                let respond = respond.clone();
+                async move {
+                    axum::Json(serde_json::json!({
+                        "jsonrpc": "2.0", "id": request["id"], "result": respond(&request)
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, server)
+    }
+
+    /// Every account read returns null; finalized reads answer at `finalized_slot`.
+    async fn absent_everywhere(finalized_slot: u64) -> (String, tokio::task::JoinHandle<()>) {
+        spawn_rpc(move |request| {
+            assert_eq!(request["method"], "getMultipleAccounts");
+            let slot = if request["params"][1]["commitment"] == "finalized" {
+                finalized_slot
+            } else {
+                u64::MAX
+            };
+            serde_json::json!({"context": {"slot": slot}, "value": [null]})
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn one_absent_read_never_deletes_a_live_v1_session() {
+        let rpc = RpcClient::new(Duration::from_secs(5)).unwrap();
+        let mut state = channel_state();
+        state.open_slot = Some(1_000);
+        let window = payment_channels::OPEN_SLOT_WINDOW;
+        for (finalized_slot, expected) in [
+            // A stale or lagging node cannot prove the channel is gone.
+            (1_000 + window, StoreDisposition::Keep),
+            // Past the open window a finalized null is a reclaimed channel.
+            (1_001 + window, StoreDisposition::Delete),
+        ] {
+            let (url, server) = absent_everywhere(finalized_slot).await;
+            let result = reconcile_channel(
+                &rpc,
+                &url,
+                state.clone(),
+                0,
+                0,
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                None,
+            )
+            .await
+            .unwrap();
+            server.abort();
+            assert_eq!(result.store_disposition, expected, "slot {finalized_slot}");
+        }
+    }
+
+    #[tokio::test]
+    async fn one_absent_read_never_deletes_a_batch_ledger() {
+        let rpc = RpcClient::new(Duration::from_secs(5)).unwrap();
+        let mut state = channel_state();
+        state.open_slot = Some(1_000);
+        let window = payment_channels::OPEN_SLOT_WINDOW;
+        for (finalized_slot, expected) in [(1_000 + window, false), (1_001 + window, true)] {
+            let (url, server) = absent_everywhere(finalized_slot).await;
+            let result = reconcile_batch_channel(
+                &rpc,
+                &url,
+                state.clone(),
+                None,
+                0,
+                0,
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+            server.abort();
+            assert_eq!(result.delete_absent, expected, "slot {finalized_slot}");
+        }
     }
 
     #[test]

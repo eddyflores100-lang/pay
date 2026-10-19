@@ -200,6 +200,40 @@ pub async fn fetch_channel_for_program(
     decode_v1_channel(address, &account.data)
 }
 
+/// Account discriminator of the program's terminal `ClosedChannel` tombstone.
+const CLOSED_CHANNEL_DISCRIMINATOR: u8 = 2;
+
+/// Whether `address` is provably gone, not merely missing from one read.
+///
+/// A confirmed read can lag or return a stale null for a live channel, and
+/// dropping its durable record would reopen settled vouchers. Absence counts
+/// only at finalized commitment from a node past the slot after which the
+/// channel can no longer be opened (`open_slot + OPEN_SLOT_WINDOW`), or when
+/// the program has left its closed-channel tombstone.
+pub async fn channel_absence_proven(
+    rpc: &RpcClient,
+    rpc_url: &str,
+    address: &Pubkey,
+    program_id: &Pubkey,
+    open_slot: u64,
+) -> Result<bool, JobError> {
+    let (slot, accounts) = rpc
+        .get_multiple_accounts_with_owner_at(
+            rpc_url,
+            &[address.to_string()],
+            pay_api_core::rpc::Commitment::Finalized,
+        )
+        .await?;
+    Ok(match accounts.into_iter().next().flatten() {
+        None => slot > open_slot.saturating_add(pay_kit::core::payment_channels::OPEN_SLOT_WINDOW),
+        Some(account) => {
+            account.owner == program_id.to_string()
+                && account.data.len() < CHANNEL_ACCOUNT_SIZE
+                && account.data.first() == Some(&CLOSED_CHANNEL_DISCRIMINATOR)
+        }
+    })
+}
+
 /// Validate persisted ABI selection before any recovery or transaction building.
 pub fn session_deployment(config: &SessionConfig) -> Result<Deployment, JobError> {
     config
@@ -844,6 +878,74 @@ mod tests {
         );
         assert!(decode_v1_channel(&address, &bytes).unwrap().is_some());
         assert!(decode_v1_channel(&address, &[0]).unwrap().is_none());
+    }
+
+    async fn serve_account(
+        slot: u64,
+        account: serde_json::Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{Json, Router, routing::post};
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let account = account.clone();
+                async move {
+                    assert_eq!(request["method"], "getMultipleAccounts");
+                    assert_eq!(request["params"][1]["commitment"], "finalized");
+                    Json(serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1,
+                        "result": {"context": {"slot": slot}, "value": [account]}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        (
+            url,
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+        )
+    }
+
+    #[tokio::test]
+    async fn absence_requires_finalized_proof_past_the_open_window() {
+        use base64::Engine;
+        let rpc = RpcClient::new(std::time::Duration::from_secs(5)).unwrap();
+        let address = Pubkey::new_unique();
+        let program = default_program_id();
+        let open_slot = 10_000;
+        let window = pay_kit::core::payment_channels::OPEN_SLOT_WINDOW;
+        let encoded = |data: &[u8]| base64::engine::general_purpose::STANDARD.encode(data);
+        let mut live = vec![0; CHANNEL_ACCOUNT_SIZE];
+        live[0] = 1;
+        live[1] = 1;
+        let cases = [
+            (open_slot + window, serde_json::Value::Null, false),
+            (open_slot + window + 1, serde_json::Value::Null, true),
+            (
+                0,
+                serde_json::json!({"owner": program.to_string(), "data": [encoded(&[2]), "base64"]}),
+                true,
+            ),
+            (
+                u64::MAX,
+                serde_json::json!({"owner": Pubkey::new_unique().to_string(), "data": [encoded(&[2]), "base64"]}),
+                false,
+            ),
+            (
+                u64::MAX,
+                serde_json::json!({"owner": program.to_string(), "data": [encoded(&live), "base64"]}),
+                false,
+            ),
+        ];
+        for (slot, account, expected) in cases {
+            let (url, server) = serve_account(slot, account.clone()).await;
+            let proven = channel_absence_proven(&rpc, &url, &address, &program, open_slot)
+                .await
+                .unwrap();
+            server.abort();
+            assert_eq!(proven, expected, "slot {slot} account {account}");
+        }
     }
 
     #[test]
