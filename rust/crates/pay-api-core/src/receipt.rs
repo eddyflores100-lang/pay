@@ -44,16 +44,23 @@ pub const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 /// Discriminators that — on either the multi-delegator OR the subscriptions
 /// program — denote the subscription intent rather than the pull-mode session
 /// intent. Used by the classifier to decide which intent kind to emit.
-const SUBSCRIPTION_DISCRIMINATORS: &[u8] = &[
-    0,  // initializeSubscriptionAuthority
-    6,  // closeSubscriptionAuthority
-    7,  // createPlan
-    8,  // updatePlan
-    9,  // deletePlan
-    10, // transferSubscription (renew)
-    11, // subscribe
-    12, // cancelSubscription
-];
+const SUBSCRIPTION_DISCRIMINATORS: &[u8] = {
+    use pay_kit::generated::subscriptions::instructions::*;
+    &[
+        INIT_SUBSCRIPTION_AUTHORITY_DISCRIMINATOR,
+        CLOSE_SUBSCRIPTION_AUTHORITY_DISCRIMINATOR,
+        CREATE_PLAN_DISCRIMINATOR,
+        UPDATE_PLAN_DISCRIMINATOR,
+        DELETE_PLAN_DISCRIMINATOR,
+        TRANSFER_SUBSCRIPTION_DISCRIMINATOR,
+        SUBSCRIBE_DISCRIMINATOR,
+        CANCEL_SUBSCRIPTION_DISCRIMINATOR,
+        RESUME_SUBSCRIPTION_DISCRIMINATOR,
+        REVOKE_SUBSCRIPTION_AUTHORITY_DISCRIMINATOR,
+        REVOKE_ABANDONED_SUBSCRIPTION_DISCRIMINATOR,
+        CANCEL_SUBSCRIPTION_NOW_DISCRIMINATOR,
+    ]
+};
 
 const SPL_TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
@@ -423,10 +430,14 @@ fn attach_subscription_delegation_state(
 /// Account positions of `(subscriptionPda, planPda)` per subscriptions-program
 /// lifecycle instruction.
 fn subscription_account_roles(discriminator: u8) -> Option<(usize, usize)> {
+    use pay_kit::generated::subscriptions::instructions::*;
     match discriminator {
-        10 => Some((0, 1)), // transferSubscription
-        11 => Some((3, 2)), // subscribe
-        12 => Some((2, 1)), // cancelSubscription
+        TRANSFER_SUBSCRIPTION_DISCRIMINATOR => Some((0, 1)),
+        SUBSCRIBE_DISCRIMINATOR => Some((3, 2)),
+        CANCEL_SUBSCRIPTION_DISCRIMINATOR => Some((2, 1)),
+        RESUME_SUBSCRIPTION_DISCRIMINATOR => Some((2, 1)),
+        REVOKE_ABANDONED_SUBSCRIPTION_DISCRIMINATOR => Some((1, 3)),
+        CANCEL_SUBSCRIPTION_NOW_DISCRIMINATOR => Some((3, 2)),
         _ => None,
     }
 }
@@ -1543,12 +1554,14 @@ fn build_subscription(
     let status = match action.as_str() {
         "subscribe" => SubscriptionStatus::Active,
         "renew" => SubscriptionStatus::Renewed,
-        "cancel" => SubscriptionStatus::Cancelled,
+        "resume" => SubscriptionStatus::Active,
+        "cancel" | "cancelNow" | "revokeAbandonedSubscription" => SubscriptionStatus::Cancelled,
         "createPlan"
         | "updatePlan"
         | "deletePlan"
         | "initSubscriptionAuthority"
-        | "closeSubscriptionAuthority" => SubscriptionStatus::Admin,
+        | "closeSubscriptionAuthority"
+        | "revokeSubscriptionAuthority" => SubscriptionStatus::Admin,
         _ => SubscriptionStatus::Unknown,
     };
 
@@ -1692,6 +1705,11 @@ fn subscription_or_session_label(byte: u8) -> String {
         10 => "renew".to_string(),
         11 => "subscribe".to_string(),
         12 => "cancel".to_string(),
+        13 => "resume".to_string(),
+        14 => "revokeSubscriptionAuthority".to_string(),
+        15 => "revokeAbandonedDelegation".to_string(),
+        16 => "revokeAbandonedSubscription".to_string(),
+        17 => "cancelNow".to_string(),
         228 => "emitEvent".to_string(),
         other => format!("ix-{other}"),
     }
@@ -2242,6 +2260,39 @@ mod tests {
             value.as_object_mut().unwrap().remove("blockTime");
             let subscription = build(&rpc, &value).await.subscription.unwrap();
             assert_eq!(subscription.period_start_ts, None);
+        }
+
+        #[tokio::test]
+        async fn immediate_cancellation_is_a_typed_subscription_cancel() {
+            let rpc = StubRpc::start().await;
+            let f = Fixture::new(&subscriptions_program());
+            f.install(&rpc, SUBSCRIPTIONS_PROGRAM);
+            // cancelSubscriptionNow: [subscriber, merchant, planPda, subscriptionPda, ...].
+            let mut data = vec![17u8];
+            data.extend_from_slice(&1_725_000_000_i64.to_le_bytes());
+            let mut value = tx(
+                SUBSCRIPTIONS_PROGRAM,
+                17,
+                &[
+                    f.subscriber.to_string(),
+                    Pubkey::new_unique().to_string(),
+                    f.plan.to_string(),
+                    f.subscription.to_string(),
+                ],
+            );
+            value["transaction"]["message"]["instructions"][0]["data"] =
+                json!(bs58::encode(data).into_string());
+            let receipt = build(&rpc, &value).await;
+            assert_eq!(receipt.intent.kind, ReceiptIntentKind::MppSubscription);
+            assert_eq!(receipt.intent.action.as_deref(), Some("cancelNow"));
+            assert!(receipt.session.is_none());
+            let subscription = receipt.subscription.unwrap();
+            assert_eq!(subscription.status, SubscriptionStatus::Cancelled);
+            assert_eq!(
+                subscription.subscription_id,
+                Some(f.subscription.to_string())
+            );
+            assert_eq!(subscription.expires_at_ts, Some(1_800_000_000));
         }
 
         #[tokio::test]
@@ -3272,6 +3323,10 @@ mod tests {
             (10, "renew"),
             (11, "subscribe"),
             (12, "cancel"),
+            (13, "resume"),
+            (14, "revokeSubscriptionAuthority"),
+            (16, "revokeAbandonedSubscription"),
+            (17, "cancelNow"),
         ];
         for program in [MULTI_DELEGATOR_PROGRAM, SUBSCRIPTIONS_PROGRAM] {
             for (disc, label) in cases {
@@ -3322,7 +3377,16 @@ mod tests {
         assert_eq!(s.action, "cancel");
         assert_eq!(s.status, pay_api_types::SubscriptionStatus::Cancelled);
 
-        for disc in [0u8, 6, 7, 8, 9] {
+        for (disc, status) in [
+            (13u8, pay_api_types::SubscriptionStatus::Active),
+            (16, pay_api_types::SubscriptionStatus::Cancelled),
+            (17, pay_api_types::SubscriptionStatus::Cancelled),
+        ] {
+            let r = parse(subscription_program_tx(SUBSCRIPTIONS_PROGRAM, disc));
+            assert_eq!(r.subscription.unwrap().status, status, "disc {disc}");
+        }
+
+        for disc in [0u8, 6, 7, 8, 9, 14] {
             let r = parse(subscription_program_tx(SUBSCRIPTIONS_PROGRAM, disc));
             let s = r.subscription.expect("admin builds a block");
             assert_eq!(s.status, pay_api_types::SubscriptionStatus::Admin);
