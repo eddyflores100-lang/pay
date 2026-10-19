@@ -97,8 +97,13 @@ pub async fn build_receipt(
 
         // Best-effort: if the channel is still open, decode its state to
         // attach the on-chain `payer`, `payee`, and `status`.
-        let candidates = session_account_candidates(rpc_value);
-        if !candidates.is_empty()
+        let candidates = match payment_channel_accounts(top_level_instructions(rpc_value)) {
+            channels if channels.len() == 1 => channels,
+            channels if channels.is_empty() => session_account_candidates(rpc_value),
+            _ => Vec::new(),
+        };
+        if receipt.session.is_some()
+            && !candidates.is_empty()
             && let Ok(Some(channel)) = fetch_channel(rpc, rpc_url, &candidates).await
         {
             attach_channel_state(&mut receipt, &channel);
@@ -161,6 +166,60 @@ fn collect_ata_owners(rpc_value: &Value) -> BTreeMap<String, String> {
         }
     }
     map
+}
+
+fn top_level_instructions(rpc_value: &Value) -> &[Value] {
+    rpc_value
+        .pointer("/transaction/message/instructions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+/// Distinct channel PDAs named by top-level payment-channels lifecycle
+/// instructions, by account role (mirrors pay-kit's `channels_in_message`).
+fn payment_channel_accounts(top: &[Value]) -> Vec<String> {
+    use pay_kit::generated::payment_channels::instructions::{
+        DISTRIBUTE_DISCRIMINATOR, OPEN_DISCRIMINATOR, RECLAIM_DISCRIMINATOR,
+        REQUEST_CLOSE_DISCRIMINATOR, SEAL_DISCRIMINATOR, SETTLE_AND_SEAL_DISCRIMINATOR,
+        SETTLE_DISCRIMINATOR, TOP_UP_DISCRIMINATOR, WITHDRAW_PAYER_DISCRIMINATOR,
+    };
+    let mut channels: Vec<String> = Vec::new();
+    for ix in top {
+        if ix.get("programId").and_then(Value::as_str) != Some(PAYMENT_CHANNELS_PROGRAM) {
+            continue;
+        }
+        let slot = match ix
+            .get("data")
+            .and_then(Value::as_str)
+            .and_then(first_data_byte)
+        {
+            Some(OPEN_DISCRIMINATOR) => 5,
+            Some(
+                TOP_UP_DISCRIMINATOR
+                | SETTLE_AND_SEAL_DISCRIMINATOR
+                | REQUEST_CLOSE_DISCRIMINATOR
+                | WITHDRAW_PAYER_DISCRIMINATOR,
+            ) => 1,
+            Some(
+                SETTLE_DISCRIMINATOR
+                | DISTRIBUTE_DISCRIMINATOR
+                | SEAL_DISCRIMINATOR
+                | RECLAIM_DISCRIMINATOR,
+            ) => 0,
+            _ => continue,
+        };
+        if let Some(channel) = ix
+            .get("accounts")
+            .and_then(Value::as_array)
+            .and_then(|accounts| accounts.get(slot))
+            .and_then(Value::as_str)
+            && !channels.iter().any(|known| known == channel)
+        {
+            channels.push(channel.to_string());
+        }
+    }
+    channels
 }
 
 /// The channel payer as named by a payment-channels instruction's account
@@ -639,7 +698,11 @@ pub fn build_receipt_skeleton(
 
     let total = aggregate_total(&transfers);
 
+    // A transaction settling several channels has no single session: its
+    // transfers stay transaction-level instead of being merged into one.
+    let channels = payment_channel_accounts(&top_instructions);
     let session = match intent.kind {
+        ReceiptIntentKind::MppSession if channels.len() > 1 => None,
         ReceiptIntentKind::MppSession => Some(build_session(
             intent
                 .action
@@ -1823,7 +1886,10 @@ fn build_session(
     top_instructions: &[Value],
     account_keys: &[String],
 ) -> ReceiptSession {
-    let channel = extract_session_channel(top_instructions, account_keys, program_id.as_deref());
+    let channel = payment_channel_accounts(top_instructions)
+        .into_iter()
+        .next()
+        .or_else(|| extract_session_channel(top_instructions, account_keys, program_id.as_deref()));
 
     // For `open`: the sender of the deposit is the original payer.
     // For `settle`/`distribute`/`seal`: the channel sends to recipients
@@ -2922,6 +2988,80 @@ mod tests {
         assert_eq!(session.channel_status, Some(WireChannelStatus::Open));
         assert_eq!(session.payer, Some(payer.to_string()));
         assert_eq!(session.payee, Some(payee.to_string()));
+    }
+
+    fn two_channel_batch() -> Value {
+        let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        json!({
+            "slot": 100,
+            "blockTime": 1_700_000_000_i64,
+            "meta": {"err": null, "fee": 5000_u64, "innerInstructions": [
+                {"index": 0, "instructions": [
+                    token_transfer("ChannelA", "OperatorWallet", mint, "900", 6),
+                    token_transfer("ChannelA", "PayerA_ATA", mint, "100", 6)
+                ]},
+                {"index": 1, "instructions": [
+                    token_transfer("ChannelB", "OperatorWallet", mint, "200", 6),
+                    token_transfer("ChannelB", "PayerB_ATA", mint, "800", 6)
+                ]}
+            ]},
+            "transaction": {"message": {
+                "accountKeys": [{"pubkey": "OperatorWallet", "signer": true}],
+                "instructions": [
+                    distribute_ix("ChannelA", "PayerA", "PayerA_ATA"),
+                    distribute_ix("ChannelB", "PayerB", "PayerB_ATA")
+                ]
+            }}
+        })
+    }
+
+    #[test]
+    fn batched_channel_settlements_do_not_collapse_into_one_session() {
+        let rpc = two_channel_batch();
+        let receipt = parse(rpc.clone());
+        assert_eq!(receipt.intent.kind, ReceiptIntentKind::MppSession);
+        assert!(receipt.session.is_none());
+        assert_eq!(receipt.transfers.len(), 4);
+        assert_eq!(
+            payment_channel_accounts(top_level_instructions(&rpc)),
+            vec!["ChannelA".to_string(), "ChannelB".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn batched_settlement_skips_channel_enrichment() {
+        let rpc = crate::test_rpc::StubRpc::start().await;
+        let receipt = build_receipt(
+            &RpcClient::new(std::time::Duration::from_secs(5)).unwrap(),
+            &rpc.url,
+            "sig",
+            Network::Sandbox,
+            &two_channel_batch(),
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(receipt.session.is_none());
+        assert!(
+            rpc.requests()
+                .iter()
+                .all(|request| !request.contains(&"ChannelA".to_string()))
+        );
+    }
+
+    #[test]
+    fn repeated_instructions_for_one_channel_keep_a_single_session() {
+        let mut rpc = two_channel_batch();
+        rpc["transaction"]["message"]["instructions"] = json!([
+            {
+                "programId": PAYMENT_CHANNELS_PROGRAM,
+                "accounts": ["OperatorWallet", "ChannelA"],
+                "data": bs58::encode([4u8]).into_string()
+            },
+            distribute_ix("ChannelA", "PayerA", "PayerA_ATA")
+        ]);
+        let session = parse(rpc).session.expect("single channel session");
+        assert_eq!(session.channel.as_deref(), Some("ChannelA"));
     }
 
     // ── Plain transfer / SOL / Token-2022 ─────────────────────────────────
