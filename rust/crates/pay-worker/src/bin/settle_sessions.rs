@@ -2560,6 +2560,11 @@ async fn reconcile_batch_channel(
                     ))
                 })?;
             let preimage = channel::recover_distribution_preimage(rpc, rpc_url, &onchain).await?;
+            instructions.push(channel::payer_refund_account_ix(
+                operator,
+                &onchain,
+                &token_program,
+            ));
             instructions.push(
                 channel::build_distribute_ix(&onchain, treasury_owner, &token_program, &preimage).0,
             );
@@ -2633,6 +2638,11 @@ async fn reconcile_batch_channel(
                     ))
                 })?;
             let preimage = channel::recover_distribution_preimage(rpc, rpc_url, &onchain).await?;
+            instructions.push(channel::payer_refund_account_ix(
+                operator,
+                &onchain,
+                &token_program,
+            ));
             instructions.push(
                 channel::build_distribute_ix(&onchain, treasury_owner, &token_program, &preimage).0,
             );
@@ -2671,6 +2681,11 @@ async fn reconcile_batch_channel(
                     ))
                 })?;
             let preimage = channel::recover_distribution_preimage(rpc, rpc_url, &onchain).await?;
+            instructions.push(channel::payer_refund_account_ix(
+                operator,
+                &onchain,
+                &token_program,
+            ));
             instructions.push(
                 channel::build_distribute_ix(&onchain, treasury_owner, &token_program, &preimage).0,
             );
@@ -2699,6 +2714,11 @@ async fn reconcile_batch_channel(
                     ))
                 })?;
             let preimage = channel::recover_distribution_preimage(rpc, rpc_url, &onchain).await?;
+            instructions.push(channel::payer_refund_account_ix(
+                operator,
+                &onchain,
+                &token_program,
+            ));
             instructions.push(
                 channel::build_distribute_ix(&onchain, treasury_owner, &token_program, &preimage).0,
             );
@@ -3236,24 +3256,35 @@ async fn build_idle_close_candidate(
         return Ok(None);
     };
 
-    let distribution = if let Some(config) = bound_config {
+    let (distribution, token_program) = if let Some(config) = bound_config {
         let token_program = config
             .token_program
             .ok_or_else(|| binding_error("missing token program"))?;
         channel::require_token_program(rpc, rpc_url, &onchain.mint(), &token_program).await?;
-        bound_distribution_instruction(config, onchain, treasury_owner, &token_program)?
+        (
+            bound_distribution_instruction(config, onchain, treasury_owner, &token_program)?,
+            token_program,
+        )
     } else {
         let token_program = channel::resolve_token_program(rpc, rpc_url, &onchain.mint()).await?;
         let preimage = channel::recover_distribution_preimage(rpc, rpc_url, onchain).await?;
-        channel::build_distribute_ix_for_program(
-            onchain,
-            treasury_owner,
-            &token_program,
-            &preimage,
-            &program,
+        (
+            channel::build_distribute_ix_for_program(
+                onchain,
+                treasury_owner,
+                &token_program,
+                &preimage,
+                &program,
+            )
+            .0,
+            token_program,
         )
-        .0
     };
+    instructions.push(channel::payer_refund_account_ix(
+        operator,
+        onchain,
+        &token_program,
+    ));
     instructions.push(distribution);
     let before = inventory_snapshot(
         state.sealed,
@@ -4170,6 +4201,7 @@ mod tests {
         )
         .0;
         let distribution = candidate.instructions.last().unwrap();
+        assert_refund_account_precedes_distribute(&candidate.instructions, &operator);
         assert_eq!(distribution.program_id, program);
         assert_eq!(distribution.data, base.data);
         assert_eq!(
@@ -5396,6 +5428,58 @@ mod tests {
         assert_eq!(candidate.settled_on_chain, 350);
     }
 
+    fn assert_refund_account_precedes_distribute(
+        instructions: &[solana_instruction::Instruction],
+        operator: &Pubkey,
+    ) {
+        use pay_kit::generated::payment_channels::generated::instructions::DISTRIBUTE_DISCRIMINATOR;
+        let position = instructions
+            .iter()
+            .position(|ix| {
+                ix.data.first() == Some(&DISTRIBUTE_DISCRIMINATOR) && ix.accounts.len() >= 11
+            })
+            .expect("distribute instruction");
+        let create = &instructions[position - 1];
+        assert_eq!(
+            create.program_id,
+            payment_channels::to_address(&pay_api_core::ata::ATA_PROGRAM_ID)
+        );
+        assert_eq!(create.data, vec![1], "CreateIdempotent");
+        assert_eq!(
+            create.accounts[0].pubkey,
+            payment_channels::to_address(operator)
+        );
+        assert_eq!(
+            create.accounts[1].pubkey, instructions[position].accounts[4].pubkey,
+            "the refund account distribute writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_batch_distribution_recreates_a_closed_payer_refund_account() {
+        let (state, mut onchain, operator) = batch_closing_fixture();
+        // Already sealed by another crank: distribute alone, refund account first.
+        onchain.channel.status = STATUS_SEALED;
+        let candidate = reconcile_closing_batch(state.clone(), &onchain, &operator, 0)
+            .await
+            .unwrap()
+            .candidate
+            .unwrap();
+        assert_eq!(candidate.instructions.len(), 2);
+        assert_refund_account_precedes_distribute(&candidate.instructions, &operator);
+
+        // In-grace settle-and-seal plus distribute.
+        onchain.channel.status = STATUS_CLOSING;
+        let mut frozen = state;
+        frozen.freeze_watermark_at(frozen.cumulative);
+        let candidate = reconcile_closing_batch(frozen, &onchain, &operator, 1_010)
+            .await
+            .unwrap()
+            .candidate
+            .unwrap();
+        assert_refund_account_precedes_distribute(&candidate.instructions, &operator);
+    }
+
     #[tokio::test]
     async fn post_grace_batch_seal_refuses_to_drop_accepted_vouchers() {
         let (state, onchain, operator) = batch_closing_fixture();
@@ -5445,7 +5529,7 @@ mod tests {
             .unwrap();
         assert_eq!(candidate.kind, BatchCandidateKind::FinalizeClose);
         assert_eq!(candidate.settled_on_chain, 100);
-        assert_eq!(candidate.instructions.len(), 2);
+        assert_eq!(candidate.instructions.len(), 3);
     }
 
     #[test]

@@ -647,6 +647,22 @@ pub fn build_top_up_ix(
         .instruction()
 }
 
+/// Idempotently create the payer's refund token account. `distribute` writes
+/// the refund there, and the payer can close an emptied account at any time;
+/// without it the distribution, and every channel co-batched with it, fails.
+pub fn payer_refund_account_ix(
+    fee_payer: &Pubkey,
+    channel: &DecodedChannel,
+    token_program: &Pubkey,
+) -> Instruction {
+    pay_kit::core::payment_channels::build_create_associated_token_account_instruction(
+        fee_payer,
+        &channel.payer(),
+        &channel.mint(),
+        token_program,
+    )
+}
+
 /// Accounts derived for a `distribute` instruction, surfaced for logging.
 pub struct DistributeAccounts {
     pub channel_ata: Pubkey,
@@ -945,6 +961,43 @@ mod tests {
                 .unwrap();
             server.abort();
             assert_eq!(proven, expected, "slot {slot} account {account}");
+        }
+    }
+
+    #[test]
+    fn payer_refund_account_is_recreated_idempotently_at_the_distribute_slot() {
+        let mut bytes = vec![0; CHANNEL_ACCOUNT_SIZE];
+        bytes[0] = 1;
+        bytes[1] = 1;
+        let mut channel = decode_v1_channel(&Pubkey::new_unique(), &bytes)
+            .unwrap()
+            .unwrap();
+        channel.channel.payer = to_address(&Pubkey::new_unique());
+        channel.channel.mint = to_address(&Pubkey::new_unique());
+        let fee_payer = Pubkey::new_unique();
+        for token_program in [SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID] {
+            let create = payer_refund_account_ix(&fee_payer, &channel, &token_program);
+            let (distribute, accounts) = build_distribute_ix(
+                &channel,
+                &Pubkey::new_unique(),
+                &token_program,
+                &DistributionPreimage {
+                    preimage_bytes: vec![0; 4],
+                    recipients: vec![],
+                },
+            );
+            // CreateIdempotent, funded by the fee payer, for the exact refund account.
+            assert_eq!(create.data, vec![1]);
+            assert_eq!(
+                create.program_id,
+                to_address(&pay_api_core::ata::ATA_PROGRAM_ID)
+            );
+            assert_eq!(create.accounts[0].pubkey, to_address(&fee_payer));
+            assert!(create.accounts[0].is_signer);
+            assert_eq!(create.accounts[1].pubkey, to_address(&accounts.payer_ata));
+            assert_eq!(distribute.accounts[4].pubkey, create.accounts[1].pubkey);
+            assert_eq!(create.accounts[2].pubkey, channel.channel.payer);
+            assert_eq!(create.accounts[5].pubkey, to_address(&token_program));
         }
     }
 
