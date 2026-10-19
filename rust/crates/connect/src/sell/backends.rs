@@ -305,10 +305,18 @@ impl EndpointBackends {
                     channel_hooks: channel_hooks.clone(),
                     token_program: Some(token_program),
                 };
-                let session = SessionMpp::new(config, operator.challenge_binding_secret.clone())
-                    .with_realm(sale.title.clone())
-                    .with_blockhash_cache(operator.blockhashes.clone())
-                    .with_payment_channel_signer(operator.signer.clone());
+                // Endpoints share the operator's root secret; derive one per
+                // endpoint so a clone's session cannot be replayed into it.
+                let session = SessionMpp::new(
+                    config,
+                    pay_core::server::session::endpoint_challenge_binding_secret(
+                        &operator.challenge_binding_secret,
+                        &sale.endpoint_id,
+                    ),
+                )
+                .with_realm(sale.title.clone())
+                .with_blockhash_cache(operator.blockhashes.clone())
+                .with_payment_channel_signer(operator.signer.clone());
                 // Embedded reconciliation: this process pushes watermarks and
                 // closes idle channels. A settlement worker takes over when
                 // pay-connect's session state moves to Redis.
@@ -559,6 +567,42 @@ mod tests {
             .blockhashes
             .set("11111111111111111111111111111111".into(), 1_000, 1);
         operator
+    }
+
+    /// A clone endpoint copying another's public profile cannot have its
+    /// session challenges accepted by the original.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_challenges_do_not_cross_endpoints() {
+        let operator = operator();
+        let backends = |endpoint_id: &str| {
+            let mut sale = sale(SellPricing::PerRequest { usd: 0.02 });
+            sale.endpoint_id = endpoint_id.into();
+            EndpointBackends::build(&sale, &operator, "https://connect.test").unwrap()
+        };
+        let (target, clone) = (backends("e1"), backends("e2"));
+        let credential = |backends: &EndpointBackends| {
+            pay_kit::mpp::PaymentCredential::new(
+                backends.session_mpp_handles()[0]
+                    .challenge(None)
+                    .unwrap()
+                    .to_echo(),
+                serde_json::json!({ "action": "mystery" }),
+            )
+        };
+        let session = &target.session_mpp_handles()[0];
+        let error = session
+            .process_credential(credential(&clone))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("did not issue"), "{error}");
+        let error = session
+            .process_credential(credential(&target))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Unrecognized session action"),
+            "{error}"
+        );
     }
 
     fn sale(pricing: SellPricing) -> SellInference {

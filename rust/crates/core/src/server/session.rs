@@ -163,6 +163,19 @@ fn session_close_needs_reconciliation(message: &str) -> bool {
     message.contains("Close already requested") || message.contains("Channel is already sealed")
 }
 
+/// Challenge-binding secret for one endpoint of an operator serving several
+/// from one root secret, so a challenge minted for one endpoint (and the
+/// session opened from it) never verifies at another.
+pub fn endpoint_challenge_binding_secret(secret: &str, endpoint_id: &str) -> String {
+    use base64::Engine as _;
+    use hmac::{Hmac, Mac};
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts any key length");
+    mac.update(b"pay-session-endpoint\0");
+    mac.update(endpoint_id.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+}
+
 /// The per-request price a voucher must pay: the authenticated challenge
 /// amount, never the static session config amount.
 fn voucher_request_amount(request: &SessionRequest) -> Result<u64> {
@@ -4105,6 +4118,54 @@ mod tests {
         let inactive = feature_gate_rpc(false).await;
         assert_eq!(settlement_tx_version(Some(inactive)).await, TxVersion::V0);
         assert_eq!(settlement_tx_version(None).await, TxVersion::V0);
+    }
+
+    #[tokio::test]
+    async fn endpoint_secrets_keep_challenges_on_their_endpoint() {
+        let root = "operator-root-secret";
+        assert_eq!(
+            endpoint_challenge_binding_secret(root, "e1"),
+            endpoint_challenge_binding_secret(root, "e1")
+        );
+        assert_ne!(
+            endpoint_challenge_binding_secret(root, "e1"),
+            endpoint_challenge_binding_secret(root, "e2")
+        );
+        assert_ne!(endpoint_challenge_binding_secret(root, "e1"), root);
+        let endpoint = |id: &str| {
+            SessionMpp::new(
+                test_session_config(),
+                endpoint_challenge_binding_secret(root, id),
+            )
+            .with_realm("Same Title")
+            .with_blockhash_cache(test_blockhash_cache())
+        };
+        let (target, clone) = (endpoint("e1"), endpoint("e2"));
+        let credential = |session: &SessionMpp| {
+            PaymentCredential::new(
+                session.challenge(None).unwrap().to_echo(),
+                serde_json::json!({ "action": "mystery" }),
+            )
+        };
+        let error = target
+            .process_credential(credential(&clone))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(terminal_errors::CHALLENGE_ECHO_MISMATCH),
+            "{error}"
+        );
+        // Its own challenge passes the echo check and reaches the payload.
+        let error = target
+            .process_credential(credential(&target))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Unrecognized session action"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
