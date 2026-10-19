@@ -989,8 +989,10 @@ pub fn build_siwx_auth_header_with_override(
 ) -> Result<BuiltPayment> {
     let (chain, network) = sign_in_chain(challenge, network_override)?;
     let desc = crate::client::prompt::payment_description(None, &[resource_url]);
-    let reason = format!("authorize sign-in for {desc}");
-    let intent = crate::keystore::AuthIntent::from_reason(&reason);
+    let intent = crate::keystore::AuthIntent::sign_in(format!(
+        "sign in to {} ({}) with your wallet for {desc}",
+        challenge.extension.domain, challenge.extension.uri
+    ));
     let (signer, ephemeral_notice) =
         crate::signer::load_signer_for_network_with_intent_and_override(
             &network,
@@ -1991,6 +1993,89 @@ mod tests {
         assert_eq!(payload.address, pubkey);
         assert_eq!(payload.chain_id, SOLANA_DEVNET);
         assert!(pay_kit::x402::siwx::verify_siwx_payload(&payload).unwrap());
+    }
+
+    #[test]
+    fn build_siwx_auth_header_asks_for_a_sign_in_approval_naming_the_site() {
+        use std::sync::{Arc, Mutex};
+        struct Recording(Arc<Mutex<Vec<crate::keystore::AuthIntent>>>);
+        impl crate::keystore::AuthGate for Recording {
+            fn authenticate(
+                &self,
+                intent: &crate::keystore::AuthIntent,
+            ) -> pay_keystore::Result<()> {
+                self.0.lock().unwrap().push(intent.clone());
+                Ok(())
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+        }
+
+        let keypair = solana_keypair::Keypair::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&keypair.to_bytes().to_vec()).unwrap(),
+        )
+        .unwrap();
+        let mut file = AccountsFile::default();
+        file.upsert(
+            "mainnet",
+            "default",
+            Account {
+                backend: BackendKind::File,
+                provider: None,
+                active: true,
+                auth_required: Some(true),
+                pubkey: Some(solana_signer::Signer::pubkey(&keypair).to_string()),
+                vault: None,
+                account: None,
+                path: Some(path.to_string_lossy().into_owned()),
+                secret_key_b58: None,
+                created_at: None,
+                subscriptions: Default::default(),
+            },
+        );
+        let store = MemoryAccountsStore::with_file(file);
+        let challenge = SiwxAuthChallenge {
+            extension: pay_kit::x402::siwx::SiwxExtension::new(
+                pay_kit::x402::siwx::SiwxExtensionInfo {
+                    domain: "merchant.example".to_string(),
+                    uri: "https://merchant.example/data".to_string(),
+                    statement: None,
+                    version: "1".to_string(),
+                    nonce: "nonce-1".to_string(),
+                    issued_at: "2026-10-19T00:00:00Z".to_string(),
+                    expiration_time: None,
+                    not_before: None,
+                    request_id: None,
+                    resources: None,
+                },
+                pay_kit::x402::siwx::default_solana_siwx_chains(),
+            ),
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        build_siwx_auth_header_with_override(
+            &challenge,
+            &store,
+            Some("mainnet"),
+            Some("default"),
+            Some("https://merchant.example/data"),
+            Some(Box::new(Recording(seen.clone()))),
+        )
+        .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].signs_raw_proof(), "{:?}", seen[0]);
+        assert!(!seen[0].moves_money());
+        assert!(
+            seen[0].message().contains("merchant.example"),
+            "{:?}",
+            seen[0]
+        );
     }
 
     #[test]

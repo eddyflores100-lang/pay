@@ -241,6 +241,27 @@ impl PolicyGate {
     }
 }
 
+/// Hosted callers with no interactive prompt: a raw wallet proof has no
+/// amount for the policy to bound, so it needs the client's own approval.
+struct RequireInteractiveProofApproval;
+
+impl AuthGate for RequireInteractiveProofApproval {
+    fn authenticate(&self, intent: &AuthIntent) -> pay_keystore::Result<()> {
+        if intent.signs_raw_proof() {
+            return Err(pay_keystore::Error::AuthDenied(
+                "wallet sign-in needs approval from an MCP client that supports prompts; \
+                 this client cannot show one"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn is_available(&self) -> bool {
+        true
+    }
+}
+
 impl AuthGate for PolicyGate {
     fn authenticate(&self, intent: &AuthIntent) -> pay_keystore::Result<()> {
         if let Some(reserved) = self.reserve(intent)?
@@ -279,8 +300,9 @@ pub struct PolicyApproval {
 impl PolicyApproval {
     fn chain(&self, policy: PolicyGate, peer: Option<&Peer<RoleServer>>) -> AuthOverride {
         let mut gates: Vec<Box<dyn AuthGate>> = vec![Box::new(policy)];
-        if let Some(peer) = peer.filter(|p| peer_supports_elicitation(p)) {
-            gates.push(Box::new(crate::ElicitationAuth::new(peer.clone())));
+        match peer.filter(|p| peer_supports_elicitation(p)) {
+            Some(peer) => gates.push(Box::new(crate::ElicitationAuth::new(peer.clone()))),
+            None => gates.push(Box::new(RequireInteractiveProofApproval)),
         }
         Some(Box::new(ChainedGate(gates)))
     }
@@ -595,5 +617,100 @@ mod tests {
             .unwrap();
         drop(hold);
         assert_eq!(ledger.spent_today("sub"), 60_000);
+    }
+
+    #[test]
+    fn hosted_sign_in_without_a_client_prompt_is_refused() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let approval = PolicyApproval {
+            subject: "sub".to_string(),
+            policy: SpendPolicy::FROZEN,
+            ledger: ledger.clone(),
+        };
+        let gate = approval.gate(None).expect("hosted policy always gates");
+        let err = gate
+            .authenticate(&AuthIntent::sign_in("sign in to merchant.example"))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("wallet sign-in needs approval"),
+            "{err}"
+        );
+        assert_eq!(ledger.spent_today("sub"), 0);
+
+        // Plain account use and in-policy payments still pass without a prompt.
+        let approval = PolicyApproval {
+            subject: "sub".to_string(),
+            policy: SpendPolicy::dollars(1.0, 1.0),
+            ledger: ledger.clone(),
+        };
+        let gate = approval.gate(None).unwrap();
+        assert!(gate.authenticate(&AuthIntent::use_account("read")).is_ok());
+        assert!(gate.authenticate(&payment("$0.10")).is_ok());
+    }
+
+    #[test]
+    fn hosted_siwx_header_is_not_signed_without_a_client_prompt() {
+        const KEYPAIR: [u8; 64] = [
+            41, 99, 180, 88, 51, 57, 48, 80, 61, 63, 219, 75, 176, 49, 116, 254, 227, 176, 196,
+            204, 122, 47, 166, 133, 155, 252, 217, 0, 253, 17, 49, 143, 47, 94, 121, 167, 195, 136,
+            72, 22, 157, 48, 77, 88, 63, 96, 57, 122, 181, 243, 236, 188, 241, 134, 174, 224, 100,
+            246, 17, 170, 104, 17, 151, 48,
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connector.json");
+        std::fs::write(&path, serde_json::to_string(&KEYPAIR.to_vec()).unwrap()).unwrap();
+        let mut file = pay_core::accounts::AccountsFile::default();
+        file.upsert(
+            "mainnet",
+            "connector",
+            pay_core::accounts::Account {
+                backend: pay_core::accounts::BackendKind::File,
+                provider: None,
+                active: true,
+                auth_required: Some(true),
+                pubkey: Some("4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR".to_string()),
+                vault: None,
+                account: None,
+                path: Some(path.to_string_lossy().into_owned()),
+                secret_key_b58: None,
+                created_at: None,
+                subscriptions: Default::default(),
+            },
+        );
+        let store = pay_core::accounts::MemoryAccountsStore::with_file(file);
+        let challenge = pay_core::client::x402::SiwxAuthChallenge {
+            extension: pay_kit::x402::siwx::SiwxExtension::new(
+                pay_kit::x402::siwx::SiwxExtensionInfo {
+                    domain: "merchant.example".to_string(),
+                    uri: "https://merchant.example/data".to_string(),
+                    statement: None,
+                    version: "1".to_string(),
+                    nonce: "nonce".to_string(),
+                    issued_at: "2026-10-19T00:00:00Z".to_string(),
+                    expiration_time: None,
+                    not_before: None,
+                    request_id: None,
+                    resources: None,
+                },
+                pay_kit::x402::siwx::default_solana_siwx_chains(),
+            ),
+        };
+        let approval = PolicyApproval {
+            subject: "sub".to_string(),
+            policy: SpendPolicy::dollars(1.0, 10.0),
+            ledger: Arc::new(MemoryLedger::new()),
+        };
+        let result = pay_core::client::x402::build_siwx_auth_header_with_override(
+            &challenge,
+            &store,
+            Some("mainnet"),
+            Some("connector"),
+            Some("https://merchant.example/data"),
+            approval.gate(None),
+        );
+        // The same store signs once a gate approves (see the core SIWX tests);
+        // here the hosted gate refuses the raw proof.
+        let err = result.expect_err("raw proof signed without approval");
+        assert!(matches!(err, pay_core::Error::PaymentRejected(_)), "{err}");
     }
 }

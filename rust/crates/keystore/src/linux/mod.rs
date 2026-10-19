@@ -128,7 +128,7 @@ fn polkit_action_for_intent(intent: &AuthIntent) -> &'static str {
         AuthIntent::DeleteAccount(_) => POLKIT_ACTION_DELETE,
         AuthIntent::OpenSession(_) => POLKIT_ACTION_SESSION,
         AuthIntent::UseGatewayFeePayer(_) => POLKIT_ACTION_GATEWAY_FEE_PAYER,
-        AuthIntent::UseAccount(_) => POLKIT_ACTION_USE,
+        AuthIntent::UseAccount(_) | AuthIntent::SignIn(_) => POLKIT_ACTION_USE,
     }
 }
 

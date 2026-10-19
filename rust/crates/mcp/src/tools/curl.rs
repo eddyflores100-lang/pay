@@ -1403,10 +1403,11 @@ fn do_paid_fetch(
             ..
         } => {
             // Prefer spending existing credits: sign in with the wallet and
-            // retry. The sign-in signature takes one Touch ID / approval; if
-            // sign-in doesn't grant access and we fall back to paying below,
-            // the payment signature requires a second approval.
-            let built = scope.with_approval(peer.as_ref(), |auth| {
+            // retry. The sign-in signature takes its own approval (hosted
+            // callers need a client prompt for it); if sign-in is refused or
+            // doesn't grant access and we fall back to paying below, the
+            // payment signature requires a second approval.
+            let signed_in = scope.with_approval(peer.as_ref(), |auth| {
                 pay_core::client::x402::build_siwx_auth_header_with_override(
                     &challenge,
                     store,
@@ -1415,21 +1416,27 @@ fn do_paid_fetch(
                     Some(url),
                     auth,
                 )
-            })?;
-            let mut headers = extra_headers.to_vec();
-            headers.extend(
-                built
-                    .headers
-                    .into_iter()
-                    .map(|(name, value)| (name.to_string(), value)),
-            );
-            let retry = fetch_request(&headers)?;
+            });
+            let retry = match signed_in {
+                Ok(built) => {
+                    let mut headers = extra_headers.to_vec();
+                    headers.extend(
+                        built
+                            .headers
+                            .into_iter()
+                            .map(|(name, value)| (name.to_string(), value)),
+                    );
+                    Some(fetch_request(&headers)?)
+                }
+                Err(error) if payment_fallback.is_none() => return Err(error),
+                Err(_) => None,
+            };
 
             // If sign-in granted access, we're done — credits were spent, no
             // payment made. If the server still refuses (e.g. the wallet has
             // no credits yet) and the same 402 also offered a payment option,
             // fall back to paying so the call can still go through.
-            if matches!(retry, RunOutcome::Completed { .. }) {
+            if let Some(retry @ RunOutcome::Completed { .. }) = retry {
                 interpret_retry(retry)
             } else if let Some(pay_challenge) = payment_fallback {
                 if let Some(permissions) = &scope.payment_permissions {
@@ -1453,7 +1460,7 @@ fn do_paid_fetch(
                         .map(|(name, value)| (name.to_string(), value)),
                 );
                 interpret_retry(fetch_request(&headers)?)
-            } else if let RunOutcome::PaymentRejected { reason, .. } = retry {
+            } else if let Some(RunOutcome::PaymentRejected { reason, .. }) = retry {
                 Err(pay_core::Error::PaymentRejected(reason))
             } else {
                 // Sign-in didn't grant access and the 402 offered no payment
