@@ -27,7 +27,7 @@ struct Args {
     #[arg(long, env = "COMPUTE_ALLOWED_HOSTS", value_delimiter = ',')]
     allowed_hosts: Vec<String>,
     /// Disable MCP Host-header validation. This is safe for the private Cloud
-    /// Run origin because IAM and the verified-payer header remain mandatory.
+    /// Run origin because IAM and the proxy-proven payer remain mandatory.
     #[arg(long, env = "COMPUTE_DISABLE_HOST_VALIDATION", default_value_t = false)]
     disable_host_validation: bool,
 }

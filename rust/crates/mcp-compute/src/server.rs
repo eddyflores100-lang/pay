@@ -484,9 +484,19 @@ pub fn router_with_payments(
             Default::default(),
             transport,
         );
+    let state = AppState {
+        drivers,
+        trigger_drivers,
+        gateway_domain,
+        executor_proof,
+        proxy_proof,
+    };
     let mcp = Router::new()
         .nest_service("/mcp", service)
-        .layer(middleware::from_fn(verified_tenant));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            verified_tenant,
+        ));
     let payment_routes = match payments {
         Some(payments) => payments.router(),
         None => Router::new().route(
@@ -499,13 +509,7 @@ pub fn router_with_payments(
         .route("/internal/triggers/run", post(execute_trigger))
         .merge(mcp)
         .fallback(gateway_invoke)
-        .with_state(AppState {
-            drivers,
-            trigger_drivers,
-            gateway_domain,
-            executor_proof,
-            proxy_proof,
-        })
+        .with_state(state)
         .merge(payment_routes)
 }
 
@@ -562,7 +566,18 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
-async fn verified_tenant(mut request: Request, next: Next) -> Response {
+async fn verified_tenant(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    if !proxy_verified(&state, request.headers()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "verified_payer_required" })),
+        )
+            .into_response();
+    }
     let tenant = request
         .headers()
         .get(VERIFIED_PAYER_HEADER)
@@ -875,6 +890,85 @@ mod tests {
             builder = builder.header(PROXY_PROOF_HEADER, proof);
         }
         builder.body(Body::from("{}")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn payer_identity_requires_the_proxy_proof() {
+        let state = AppState {
+            drivers: DriverRegistry::default(),
+            trigger_drivers: TriggerDriverRegistry::default(),
+            gateway_domain: "cpu.example.invalid".into(),
+            executor_proof: b"correct-proof-that-is-at-least-32-bytes".to_vec(),
+            proxy_proof: PROXY_PROOF.to_vec(),
+        };
+        let app = Router::new()
+            .route(
+                "/",
+                get(|request: Request| async move {
+                    request
+                        .extensions()
+                        .get::<Tenant>()
+                        .map(|tenant| tenant.channel_id.clone())
+                        .unwrap_or_default()
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                verified_tenant,
+            ))
+            .with_state(state);
+        let victim = bs58::encode([11_u8; 32]).into_string();
+        let request = |proof: Option<&[u8]>, channel: Option<&str>| {
+            let mut builder = Request::get("/").header(VERIFIED_PAYER_HEADER, &victim);
+            if let Some(channel) = channel {
+                builder = builder.header(VERIFIED_CHANNEL_HEADER, channel);
+            }
+            if let Some(proof) = proof {
+                builder = builder.header(PROXY_PROOF_HEADER, proof);
+            }
+            builder.body(Body::empty()).unwrap()
+        };
+        for (proof, channel) in [
+            (None, Some("forgedchannel")),
+            (
+                Some(&b"wrong-proof-that-is-at-least-32-bytes"[..]),
+                Some("forgedchannel"),
+            ),
+            (Some(PROXY_PROOF), None),
+        ] {
+            let response = app.clone().oneshot(request(proof, channel)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = app
+            .oneshot(request(Some(PROXY_PROOF), Some("verifiedchannel")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"verifiedchannel");
+    }
+
+    #[tokio::test]
+    async fn forged_identity_cannot_reach_mcp_tools() {
+        let app = gateway_app(Arc::new(GatewayStub::default()));
+        let victim = bs58::encode([11_u8; 32]).into_string();
+        let response = app
+            .oneshot(
+                Request::post("/mcp")
+                    .header(VERIFIED_PAYER_HEADER, victim)
+                    .header(VERIFIED_CHANNEL_HEADER, "forgedchannel")
+                    .header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"deploy","arguments":{}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
