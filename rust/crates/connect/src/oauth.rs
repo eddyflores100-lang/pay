@@ -568,6 +568,18 @@ impl Store {
         })
     }
 
+    /// End every code and token issued to `subject`.
+    pub fn revoke_subject(&self, subject: &str) {
+        self.codes
+            .lock()
+            .unwrap()
+            .retain(|_, grant| grant.subject != subject);
+        self.tokens
+            .lock()
+            .unwrap()
+            .retain(|_, token| token.subject != subject);
+    }
+
     /// End every code and token approved in the upstream login `session`.
     pub fn revoke_session(&self, session: &str) {
         let ours = |s: &Option<String>| s.as_deref() == Some(session);
@@ -1122,60 +1134,101 @@ pub(crate) async fn approve_with_privy(
         )
     })?;
     let subject = crate::privy::subject_for_user(&identity.user_id);
-    let mut bound = None;
-    if state.tenants().get(&subject).is_none() {
-        let _claim = state
-            .tenants()
-            .claim_provisioning(&subject)
-            .ok_or_else(|| {
-                ApiError::new(
-                    StatusCode::CONFLICT,
-                    "provisioning",
-                    "This wallet is already being prepared. Try again in a moment.",
-                )
-            })?;
-        // A previous claimant may have completed between our first lookup
-        // and this reservation.
-        if state.tenants().get(&subject).is_none() {
-            let wallet = match privy.solana_wallet(&identity.user_id).await {
-                Ok(Some(existing)) => {
-                    bound = Some(Bound::Existing);
-                    Ok(existing)
-                }
-                Ok(None) => {
-                    bound = Some(Bound::Created);
-                    privy.create_wallet(&identity.user_id).await
-                }
-                Err(e) => Err(e),
-            }
-            .map_err(|e| {
-                tracing::warn!(error = %e, "privy wallet lookup failed");
-                ApiError::new(StatusCode::BAD_GATEWAY, "provider_error", e.to_string())
-            })?;
-            if !wallet.pay_can_sign {
-                return Err(ApiError::new(
-                    StatusCode::CONFLICT,
-                    "signer_required",
-                    format!(
-                        "Your Privy wallet {} does not let pay sign yet. Add pay as a signer, then approve again.",
-                        wallet.address
-                    ),
-                )
-                .with_details(serde_json::json!({
-                    "address": wallet.address,
-                    "signer_id": privy.signer_id(),
-                    "policy_id": privy.policy_id(),
-                })));
-            }
-            tracing::info!(%subject, address = %wallet.address, ?bound, "privy tenant bound");
-            state.tenants().bind(privy.tenant_record(&subject, &wallet));
+    let provider_error = |e: crate::privy::PrivyError| {
+        tracing::warn!(error = %e, "privy wallet lookup failed");
+        ApiError::new(StatusCode::BAD_GATEWAY, "provider_error", e.to_string())
+    };
+    // Every sign-in rechecks the user's wallet at Privy: a binding is only
+    // as current as the provider says it is.
+    let mut current = privy
+        .solana_wallet(&identity.user_id)
+        .await
+        .map_err(provider_error)?;
+    if let Some(existing) = state.tenants().get(&subject) {
+        let unchanged = current.as_ref().is_some_and(|wallet| {
+            wallet.id == existing.wallet_id
+                && wallet.address == existing.pubkey
+                && wallet.pay_can_sign
+        });
+        if unchanged {
+            return Ok(PrivyApproval {
+                subject,
+                bound: None,
+                session: identity.session_id,
+            });
         }
+        invalidate_wallet_binding(state, &existing);
+    }
+    let mut bound = None;
+    let _claim = state
+        .tenants()
+        .claim_provisioning(&subject)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "provisioning",
+                "This wallet is already being prepared. Try again in a moment.",
+            )
+        })?;
+    // A previous claimant may have completed between our first lookup and
+    // this reservation.
+    if state.tenants().get(&subject).is_none() {
+        let wallet = match current.take() {
+            Some(existing) => {
+                bound = Some(Bound::Existing);
+                existing
+            }
+            None => {
+                bound = Some(Bound::Created);
+                privy
+                    .create_wallet(&identity.user_id)
+                    .await
+                    .map_err(provider_error)?
+            }
+        };
+        if !wallet.pay_can_sign {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "signer_required",
+                format!(
+                    "Your Privy wallet {} does not let pay sign yet. Add pay as a signer, then approve again.",
+                    wallet.address
+                ),
+            )
+            .with_details(serde_json::json!({
+                "address": wallet.address,
+                "signer_id": privy.signer_id(),
+                "policy_id": privy.policy_id(),
+            })));
+        }
+        tracing::info!(%subject, address = %wallet.address, ?bound, "privy tenant bound");
+        state.tenants().bind(privy.tenant_record(&subject, &wallet));
     }
     Ok(PrivyApproval {
         subject,
         bound,
         session: identity.session_id,
     })
+}
+
+/// A wallet binding the provider no longer confirms: unbind every subject
+/// on that wallet and revoke every credential they hold.
+#[cfg(feature = "privy")]
+fn invalidate_wallet_binding(state: &AppState, stale: &crate::tenants::TenantRecord) {
+    for subject in state
+        .tenants()
+        .remove_wallet(&stale.provider, &stale.wallet_id)
+    {
+        if let Some(store) = state.oauth() {
+            store.revoke_subject(&subject);
+        }
+        state.cli().revoke_subject(&subject);
+    }
+    tracing::warn!(
+        wallet = %stale.wallet_id,
+        address = %stale.pubkey,
+        "privy wallet binding changed; tenant credentials revoked"
+    );
 }
 
 #[cfg(not(feature = "privy"))]
@@ -2825,6 +2878,47 @@ mod tests {
                 json["access_token"].as_str().unwrap().to_string(),
                 json["refresh_token"].as_str().unwrap().to_string(),
             )
+        }
+
+        #[tokio::test]
+        async fn a_reassigned_wallet_invalidates_the_stale_binding() {
+            let (app, state, fake, mock) = privy_app().await;
+            let client_id = register_grok(&app).await;
+            let token = fake.token_for(USER);
+            let (access, _) = privy_tokens(&app, &client_id, &token).await;
+            let subject = crate::privy::subject_for_user(USER);
+            let wallet = state.tenants().get(&subject).unwrap().wallet_id.clone();
+            state.tenants().bind({
+                let mut guest = (*state.tenants().get(&subject).unwrap()).clone();
+                guest.subject = "guest_linked".to_string();
+                guest
+            });
+            let cli_token = state.cli().issue_token(subject.clone(), None).unwrap();
+
+            // An unchanged wallet keeps every credential.
+            let (second, _) = privy_tokens(&app, &client_id, &token).await;
+            let oauth = state.oauth().unwrap();
+            assert!(oauth.authenticate(&access).is_some());
+            assert!(state.cli().authenticate(&cli_token).is_some());
+
+            // Privy moves the wallet to another user.
+            {
+                let mut wallets = mock.wallets.lock().unwrap();
+                let entry = wallets.remove(USER).unwrap();
+                wallets.insert("did:privy:someone_else".to_string(), entry);
+            }
+            let (fresh, _) = privy_tokens(&app, &client_id, &token).await;
+            for stale in [&access, &second] {
+                assert!(oauth.authenticate(stale).is_none(), "stale bearer revoked");
+            }
+            assert!(state.cli().authenticate(&cli_token).is_none());
+            assert!(
+                state.tenants().get("guest_linked").is_none(),
+                "aliases unbound"
+            );
+            let rebound = state.tenants().get(&subject).unwrap();
+            assert_ne!(rebound.wallet_id, wallet, "a new wallet for the user");
+            assert_eq!(oauth.authenticate(&fresh).unwrap().id, subject);
         }
 
         #[tokio::test]

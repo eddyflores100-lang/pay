@@ -166,6 +166,18 @@ impl Store {
         Some((grant.subject, grant.session))
     }
 
+    /// End every link code and CLI token issued to `subject`.
+    pub fn revoke_subject(&self, subject: &str) {
+        self.grants
+            .lock()
+            .unwrap()
+            .retain(|_, grant| grant.subject != subject);
+        self.tokens
+            .lock()
+            .unwrap()
+            .retain(|_, token| token.subject != subject);
+    }
+
     /// End every link code and CLI token approved in the Privy `session`.
     pub fn revoke_session(&self, session: &str) {
         let ours = |s: &Option<String>| s.as_deref() == Some(session);
@@ -179,7 +191,11 @@ impl Store {
             .retain(|_, token| !ours(&token.session));
     }
 
-    fn issue_token(&self, subject: String, session: Option<String>) -> Result<String, ApiError> {
+    pub(crate) fn issue_token(
+        &self,
+        subject: String,
+        session: Option<String>,
+    ) -> Result<String, ApiError> {
         let token = format!("pct_{}", random_token());
         let mut tokens = self.tokens.lock().unwrap();
         let now = Instant::now();

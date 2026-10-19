@@ -336,6 +336,20 @@ impl TenantRegistry {
         self.tenants.lock().unwrap().get(subject).cloned()
     }
 
+    /// Unbind every subject on one provider wallet; returns those subjects.
+    pub fn remove_wallet(&self, provider: &str, wallet_id: &str) -> Vec<String> {
+        let mut tenants = self.tenants.lock().unwrap();
+        let subjects: Vec<String> = tenants
+            .values()
+            .filter(|t| t.provider == provider && t.wallet_id == wallet_id)
+            .map(|t| t.subject.clone())
+            .collect();
+        for subject in &subjects {
+            tenants.remove(subject);
+        }
+        subjects
+    }
+
     pub fn remove(&self, subject: &str) -> Option<Arc<TenantRecord>> {
         self.tenants.lock().unwrap().remove(subject)
     }

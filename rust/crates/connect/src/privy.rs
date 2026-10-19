@@ -479,9 +479,15 @@ impl Privy {
     pub async fn solana_wallet(&self, user_id: &str) -> Result<Option<Wallet>, PrivyError> {
         let path = format!("/users/{}", urlencode(user_id));
         let user: UserResponse = Self::read(self.get(&path).send().await?, "user").await?;
-        let Some(id) = embedded_solana_wallet_id(&user.linked_accounts) else {
+        if user.id.as_deref().is_some_and(|id| id != user_id) {
+            return Err(PrivyError::Protocol(
+                "user: the response is for another user".to_string(),
+            ));
+        }
+        let Some(linked) = embedded_solana_wallet(&user.linked_accounts) else {
             return Ok(None);
         };
+        let id = linked.id.clone().expect("filtered on id");
         let wallet: WalletResponse = Self::read(
             self.get(&format!("/wallets/{}", urlencode(&id)))
                 .send()
@@ -489,6 +495,20 @@ impl Privy {
             "wallet",
         )
         .await?;
+        if wallet.id != id
+            || wallet
+                .chain_type
+                .as_deref()
+                .is_some_and(|chain| chain != "solana")
+            || linked
+                .address
+                .as_deref()
+                .is_some_and(|address| address != wallet.address)
+        {
+            return Err(PrivyError::Protocol(
+                "wallet: the response does not match the user's linked wallet".to_string(),
+            ));
+        }
         Ok(Some(self.wallet_from(wallet)))
     }
 
@@ -586,6 +606,8 @@ fn urlencode(s: &str) -> String {
 #[derive(Deserialize)]
 struct UserResponse {
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
     linked_accounts: Vec<LinkedAccount>,
 }
 
@@ -595,6 +617,8 @@ struct LinkedAccount {
     kind: String,
     #[serde(default)]
     id: Option<String>,
+    #[serde(default)]
+    address: Option<String>,
     #[serde(default)]
     chain_type: Option<String>,
     #[serde(default)]
@@ -606,7 +630,12 @@ struct LinkedAccount {
 }
 
 /// The first embedded Solana wallet on a user, by index.
+#[cfg(test)]
 fn embedded_solana_wallet_id(accounts: &[LinkedAccount]) -> Option<String> {
+    embedded_solana_wallet(accounts).and_then(|a| a.id.clone())
+}
+
+fn embedded_solana_wallet(accounts: &[LinkedAccount]) -> Option<&LinkedAccount> {
     accounts
         .iter()
         .filter(|a| a.kind == "wallet" && a.chain_type.as_deref() == Some("solana"))
@@ -616,13 +645,14 @@ fn embedded_solana_wallet_id(accounts: &[LinkedAccount]) -> Option<String> {
         })
         .filter(|a| a.id.is_some())
         .min_by_key(|a| a.wallet_index.unwrap_or(i64::MAX))
-        .and_then(|a| a.id.clone())
 }
 
 #[derive(Deserialize)]
 struct WalletResponse {
     id: String,
     address: String,
+    #[serde(default)]
+    chain_type: Option<String>,
     #[serde(default)]
     owner_id: Option<String>,
     #[serde(default)]
@@ -1059,6 +1089,55 @@ pub(crate) mod tests {
             Some("w_sol1")
         );
         assert!(embedded_solana_wallet_id(&[]).is_none());
+    }
+
+    async fn serve_json(user: serde_json::Value, wallet: serde_json::Value) -> String {
+        let app = Router::new()
+            .route("/users/{id}", get(move || async move { Json(user) }))
+            .route("/wallets/{id}", get(move || async move { Json(wallet) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn provider_responses_must_match_the_requested_user_and_wallet() {
+        let linked = |address: &str| {
+            json!({ "id": USER, "linked_accounts": [
+                { "type": "wallet", "id": "w_1", "address": address, "chain_type": "solana",
+                  "connector_type": "embedded", "wallet_index": 0 }
+            ]})
+        };
+        let wallet = |id: &str, chain: &str| {
+            json!({ "id": id, "address": ADDRESS, "chain_type": chain,
+                    "additional_signers": [{ "signer_id": SIGNER }] })
+        };
+        let ok = serve_json(linked(ADDRESS), wallet("w_1", "solana")).await;
+        let privy = Privy::new(FakeApp::new(&ok).cfg).unwrap();
+        assert_eq!(privy.solana_wallet(USER).await.unwrap().unwrap().id, "w_1");
+
+        for (user, wallet) in [
+            (linked(ADDRESS), wallet("w_other", "solana")),
+            (linked(ADDRESS), wallet("w_1", "ethereum")),
+            (
+                linked("SomeOtherAddress1111111111111111111111111111"),
+                wallet("w_1", "solana"),
+            ),
+            (
+                json!({ "id": "did:privy:other", "linked_accounts": linked(ADDRESS)["linked_accounts"] }),
+                wallet("w_1", "solana"),
+            ),
+        ] {
+            let base = serve_json(user, wallet).await;
+            let privy = Privy::new(FakeApp::new(&base).cfg).unwrap();
+            assert!(matches!(
+                privy.solana_wallet(USER).await,
+                Err(PrivyError::Protocol(_))
+            ));
+        }
     }
 
     #[tokio::test]
