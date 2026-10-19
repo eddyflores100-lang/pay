@@ -537,8 +537,12 @@ struct StreamUsageAccumulator {
     output_bytes: u64,
     output_chars: u64,
     output_words: u64,
+    /// UTF-8 bytes of streamed text: an upper bound on its tokenizer units.
+    output_text_bytes: u64,
     input_tokens: u64,
     output_tokens: u64,
+    provider_output_tokens: bool,
+    finished: bool,
     request_seen: bool,
     observed: bool,
 }
@@ -554,8 +558,11 @@ impl StreamUsageAccumulator {
             output_bytes: 0,
             output_chars: 0,
             output_words: 0,
+            output_text_bytes: 0,
             input_tokens: 0,
             output_tokens: 0,
+            provider_output_tokens: false,
+            finished: false,
             request_seen: false,
             observed: false,
         }
@@ -618,6 +625,8 @@ impl StreamUsageAccumulator {
         } else {
             self.finish_ndjson()?
         };
+        self.finished = true;
+        let changed = changed || (!self.provider_output_tokens && self.output_text_bytes > 0);
         self.observed |= changed;
         Ok(changed)
     }
@@ -651,6 +660,9 @@ impl StreamUsageAccumulator {
             self.output_words = self
                 .output_words
                 .saturating_add(streamed_text_word_count(value));
+            self.output_text_bytes = self
+                .output_text_bytes
+                .saturating_add(streamed_text_byte_count(value));
             changed = true;
         }
         if let Some(input) = provider_token_quantity(value, MeterDirection::Input) {
@@ -659,9 +671,22 @@ impl StreamUsageAccumulator {
         }
         if let Some(output) = provider_token_quantity(value, MeterDirection::Output) {
             self.output_tokens = self.output_tokens.max(output);
+            self.provider_output_tokens = true;
             changed = true;
         }
         changed
+    }
+
+    /// Output tokens to rate. Whitespace words are only a live lower bound;
+    /// a stream that ends without provider usage settles the text byte count,
+    /// which no tokenizer unit count can exceed.
+    fn output_token_amount(&self) -> u64 {
+        let floor = self.output_tokens.max(self.output_words);
+        if self.finished && !self.provider_output_tokens {
+            floor.max(self.output_text_bytes)
+        } else {
+            floor
+        }
     }
 
     fn observation(&self) -> UsageObservation {
@@ -679,16 +704,14 @@ impl StreamUsageAccumulator {
             (MeterDirection::Output, BillingUnit::Bytes) => self.output_bytes,
             (MeterDirection::Output, BillingUnit::Characters) => self.output_chars,
             (MeterDirection::Input, BillingUnit::Tokens) => self.input_tokens,
-            (MeterDirection::Output, BillingUnit::Tokens) => {
-                self.output_tokens.max(self.output_words)
-            }
+            (MeterDirection::Output, BillingUnit::Tokens) => self.output_token_amount(),
             (MeterDirection::Input, BillingUnit::QuotaUnits) => self
                 .hints
                 .tokens_per_quota_unit(MeterDirection::Input)
                 .map(|scale| ceil_div_u64(self.input_tokens, scale))
                 .unwrap_or(self.input_tokens),
             (MeterDirection::Output, BillingUnit::QuotaUnits) => {
-                let output_tokens = self.output_tokens.max(self.output_words);
+                let output_tokens = self.output_token_amount();
                 self.hints
                     .tokens_per_quota_unit(MeterDirection::Output)
                     .map(|scale| ceil_div_u64(output_tokens, scale))
@@ -924,6 +947,10 @@ fn streamed_text_char_count(value: &Value) -> u64 {
     streamed_texts(value)
         .map(|text| text.chars().count() as u64)
         .sum()
+}
+
+fn streamed_text_byte_count(value: &Value) -> u64 {
+    streamed_texts(value).map(|text| text.len() as u64).sum()
 }
 
 fn streamed_text_word_count(value: &Value) -> u64 {
@@ -1936,5 +1963,91 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         .unwrap();
 
         assert_eq!(session.committed_watermark(&channel_id), Some(7));
+    }
+
+    fn sse_text_event(text: &str) -> Vec<u8> {
+        let chunk = serde_json::json!({"choices": [{"delta": {"content": text}}]});
+        format!("data: {chunk}\n\n").into_bytes()
+    }
+
+    #[tokio::test]
+    async fn delegated_token_stream_without_provider_usage_settles_text_upper_bound() {
+        let payload = "!?".repeat(256);
+        assert_eq!(count_words(&payload), 1);
+        let (session, channel_id, meter) = delegated_test_meter(
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )],
+            "missing-usage-upper-bound",
+        )
+        .await;
+
+        drain_delegated(
+            vec![sse_text_event(&payload), b"data: [DONE]\n\n".to_vec()],
+            meter,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            session.committed_watermark(&channel_id),
+            Some(payload.len() as u64),
+            "a word count must never be the final token settlement"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_token_stream_settles_provider_usage_when_reported() {
+        let payload = "!?".repeat(256);
+        let (session, channel_id, meter) = delegated_test_meter(
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )],
+            "provider-usage-authoritative",
+        )
+        .await;
+
+        drain_delegated(
+            vec![
+                sse_text_event(&payload),
+                b"data: {\"choices\":[],\"usage\":{\"completion_tokens\":300}}\n\n".to_vec(),
+                b"data: [DONE]\n\n".to_vec(),
+            ],
+            meter,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(session.committed_watermark(&channel_id), Some(300));
+    }
+
+    #[test]
+    fn missing_output_usage_upper_bound_counts_utf8_bytes_only_at_finish() {
+        let spec = SessionMeterSpec::new([SessionMeterDimension::required(
+            MeterDirection::Output,
+            BillingUnit::Tokens,
+            1,
+            1,
+        )]);
+        let mut accumulator = StreamUsageAccumulator::new(spec, SessionUsageHints::default());
+        accumulator
+            .observe_chunk(&sse_text_event("héllo wörld"), true)
+            .unwrap();
+        assert_eq!(
+            accumulator
+                .observation()
+                .get(MeterDirection::Output, BillingUnit::Tokens),
+            Some(2)
+        );
+
+        assert!(accumulator.finish_stream(true).unwrap());
+        assert_eq!(
+            accumulator
+                .observation()
+                .get(MeterDirection::Output, BillingUnit::Tokens),
+            Some("héllo wörld".len() as u64)
+        );
     }
 }
