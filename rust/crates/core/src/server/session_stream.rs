@@ -13,6 +13,7 @@ use futures_util::{Stream, StreamExt};
 use pay_types::metering::{BillingUnit, MeterDimension, MeterDirection, Metering};
 use serde_json::Value;
 
+use crate::server::completion_stream::MeteredSettlement;
 use crate::server::gate::SessionForward;
 use crate::server::metering::{
     RequestProperties, provider_token_quantity, quota_tokens_per_unit, resolve_variant,
@@ -174,6 +175,7 @@ pub struct DelegatedSessionStreamMeter {
     clamp_reprice_to_authorized: bool,
     authorization_exhausted: bool,
     next_lifecycle_touch: Instant,
+    observer: Option<MeteredSettlement>,
 }
 
 impl DelegatedSessionStreamMeter {
@@ -212,12 +214,19 @@ impl DelegatedSessionStreamMeter {
             clamp_reprice_to_authorized: false,
             authorization_exhausted: false,
             next_lifecycle_touch: Instant::now() + LIFECYCLE_TOUCH_INTERVAL,
+            observer: None,
         })
     }
 
     /// Use the exact forwarded request body size as the missing-input bound.
     pub fn with_request_body_bytes(mut self, bytes: u64) -> Self {
         self.accumulator.hints.request_body_bytes = Some(bytes);
+        self
+    }
+
+    /// Report every committed usage increment to the handler's observer.
+    pub fn with_observer(mut self, observer: Option<MeteredSettlement>) -> Self {
+        self.observer = observer;
         self
     }
 
@@ -309,6 +318,9 @@ impl DelegatedSessionStreamMeter {
             .await
             .map_err(box_error)?;
         self.gate.record_commit(accepted.cumulative);
+        if let Some(observer) = &self.observer {
+            observer.record(amount, self.forward.handle.decimals());
+        }
         self.authorization_exhausted |= exhausted_by_reprice;
         Ok(())
     }

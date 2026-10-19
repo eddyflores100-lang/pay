@@ -12,7 +12,7 @@ use http_body::Body as _;
 use pay_kit::mpp::AUTHORIZATION_HEADER;
 
 use crate::PaymentState;
-use crate::server::completion_stream::{self, DeliveryTask, StreamCompletion};
+use crate::server::completion_stream::{self, DeliveryTask, MeteredSettlement, StreamCompletion};
 use crate::server::metering::{self, RequestProperties};
 use crate::server::session_stream::{self, SessionStreamContext};
 use crate::server::telemetry;
@@ -545,6 +545,9 @@ pub(super) async fn settle_axum_delegated_response(
         return completion_stream::response(response, completion, delivery, false);
     }
 
+    let (mut parts, body) = response.into_parts();
+    let observer = parts.extensions.remove::<MeteredSettlement>();
+    let response = Response::from_parts(parts, body);
     let is_sse = response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -564,7 +567,7 @@ pub(super) async fn settle_axum_delegated_response(
     if is_sse && session_stream::DelegatedSessionStreamMeter::supports(&forward) {
         let (mut parts, body) = response.into_parts();
         let meter = match session_stream::DelegatedSessionStreamMeter::from_forward(forward) {
-            Ok(meter) => meter,
+            Ok(meter) => meter.with_observer(observer),
             Err(error) => {
                 tracing::error!(%error, "failed to configure delegated session stream metering");
                 return Response::builder()
@@ -606,9 +609,21 @@ pub(super) async fn settle_axum_delegated_response(
         parts.headers.remove(header::CONTENT_LENGTH);
         return Response::from_parts(parts, Body::from(bytes));
     }
+    let watermark = observer.map(|observer| {
+        (
+            observer,
+            forward.handle.clone(),
+            forward.channel_id.clone(),
+            forward.committed_base_units,
+        )
+    });
     match crate::server::gate::settle_delegated_session(forward, &parts.headers, Some(&bytes)).await
     {
         Ok(receipt) => {
+            if let Some((observer, handle, channel, baseline)) = watermark {
+                let committed = handle.committed_watermark(&channel).unwrap_or(baseline);
+                observer.record(committed.saturating_sub(baseline), handle.decimals());
+            }
             if let Some(receipt) = receipt {
                 for (name, value) in receipt.headers {
                     parts.headers.append(name, value);
