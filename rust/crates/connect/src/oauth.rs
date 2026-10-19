@@ -355,6 +355,10 @@ impl Store {
         if self.now().saturating_duration_since(request.created_at) > REQUEST_TTL {
             return None;
         }
+        let client = self.client(&request.client_id)?;
+        if !host_bound(&client, &request.redirect_uri) {
+            return None;
+        }
         let code = random_token();
         let grant = CodeGrant {
             client_id: request.client_id.clone(),
@@ -711,6 +715,12 @@ pub async fn authorize(
             ));
         }
     };
+    if !host_bound(&client, &redirect_uri) {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "redirect_uri does not belong to this client's host.",
+        ));
+    }
     let state_param = q.state.as_deref().filter(|s| !s.is_empty());
     let fail = |error: &str, description: &str| {
         Ok(error_redirect(
@@ -837,20 +847,30 @@ pub async fn pending_view(
         .tenants()
         .subject_from_cookie(&headers)
         .and_then(|s| state.tenants().get(&s));
+    let host = crate::hosts::verified(client.host, &request.redirect_uri);
+    // A client name is display data; a known host's name is shown only
+    // when that host's callback receives the code.
+    let client_name = client
+        .client_name
+        .clone()
+        .filter(|name| host.id != crate::hosts::GENERIC.id || !crate::hosts::names_known_host(name))
+        .unwrap_or_else(|| host.display_name.to_string());
     Ok(Json(PendingView {
-        client_name: client
-            .client_name
-            .clone()
-            .unwrap_or_else(|| crate::hosts::by_id(client.host).display_name.to_string()),
+        client_name,
         redirect_host,
         scope: request.scope,
         resource_uri: request.resource_uri,
         has_wallet: wallet.is_some(),
         wallet_address: wallet.map(|w| w.pubkey.clone()),
         providers: Vec::new(),
-        host: client.host,
+        host: host.id,
         privy: privy_login(&state),
     }))
+}
+
+/// A recognized client's code may go only to that host's callbacks.
+fn host_bound(client: &Client, redirect_uri: &str) -> bool {
+    crate::hosts::verified(client.host, redirect_uri).id == client.host
 }
 
 /// The client's redirect URI with the code and the echoed state.
@@ -1461,6 +1481,32 @@ mod tests {
     }
 
     #[test]
+    fn a_known_host_name_with_a_foreign_callback_registers_as_generic() {
+        let store = Store::new("https://cloud.test/");
+        let mut spoof = grok_registration();
+        spoof.client_name = Some("ChatGPT".to_string());
+        spoof.redirect_uris = vec!["https://attacker.example/callback".to_string()];
+        let (client, _) = store.register(spoof).unwrap();
+        assert_eq!(client.host, "generic");
+    }
+
+    #[test]
+    fn approval_refuses_a_code_for_a_callback_outside_the_host() {
+        let store = Store::new("https://cloud.test/");
+        let (client, _) = store.register(grok_registration()).unwrap();
+        let mut foreign = pending_for(&client);
+        foreign.redirect_uri = "https://attacker.example/callback".to_string();
+        let id = foreign.id.clone();
+        store.create_pending(foreign).unwrap();
+        assert!(store.approve(&id, "sub_victim").is_none());
+
+        let genuine = pending_for(&client);
+        let id = genuine.id.clone();
+        store.create_pending(genuine).unwrap();
+        assert!(store.approve(&id, "sub_victim").is_some());
+    }
+
+    #[test]
     fn registration_accepts_public_clients_with_sane_redirects() {
         let store = Store::new("https://cloud.test/");
         let (client, secret) = store.register(grok_registration()).unwrap();
@@ -2021,6 +2067,54 @@ mod tests {
             json["grant_types_supported"],
             json!(["authorization_code", "refresh_token"])
         );
+    }
+
+    async fn consent_view_for(app: &Router, name: &str, callback: &str) -> Value {
+        let reply = post_json(
+            app,
+            "/oauth/register",
+            json!({ "client_name": name, "redirect_uris": [callback] }),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.body);
+        let client_id = reply.json()["client_id"].as_str().unwrap().to_string();
+        let mut url = Url::parse("https://cloud.test/oauth/authorize").unwrap();
+        url.query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &client_id)
+            .append_pair("redirect_uri", callback)
+            .append_pair("code_challenge", &pkce_challenge(VERIFIER))
+            .append_pair("code_challenge_method", "S256");
+        let reply = get(app, &format!("{}?{}", url.path(), url.query().unwrap())).await;
+        assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+        let request = reply.query("request").unwrap();
+        let view = get(app, &format!("/api/oauth/authorize/{request}")).await;
+        assert_eq!(view.status, StatusCode::OK, "{}", view.body);
+        view.json()
+    }
+
+    #[tokio::test]
+    async fn the_consent_page_never_shows_a_spoofed_host_identity() {
+        let app = app();
+        let view = consent_view_for(&app, "ChatGPT", "https://attacker.example/callback").await;
+        assert_eq!(view["host"], "generic");
+        assert_eq!(view["client_name"], "An MCP client");
+        assert_eq!(view["redirect_host"], "attacker.example");
+
+        // The genuine host keeps its identity.
+        let view = consent_view_for(
+            &app,
+            "ChatGPT",
+            "https://chatgpt.com/connector_platform_oauth_redirect",
+        )
+        .await;
+        assert_eq!(view["host"], "chatgpt");
+        assert_eq!(view["client_name"], "ChatGPT");
+
+        // An unknown client keeps the name it registered.
+        let view = consent_view_for(&app, "Some Agent", "https://agent.example/cb").await;
+        assert_eq!(view["host"], "generic");
+        assert_eq!(view["client_name"], "Some Agent");
     }
 
     /// Start an authorization for `client_id` and return the pending id.
