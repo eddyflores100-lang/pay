@@ -736,6 +736,33 @@ pub fn build_batch_payment(
     resource_url: Option<&str>,
     auth_override: crate::signer::AuthOverride,
 ) -> Result<BuiltBatchPayment> {
+    build_batch_payment_checked(
+        challenge,
+        store,
+        cache,
+        deposit_amount,
+        network_override,
+        account_override,
+        resource_url,
+        auth_override,
+        &|_| Ok(()),
+    )
+}
+
+/// [`build_batch_payment`], calling `authorize_escrow` with the exact amount
+/// an `open` or `top_up` would move into escrow before any approval or signing.
+#[allow(clippy::too_many_arguments)]
+pub fn build_batch_payment_checked(
+    challenge: &BatchChallenge,
+    store: &dyn AccountsStore,
+    cache: &crate::client::batch::BatchChannelCache,
+    deposit_amount: Option<u64>,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+    auth_override: crate::signer::AuthOverride,
+    authorize_escrow: &dyn Fn(u64) -> Result<()>,
+) -> Result<BuiltBatchPayment> {
     use pay_kit::x402::client::batch_settlement as batch_client;
 
     // Resolve ambiguous funding before wallet approval or building another
@@ -774,6 +801,9 @@ pub fn build_batch_payment(
                 .max(price),
         ),
     };
+    if let Some(escrow) = escrow_amount {
+        authorize_escrow(escrow)?;
+    }
     // Opening and topping up move additional funds into escrow, so both must
     // go through wallet approval. A voucher/authorization only spends capacity
     // covered by the already-approved deposit and can reuse its resident
@@ -1204,6 +1234,89 @@ fn x402_version_from_json(body: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn batch_challenge_with_min_deposit(min_deposit: &str) -> BatchChallenge {
+        use base64::Engine;
+        let envelope = serde_json::json!({
+            "x402Version": 2,
+            "accepts": [{
+                "scheme": "batch-settlement",
+                "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "amount": "1000",
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "payTo": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+                "maxTimeoutSeconds": 300,
+                "extra": {
+                    "feePayer": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                    "withdrawDelay": 3600,
+                    "minDeposit": min_deposit,
+                    "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+                }
+            }]
+        });
+        let headers = vec![(
+            "payment-required".to_string(),
+            base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&envelope).unwrap()),
+        )];
+        match crate::client::runner::classify_402(&headers, None, "https://example.com/r") {
+            crate::client::runner::RunOutcome::X402BatchChallenge { challenge, .. } => *challenge,
+            other => panic!("expected a batch challenge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_escrow_from_min_deposit_is_authorized_before_signing() {
+        let challenge = batch_challenge_with_min_deposit("5000000");
+        let store = crate::accounts::MemoryAccountsStore::new();
+        let cache = crate::client::batch::BatchChannelCache::default();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let result = build_batch_payment_checked(
+            &challenge,
+            &store,
+            &cache,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &|escrow| {
+                seen.lock().unwrap().push(escrow);
+                if escrow > 1000 {
+                    Err(Error::PaymentRejected(format!("escrow {escrow} over cap")))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        let err = result.expect_err("oversized escrow must be refused");
+        assert!(err.to_string().contains("escrow 5000000 over cap"), "{err}");
+        assert_eq!(*seen.lock().unwrap(), vec![5_000_000]);
+    }
+
+    #[test]
+    fn batch_escrow_without_min_deposit_is_the_request_price() {
+        let challenge = batch_challenge_with_min_deposit("10");
+        let store = crate::accounts::MemoryAccountsStore::new();
+        let cache = crate::client::batch::BatchChannelCache::default();
+        let seen = std::sync::Mutex::new(Vec::new());
+        // A minimum below the price is ignored; the open escrows the price.
+        let _ = build_batch_payment_checked(
+            &challenge,
+            &store,
+            &cache,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &|escrow| {
+                seen.lock().unwrap().push(escrow);
+                Ok(())
+            },
+        );
+        assert_eq!(*seen.lock().unwrap(), vec![1000]);
+    }
     use crate::accounts::{Account, AccountsFile, BackendKind, MemoryAccountsStore};
     use pay_kit::x402::exact::EXACT_SCHEME;
 

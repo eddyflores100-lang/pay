@@ -1032,6 +1032,18 @@ fn prepare_hardware_account(
     }
 }
 
+fn authorize_batch_escrow(
+    scope: &crate::context::CallScope,
+    challenge: &pay_core::client::x402::BatchChallenge,
+    resource_url: &str,
+    escrow: u64,
+) -> Result<(), pay_core::Error> {
+    match &scope.payment_permissions {
+        Some(permissions) => permissions.authorize_batch_escrow(challenge, resource_url, escrow),
+        None => Ok(()),
+    }
+}
+
 /// Hosted payments settle only challenges issued by the origin the caller
 /// requested; the paid retry is sent to that origin.
 fn reject_cross_origin_challenge(
@@ -1306,7 +1318,7 @@ fn do_paid_fetch(
                 permissions.authorize_batch(&challenge, &resource_url)?;
             }
             let built = scope.with_approval(peer.as_ref(), |auth| {
-                pay_core::client::x402::build_batch_payment(
+                pay_core::client::x402::build_batch_payment_checked(
                     &challenge,
                     store,
                     &session_cache.batch_channels,
@@ -1315,6 +1327,7 @@ fn do_paid_fetch(
                     account_override.as_deref(),
                     Some(url),
                     auth,
+                    &|escrow| authorize_batch_escrow(scope, &challenge, &resource_url, escrow),
                 )
             })?;
             let mut headers = extra_headers.to_vec();
@@ -1345,7 +1358,7 @@ fn do_paid_fetch(
                     permissions.authorize_batch(corrective, &resource_url)?;
                 }
                 let retry = scope.with_approval(peer.as_ref(), |auth| {
-                    pay_core::client::x402::build_batch_payment(
+                    pay_core::client::x402::build_batch_payment_checked(
                         corrective,
                         store,
                         &session_cache.batch_channels,
@@ -1354,6 +1367,7 @@ fn do_paid_fetch(
                         account_override.as_deref(),
                         Some(url),
                         auth,
+                        &|escrow| authorize_batch_escrow(scope, corrective, &resource_url, escrow),
                     )
                 })?;
                 let mut headers = extra_headers.to_vec();

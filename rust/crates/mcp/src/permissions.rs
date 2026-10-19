@@ -155,9 +155,13 @@ fn parse_network(value: &str) -> Result<SolanaNetwork, String> {
         "mainnet" | "mainnet-beta" | "solana:mainnet" => Ok(SolanaNetwork::Mainnet),
         "devnet" | "solana:devnet" => Ok(SolanaNetwork::Devnet),
         "localnet" | "localhost" => Ok(SolanaNetwork::Localnet),
-        value => pay_kit::x402::exact::cluster_for_caip2_network(value)
-            .and_then(|cluster| cluster.parse().ok())
-            .ok_or_else(|| format!("invalid Solana network `{value}`")),
+        value => match pay_kit::x402::exact::cluster_for_caip2_network(value) {
+            Some("mainnet-beta") => Ok(SolanaNetwork::Mainnet),
+            Some(cluster) => cluster
+                .parse()
+                .map_err(|_| format!("invalid Solana network `{value}`")),
+            None => Err(format!("invalid Solana network `{value}`")),
+        },
     }
 }
 
@@ -288,6 +292,22 @@ impl McpPermissions {
             &request.method_details.network,
             &request.currency,
             deposit,
+        )
+    }
+
+    /// Authorize the escrow a batch `open` or `top_up` would deposit.
+    pub fn authorize_batch_escrow(
+        &self,
+        challenge: &x402::BatchChallenge,
+        resource_url: &str,
+        escrow: u64,
+    ) -> Result<(), pay_core::Error> {
+        let requirement = &challenge.requirements;
+        self.authorize(
+            resource_url,
+            &requirement.network,
+            &requirement.asset,
+            escrow,
         )
     }
 
@@ -422,6 +442,81 @@ assets:
         assert!(
             McpPermissions::hosted()
                 .authorize_session(&session_challenge("SOL", "1"), "https://a.example/x")
+                .is_err()
+        );
+    }
+
+    fn batch_challenge(min_deposit: &str) -> x402::BatchChallenge {
+        use base64::Engine;
+        let envelope = serde_json::json!({
+            "x402Version": 2,
+            "accepts": [{
+                "scheme": "batch-settlement",
+                "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "amount": "1000",
+                "asset": USDC,
+                "payTo": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+                "maxTimeoutSeconds": 300,
+                "extra": {
+                    "feePayer": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                    "withdrawDelay": 3600,
+                    "minDeposit": min_deposit,
+                    "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+                }
+            }]
+        });
+        let headers = vec![(
+            "payment-required".to_string(),
+            base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&envelope).unwrap()),
+        )];
+        match pay_core::client::runner::classify_402(&headers, None, "https://a.example/x") {
+            pay_core::client::runner::RunOutcome::X402BatchChallenge { challenge, .. } => {
+                *challenge
+            }
+            other => panic!("expected batch challenge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn caip2_networks_resolve_to_their_cluster() {
+        assert_eq!(
+            parse_network("solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"),
+            Ok(SolanaNetwork::Mainnet)
+        );
+        assert_eq!(
+            parse_network("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"),
+            Ok(SolanaNetwork::Devnet)
+        );
+        assert!(parse_network("solana:unknown").is_err());
+    }
+
+    #[test]
+    fn batch_escrow_is_capped_even_when_the_request_price_fits() {
+        let capped = McpPermissions::from_config(&PermissionConfig {
+            max_payment: Some("$1".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        let challenge = batch_challenge("5000000");
+        assert!(
+            capped
+                .authorize_batch(&challenge, "https://a.example/x")
+                .is_ok()
+        );
+        assert!(
+            capped
+                .authorize_batch_escrow(&challenge, "https://a.example/x", 5_000_000)
+                .is_err()
+        );
+        assert!(
+            capped
+                .authorize_batch_escrow(&challenge, "https://a.example/x", 1_000_000)
+                .is_ok()
+        );
+        assert!(
+            capped
+                .authorize_batch_escrow(&challenge, "https://a.example/x", 1_000_001)
                 .is_err()
         );
     }
