@@ -204,21 +204,35 @@ pub fn resolve_price(
 /// batch) charges. Those schemes authorize before the request body is read,
 /// so only a path-derived hint can select a variant; otherwise the body may
 /// select any variant and the most expensive candidate is charged.
+///
+/// Errors when a dimension is aggregate-settled (tokens, quota units, or a
+/// response meter): its quantity is unknown before authorization.
 pub fn resolve_fixed_price(
     metering: &Metering,
     props: &RequestProperties,
     variant_hint: Option<&str>,
-) -> Option<ResolvedPrice> {
+) -> Result<Option<ResolvedPrice>, String> {
+    if let Some(dim) = metering
+        .dimensions
+        .iter()
+        .chain(metering.variants.iter().flat_map(|v| v.dimensions.iter()))
+        .find(|dim| dim.is_aggregate_settled())
+    {
+        return Err(format!(
+            "{:?} {:?} usage is metered from the response and cannot be charged per call",
+            dim.direction, dim.unit
+        ));
+    }
     let dimensions = fixed_charge_dimensions(metering, props, variant_hint);
     if dimensions.is_empty() {
-        return resolve_price(metering, props, variant_hint, None);
+        return Ok(resolve_price(metering, props, variant_hint, None));
     }
-    Some(resolve_dimensions_as(
+    Ok(Some(resolve_dimensions_as(
         dimensions,
         props,
         None,
         Unmeasured::Costliest,
-    ))
+    )))
 }
 
 fn fixed_charge_dimensions<'a>(
@@ -3007,15 +3021,21 @@ mod tests {
         ));
         let props = RequestProperties::default();
 
-        let unhinted = resolve_fixed_price(&metering, &props, None).unwrap();
+        let unhinted = resolve_fixed_price(&metering, &props, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(per_call_usd(&unhinted), 0.10);
         // Request-time pricing (upto/session) still uses the default variant.
         let legacy = resolve_price(&metering, &props, None, None).unwrap();
         assert_eq!(per_call_usd(&legacy), 0.05);
 
-        let cheap = resolve_fixed_price(&metering, &props, Some("cheap")).unwrap();
+        let cheap = resolve_fixed_price(&metering, &props, Some("cheap"))
+            .unwrap()
+            .unwrap();
         assert_eq!(per_call_usd(&cheap), 0.01);
-        let other = resolve_fixed_price(&metering, &props, Some("unlisted")).unwrap();
+        let other = resolve_fixed_price(&metering, &props, Some("unlisted"))
+            .unwrap()
+            .unwrap();
         assert_eq!(per_call_usd(&other), 0.05);
     }
 
@@ -3028,16 +3048,28 @@ mod tests {
         let props = RequestProperties::default();
 
         assert_eq!(
-            per_call_usd(&resolve_fixed_price(&metering, &props, None).unwrap()),
+            per_call_usd(
+                &resolve_fixed_price(&metering, &props, None)
+                    .unwrap()
+                    .unwrap()
+            ),
             0.25
         );
         // A path hint that matches nothing uses the top-level backstop.
         assert_eq!(
-            per_call_usd(&resolve_fixed_price(&metering, &props, Some("x")).unwrap()),
+            per_call_usd(
+                &resolve_fixed_price(&metering, &props, Some("x"))
+                    .unwrap()
+                    .unwrap()
+            ),
             0.25
         );
         assert_eq!(
-            per_call_usd(&resolve_fixed_price(&metering, &props, Some("cheap")).unwrap()),
+            per_call_usd(
+                &resolve_fixed_price(&metering, &props, Some("cheap"))
+                    .unwrap()
+                    .unwrap()
+            ),
             0.01
         );
     }
@@ -3050,6 +3082,7 @@ mod tests {
             request_variant("premium", 0.10),
         ));
         let price = resolve_fixed_price(&metering, &RequestProperties::default(), Some("unlisted"))
+            .unwrap()
             .unwrap();
         assert_eq!(per_call_usd(&price), 0.10);
     }
@@ -3090,7 +3123,11 @@ mod tests {
                 body_size,
                 ..Default::default()
             };
-            per_call_usd(&resolve_fixed_price(&metering, &props, None).unwrap())
+            per_call_usd(
+                &resolve_fixed_price(&metering, &props, None)
+                    .unwrap()
+                    .unwrap(),
+            )
         };
         assert_eq!(price(None), 0.10);
         assert_eq!(price(Some(1_048_577)), 0.10);
@@ -3105,7 +3142,11 @@ mod tests {
         );
         let props = RequestProperties::default();
         assert_eq!(
-            per_call_usd(&resolve_fixed_price(&metering, &props, None).unwrap()),
+            per_call_usd(
+                &resolve_fixed_price(&metering, &props, None)
+                    .unwrap()
+                    .unwrap()
+            ),
             0.05
         );
         // Response-repriced paths keep their provisional estimate.
@@ -3153,7 +3194,34 @@ mod tests {
         let metering = yaml_metering(
             "dimensions:\n  - direction: usage\n    unit: requests\n    scale: 1\n    tiers: [{price_usd: 0.001}]\n  - direction: usage\n    unit: requests\n    scale: 1\n    tiers: [{price_usd: 0.5}]\n",
         );
-        let price = resolve_fixed_price(&metering, &RequestProperties::default(), None).unwrap();
+        let price = resolve_fixed_price(&metering, &RequestProperties::default(), None)
+            .unwrap()
+            .unwrap();
         assert!((per_call_usd(&price) - 0.501).abs() < 1e-12);
+    }
+
+    #[test]
+    fn fixed_price_rejects_aggregate_settled_dimensions() {
+        for dims in [
+            "  - direction: input\n    unit: tokens\n    scale: 1000000\n    tiers: [{price_usd: 1.0}]\n",
+            "  - direction: input\n    unit: quota_units\n    scale: 1\n    tiers: [{price_usd: 1.0}]\n",
+            "  - direction: output\n    unit: bytes\n    scale: 1\n    meter: {source: response_header, header: x-bytes}\n    tiers: [{price_usd: 1.0}]\n",
+        ] {
+            let top = yaml_metering(&format!("dimensions:\n{dims}"));
+            assert!(resolve_fixed_price(&top, &RequestProperties::default(), None).is_err());
+            let nested = dims
+                .replace("\n  ", "\n        ")
+                .replacen("  -", "        -", 1);
+            let variant = yaml_metering(&format!(
+                "variants:\n{}  - param: model\n    value: big\n    dimensions:\n{nested}",
+                request_variant("small", 0.01)
+            ));
+            assert!(
+                resolve_fixed_price(&variant, &RequestProperties::default(), Some("small"))
+                    .is_err()
+            );
+        }
+        let flat = yaml_metering(&format!("variants:\n{}", request_variant("small", 0.01)));
+        assert!(resolve_fixed_price(&flat, &RequestProperties::default(), None).is_ok());
     }
 }

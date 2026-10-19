@@ -458,3 +458,38 @@ async fn fixed_charge_covers_every_request_dimension() {
         "501000000"
     );
 }
+
+// ── Aggregate token pricing on fixed schemes (SOLA1-210) ───────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn token_priced_endpoint_is_never_charged_per_call() {
+    let api = spec(
+        r#"
+name: token-priced
+subdomain: token-priced
+title: Token priced
+description: Token priced endpoint
+category: ai_ml
+version: v1
+routing:
+  type: respond
+endpoints:
+  - method: POST
+    path: v1/generate
+    metering:
+      dimensions:
+        - direction: input
+          unit: tokens
+          scale: 1000000
+          tiers: [{price_usd: 1.0}]
+"#,
+    );
+    assert!(!pay_types::metering::validate_api_spec(&api).is_empty());
+
+    let challenge = challenge(&api, "v1/generate", Some(2)).await;
+    assert!(
+        challenge.charge.is_none(),
+        "no per-call charge may be offered"
+    );
+    assert_eq!(challenge.status, StatusCode::INTERNAL_SERVER_ERROR);
+}

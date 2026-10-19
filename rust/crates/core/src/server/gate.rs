@@ -840,7 +840,11 @@ impl<S: PaymentState> PaymentGate<S> {
         };
         let variant = variant_hint_from_path(path);
         let price = metering::resolve_price(meter, &props, variant.as_deref(), None);
-        let fixed_price = metering::resolve_fixed_price(meter, &props, variant.as_deref());
+        // Fixed per-call schemes are dropped (fail closed) when the meter
+        // cannot be priced before authorization.
+        let fixed_price = metering::resolve_fixed_price(meter, &props, variant.as_deref())
+            .inspect_err(|e| telemetry::record_challenge_error("mpp/charge", "configured", e))
+            .ok();
         let split_rules = metering::resolve_split_rules(meter, &props, variant.as_deref());
 
         let mut challenge_headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
@@ -870,7 +874,9 @@ impl<S: PaymentState> PaymentGate<S> {
             advertised.push("mpp/session");
         }
 
-        if accepted.contains(&Scheme::MppCharge) {
+        if accepted.contains(&Scheme::MppCharge)
+            && let Some(fixed_price) = &fixed_price
+        {
             let mpps = self.state.mpps();
             if !mpps.is_empty() {
                 let amount = crate::server::payment::charge_amount_from_price(fixed_price.as_ref());
@@ -937,6 +943,7 @@ impl<S: PaymentState> PaymentGate<S> {
         }
 
         if accepted.contains(&Scheme::X402Exact)
+            && let Some(fixed_price) = &fixed_price
             && let Some(x402) = self.state.x402()
         {
             let amount = crate::server::payment::charge_amount_from_price(fixed_price.as_ref());
@@ -1003,6 +1010,7 @@ impl<S: PaymentState> PaymentGate<S> {
         }
 
         if accepted.contains(&Scheme::X402BatchSettlement)
+            && let Some(fixed_price) = &fixed_price
             && let Some(batch) = self.state.x402_batch()
         {
             let amount = crate::server::payment::charge_amount_from_price(fixed_price.as_ref());
@@ -1033,7 +1041,10 @@ impl<S: PaymentState> PaymentGate<S> {
             ));
         }
 
-        let amount_usd = fixed_price.as_ref().map(metering::per_call_usd);
+        let amount_usd = fixed_price
+            .as_ref()
+            .and_then(Option::as_ref)
+            .map(metering::per_call_usd);
         let challenge_protocol = if advertised.len() == 1 {
             advertised[0]
         } else {
@@ -1094,9 +1105,10 @@ impl<S: PaymentState> PaymentGate<S> {
             ..Default::default()
         };
         let variant = variant_hint_from_path(path);
-        let amount = crate::server::payment::charge_amount_from_price(
-            metering::resolve_fixed_price(meter, &props, variant.as_deref()).as_ref(),
-        );
+        let amount = match fixed_charge_amount(meter, &props, variant.as_deref()) {
+            Ok(amount) => amount,
+            Err(response) => return GateDecision::Respond(response),
+        };
         let payment = amount
             .parse()
             .ok()
@@ -1283,9 +1295,10 @@ impl<S: PaymentState> PaymentGate<S> {
             ..Default::default()
         };
         let variant = variant_hint_from_path(path);
-        let amount = crate::server::payment::charge_amount_from_price(
-            metering::resolve_fixed_price(meter, &props, variant.as_deref()).as_ref(),
-        );
+        let amount = match fixed_charge_amount(meter, &props, variant.as_deref()) {
+            Ok(amount) => amount,
+            Err(response) => return GateDecision::Respond(response),
+        };
         let payment = amount
             .parse()
             .ok()
@@ -1681,9 +1694,10 @@ impl<S: PaymentState> PaymentGate<S> {
             ..Default::default()
         };
         let variant = variant_hint_from_path(path);
-        let amount = crate::server::payment::charge_amount_from_price(
-            metering::resolve_fixed_price(meter, &props, variant.as_deref()).as_ref(),
-        );
+        let amount = match fixed_charge_amount(meter, &props, variant.as_deref()) {
+            Ok(amount) => amount,
+            Err(response) => return GateDecision::Respond(response),
+        };
         // Reconstruct a URI for split-rule query params (splits price off the request).
         let uri = reconstruct_uri(path, req.query);
         let split_rules = metering::resolve_split_rules(meter, &props, variant.as_deref());
@@ -2414,6 +2428,28 @@ fn x402_payment_scheme(header: &str) -> Option<String> {
         .or_else(|| payload.get("scheme"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
+}
+
+/// The per-call amount for MPP charge / x402 exact / x402 batch, or a 500 when
+/// the meter cannot be priced before authorization.
+fn fixed_charge_amount(
+    meter: &pay_types::metering::Metering,
+    props: &metering::RequestProperties,
+    variant: Option<&str>,
+) -> Result<String, GateResponse> {
+    match metering::resolve_fixed_price(meter, props, variant) {
+        Ok(price) => Ok(crate::server::payment::charge_amount_from_price(
+            price.as_ref(),
+        )),
+        Err(message) => Err(GateResponse::json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::to_vec(&json!({
+                "error": "payment_configuration_error",
+                "message": message,
+            }))
+            .unwrap_or_default(),
+        )),
+    }
 }
 
 fn variant_hint_from_path(path: &str) -> Option<String> {

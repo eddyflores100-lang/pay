@@ -1463,6 +1463,14 @@ pub struct MeterDimension {
     pub meter: Option<UsageMeter>,
 }
 
+impl MeterDimension {
+    /// Settled from measured usage (`Σ quantity/scale × price`), so a fixed
+    /// per-call scheme cannot know its amount before authorization.
+    pub fn is_aggregate_settled(&self) -> bool {
+        matches!(self.unit, BillingUnit::Tokens | BillingUnit::QuotaUnits) || self.meter.is_some()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct UsageMeter {
     pub source: UsageMeterSource,
@@ -1749,6 +1757,7 @@ pub fn validate_api_spec(spec: &ApiSpec) -> Vec<String> {
         );
         validate_price_precision(metering, path, &mut errs);
         validate_upto_ceiling(metering, path, &mut errs);
+        validate_fixed_scheme_dimensions(metering, path, &mut errs);
     }
 
     // Channel distribution splits from a top-level `session:` block.
@@ -2460,6 +2469,36 @@ fn validate_session_splits(
             "session splits must leave a positive primary recipient share (total < 100%)"
                 .to_string(),
         );
+    }
+}
+
+/// Fixed per-call schemes charge before any usage is measured, so they cannot
+/// price aggregate-settled (token, quota-unit, or response-metered) dimensions.
+fn validate_fixed_scheme_dimensions(metering: &Metering, path: &str, errs: &mut Vec<String>) {
+    let fixed: Vec<Scheme> = metering
+        .accepted_schemes()
+        .into_iter()
+        .filter(|scheme| {
+            matches!(
+                scheme,
+                Scheme::MppCharge | Scheme::X402Exact | Scheme::X402BatchSettlement
+            )
+        })
+        .collect();
+    if fixed.is_empty() {
+        return;
+    }
+    let aggregate = metering
+        .dimensions
+        .iter()
+        .chain(metering.variants.iter().flat_map(|v| v.dimensions.iter()))
+        .any(MeterDimension::is_aggregate_settled);
+    if aggregate {
+        errs.push(format!(
+            "endpoint `{path}`: usage-metered dimensions (tokens, quota_units, or a `meter`) \
+             cannot be charged per call by {fixed:?}; list only `mpp-session` / `x402-upto` \
+             in `schemes` (omitted schemes default to `mpp-charge`)"
+        ));
     }
 }
 
@@ -4367,6 +4406,53 @@ endpoints:
         );
         let explicit: ApiSpec = serde_yml::from_str(&yaml("      upto: {max_usd: 2.0}")).unwrap();
         assert!(validate_api_spec(&explicit).is_empty());
+    }
+
+    #[test]
+    fn validate_fixed_schemes_reject_aggregate_dimensions() {
+        let yaml = |schemes: &str, unit: &str| {
+            format!(
+                r#"
+name: t
+subdomain: t
+title: T
+description: T
+category: ai_ml
+version: v1
+routing: {{type: respond}}
+endpoints:
+  - method: POST
+    path: v1/generate
+    metering:
+{schemes}
+      upto: {{max_usd: 1.0}}
+      dimensions:
+        - direction: input
+          unit: {unit}
+          scale: 1000000
+          tiers: [{{price_usd: 1.0}}]
+"#
+            )
+        };
+        let errs_for = |schemes: &str, unit: &str| {
+            validate_api_spec(&serde_yml::from_str::<ApiSpec>(&yaml(schemes, unit)).unwrap())
+        };
+        for schemes in [
+            "",
+            "      schemes: [mpp-charge]",
+            "      schemes: [x402-exact]",
+            "      schemes: [x402-batch-settlement]",
+            "      schemes: [mpp-session, mpp-charge]",
+        ] {
+            let errs = errs_for(schemes, "tokens");
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains("cannot be charged per call")),
+                "{schemes}: {errs:?}"
+            );
+        }
+        assert!(errs_for("      schemes: [mpp-session, x402-upto]", "tokens").is_empty());
+        assert!(errs_for("", "requests").is_empty());
     }
 
     #[test]
