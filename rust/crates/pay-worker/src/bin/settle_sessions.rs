@@ -1973,7 +1973,9 @@ fn record_resource_cleanup(
             );
         }
     } else {
+        // A late resource reopens cleanup; completion is never permanent.
         state.extra.remove(RESOURCE_CLEANUP_EMPTY_SINCE);
+        state.extra.remove(RESOURCE_CLEANUP_COMPLETED_AT);
     }
     state.extra.contains_key(RESOURCE_CLEANUP_COMPLETED_AT)
 }
@@ -1993,9 +1995,8 @@ async fn ensure_resource_cleanup(
     {
         return Ok(true);
     }
-    if state.extra.contains_key(RESOURCE_CLEANUP_COMPLETED_AT) {
-        return Ok(true);
-    }
+    // A recorded completion is revalidated by a fresh provider scan before
+    // the caller may drop the channel record.
     if runtime.dry_run {
         info!(
             channel_id = %state.channel_id,
@@ -4756,6 +4757,28 @@ mod tests {
 
         assert!(!record_resource_cleanup(&mut state, 2_000, 500, 0));
         assert!(record_resource_cleanup(&mut state, 2_500, 500, 0));
+    }
+
+    #[test]
+    fn completed_cleanup_reopens_when_a_late_resource_is_observed() {
+        let mut state = channel_state();
+        state.close_requested_at = Some(1);
+        assert!(!record_resource_cleanup(&mut state, 1_000, 500, 0));
+        assert!(record_resource_cleanup(&mut state, 1_500, 500, 0));
+        assert!(state.extra.contains_key(RESOURCE_CLEANUP_COMPLETED_AT));
+
+        // A resource that became visible after completion must block deletion
+        // and restart the quiet window.
+        assert!(!record_resource_cleanup(&mut state, 1_600, 500, 1));
+        assert!(!state.extra.contains_key(RESOURCE_CLEANUP_COMPLETED_AT));
+        assert!(!state.extra.contains_key(RESOURCE_CLEANUP_EMPTY_SINCE));
+        assert!(resource_cleanup_required(&state, 1_600));
+
+        assert!(!record_resource_cleanup(&mut state, 1_700, 500, 0));
+        assert!(!record_resource_cleanup(&mut state, 2_199, 500, 0));
+        assert!(record_resource_cleanup(&mut state, 2_200, 500, 0));
+        // A further empty scan keeps the completion.
+        assert!(record_resource_cleanup(&mut state, 2_300, 500, 0));
     }
 
     #[test]
