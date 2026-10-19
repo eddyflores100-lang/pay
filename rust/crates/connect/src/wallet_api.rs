@@ -150,6 +150,19 @@ fn transaction_spend_minor(
     }
     // Account zero pays the fees; the policy accounts only for stablecoins.
     let pays_fees = signer_index == 0;
+    // Each signature costs a base fee: the wallet signs alone when it pays
+    // fees, or beside exactly one fee-paying sponsor.
+    let required = usize::from(transaction.message.header().num_required_signatures);
+    if required != if pays_fees { 1 } else { 2 } || (!pays_fees && signer_index != 1) {
+        return Err(signing_denied(
+            "Only the hosted wallet and at most one fee-paying sponsor may sign.",
+        ));
+    }
+    if transaction.signatures.len() != required {
+        return Err(signing_denied(
+            "The transaction's signature slots do not match its signers.",
+        ));
+    }
     let instructions = transaction.message.instructions();
     if instructions.is_empty() || instructions.len() > MAX_INSTRUCTIONS {
         return Err(signing_denied(
@@ -235,7 +248,8 @@ fn transaction_spend_minor(
                 }
                 _ => return Err(signing_denied("The compute-budget instruction is invalid.")),
             },
-            programs::MEMO_PROGRAM if instruction.data.len() <= 566 => {}
+            programs::MEMO_PROGRAM
+                if instruction.data.len() <= 566 && instruction.accounts.is_empty() => {}
             _ => {
                 return Err(signing_denied(
                     "The transaction contains an instruction that hosted CLI wallets do not allow.",
@@ -599,6 +613,78 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// Append a memo whose instruction lists `signers` (new keys, signing).
+    fn with_memo(mut transaction: VersionedTransaction, signers: usize) -> VersionedTransaction {
+        let memo: Pubkey = pay_kit::mpp::protocol::solana::programs::MEMO_PROGRAM
+            .parse()
+            .unwrap();
+        let VersionedMessage::Legacy(message) = &mut transaction.message else {
+            unreachable!()
+        };
+        // New read-only signers go after the existing signers.
+        let at = usize::from(message.header.num_required_signatures);
+        for _ in 0..signers {
+            message.account_keys.insert(at, Pubkey::new_unique());
+            for instruction in &mut message.instructions {
+                if usize::from(instruction.program_id_index) >= at {
+                    instruction.program_id_index += 1;
+                }
+                for account in &mut instruction.accounts {
+                    if usize::from(*account) >= at {
+                        *account += 1;
+                    }
+                }
+            }
+            transaction.signatures.push(Default::default());
+        }
+        message.header.num_required_signatures += signers as u8;
+        message.header.num_readonly_signed_accounts += signers as u8;
+        message.account_keys.push(memo);
+        message.header.num_readonly_unsigned_accounts += 1;
+        message.instructions.push(CompiledInstruction {
+            program_id_index: (message.account_keys.len() - 1) as u8,
+            accounts: (at..at + signers).map(|i| i as u8).collect(),
+            data: b"invoice 42".to_vec(),
+        });
+        transaction
+    }
+
+    #[test]
+    fn memos_cannot_add_signers_or_accounts() {
+        let (transaction, signer) = payment_transaction(10_000);
+        let signer = signer.to_string();
+        // A plain memo is fine.
+        assert_eq!(
+            transaction_spend_minor(&with_memo(transaction.clone(), 0), &signer).unwrap(),
+            100
+        );
+        // The audit's case: a caller-chosen memo signer adds a base fee.
+        for extra in [1, 2] {
+            let error = transaction_spend_minor(&with_memo(transaction.clone(), extra), &signer)
+                .unwrap_err();
+            assert_eq!(error.status, StatusCode::FORBIDDEN);
+        }
+        assert!(transaction_spend_minor(&with_memo(sponsored(transaction), 1), &signer).is_err());
+    }
+
+    #[test]
+    fn signer_layout_is_wallet_alone_or_one_sponsor_then_wallet() {
+        let (transaction, signer) = payment_transaction(10_000);
+        let signer = signer.to_string();
+        assert!(transaction_spend_minor(&sponsored(transaction.clone()), &signer).is_ok());
+        // Two sponsors: two unreserved base fees for someone.
+        assert!(
+            transaction_spend_minor(&sponsored(sponsored(transaction.clone())), &signer).is_err()
+        );
+        // Missing or extra signature slots.
+        let mut short = transaction.clone();
+        short.signatures.clear();
+        assert!(transaction_spend_minor(&short, &signer).is_err());
+        let mut long = transaction;
+        long.signatures.push(Default::default());
+        assert!(transaction_spend_minor(&long, &signer).is_err());
     }
 
     fn memory_wallet() -> pay_kit::solana_keychain::MemorySigner {
