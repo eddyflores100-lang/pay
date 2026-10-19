@@ -192,6 +192,68 @@ async fn session_channel_store(
     }
 }
 
+/// Resolve a replay-protection key-value store: durable Redis when an URL is
+/// configured, otherwise in-memory. The flag reports durability.
+async fn replay_store(
+    url_vars: &[&str],
+    prefix: &str,
+    label: &str,
+) -> pay_core::Result<(Arc<dyn pay_kit::mpp::store::Store>, bool)> {
+    let redis_url = url_vars.iter().find_map(|var| {
+        std::env::var(var)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    });
+
+    let Some(redis_url) = redis_url else {
+        return Ok((Arc::new(pay_kit::mpp::store::MemoryStore::new()), false));
+    };
+
+    #[cfg(feature = "redis-session-store")]
+    {
+        let store =
+            pay_core::server::subscription::RedisSubscriptionStore::connect(&redis_url, prefix)
+                .await?;
+        tracing::info!("using durable Redis store for {label}");
+        Ok((Arc::new(store), true))
+    }
+
+    #[cfg(not(feature = "redis-session-store"))]
+    {
+        let _ = (redis_url, prefix);
+        Err(pay_core::Error::Config(format!(
+            "a {label} Redis URL is set, but this pay binary was built without the \
+             redis-session-store feature"
+        )))
+    }
+}
+
+/// Settled x402 `exact` signatures. Replicas must share this store, or one
+/// payment can be served once per replica.
+async fn x402_exact_replay_store() -> pay_core::Result<(Arc<dyn pay_kit::mpp::store::Store>, bool)>
+{
+    replay_store(
+        &[
+            "PAY_X402_REDIS_URL",
+            "PAY_MPP_REDIS_URL",
+            "PAY_SESSION_REDIS_URL",
+        ],
+        "pay:x402:v1:",
+        "x402 exact payments",
+    )
+    .await
+}
+
+fn x402_exact_backend(
+    config: pay_kit::x402::server::Config,
+    replay_store: Arc<dyn pay_kit::mpp::store::Store>,
+) -> std::result::Result<pay_kit::x402::server::X402, pay_kit::x402::Error> {
+    Ok(pay_kit::x402::server::X402::new(config)?
+        .with_store(replay_store)
+        .with_tx_v1(pay_kit::core::tx::TxV1Mode::Auto))
+}
+
 async fn subscription_store() -> pay_core::Result<Arc<dyn pay_kit::mpp::store::Store>> {
     let redis_url = ["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"]
         .into_iter()
@@ -251,9 +313,10 @@ async fn batch_channel_store()
     .await
 }
 
-/// Accepted batch vouchers live only in the channel store, so a restart of a
-/// memory store would re-serve them. Only local test clusters may run that way.
-fn batch_requires_durable_store(network: &SolanaNetwork, deployment_policy_mode: bool) -> bool {
+/// Payment state (accepted batch vouchers, consumed exact signatures) lives
+/// only in its store, so a restart or a second replica with a memory store
+/// would re-serve it. Only local test clusters may run that way.
+fn requires_durable_store(network: &SolanaNetwork, deployment_policy_mode: bool) -> bool {
     deployment_policy_mode || !matches!(network, SolanaNetwork::Devnet | SolanaNetwork::Localnet)
 }
 
@@ -2318,14 +2381,29 @@ impl StartCommand {
                         None
                     },
                 };
-                match pay_kit::x402::server::X402::new(cfg) {
-                    Ok(x) => Some(
-                        x.with_tx_v1(pay_kit::core::tx::TxV1Mode::Auto)
-                            .with_blockhash_cache(blockhash_cache.clone()),
-                    ),
-                    Err(e) => {
-                        eprintln!("x402 backend disabled ({e}); x402 schemes won't be offered");
-                        None
+                let (exact_store, durable_exact_store) = x402_exact_replay_store().await?;
+                if !durable_exact_store
+                    && requires_durable_store(&network, deployment_policy_mode)
+                {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "x402 exact disabled: {} payments need a durable replay store; \
+                             set PAY_X402_REDIS_URL",
+                            network.slug()
+                        )
+                        .yellow()
+                    );
+                    None
+                } else {
+                    match x402_exact_backend(cfg, exact_store) {
+                        Ok(x) => Some(x.with_blockhash_cache(blockhash_cache.clone())),
+                        Err(e) => {
+                            eprintln!(
+                                "x402 backend disabled ({e}); x402 schemes won't be offered"
+                            );
+                            None
+                        }
                     }
                 }
             } else {
@@ -2388,7 +2466,7 @@ impl StartCommand {
                 (true, Some(signer)) => 'batch: {
                     let (batch_store, durable_batch_store) = batch_channel_store().await?;
                     if !durable_batch_store
-                        && batch_requires_durable_store(&network, deployment_policy_mode)
+                        && requires_durable_store(&network, deployment_policy_mode)
                     {
                         eprintln!(
                             "{}",
@@ -4152,28 +4230,110 @@ mod tests {
     use std::str::FromStr;
 
     #[test]
-    fn batch_settlement_needs_a_durable_store_outside_test_clusters() {
+    fn payment_state_needs_a_durable_store_outside_test_clusters() {
         use crate::network::SolanaNetwork;
-        assert!(super::batch_requires_durable_store(
+        assert!(super::requires_durable_store(
             &SolanaNetwork::Mainnet,
             false
         ));
-        assert!(super::batch_requires_durable_store(
+        assert!(super::requires_durable_store(
             &SolanaNetwork::Unknown("custom".into()),
             false
         ));
-        assert!(super::batch_requires_durable_store(
-            &SolanaNetwork::Devnet,
-            true
-        ));
-        assert!(!super::batch_requires_durable_store(
+        assert!(super::requires_durable_store(&SolanaNetwork::Devnet, true));
+        assert!(!super::requires_durable_store(
             &SolanaNetwork::Devnet,
             false
         ));
-        assert!(!super::batch_requires_durable_store(
+        assert!(!super::requires_durable_store(
             &SolanaNetwork::Localnet,
             false
         ));
+    }
+
+    fn exact_replica(
+        store: std::sync::Arc<dyn pay_kit::mpp::store::Store>,
+    ) -> pay_kit::x402::server::X402 {
+        super::x402_exact_backend(
+            pay_kit::x402::server::Config {
+                recipient: Pubkey::new_unique().to_string(),
+                currencies: vec![pay_kit::x402::server::CurrencyConfig {
+                    currency: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+                    decimals: 6,
+                    token_program: None,
+                }],
+                network: "mainnet".to_string(),
+                rpc_url: Some("http://127.0.0.1:1".to_string()),
+                resource: "api".to_string(),
+                description: None,
+                max_age: Some(300),
+                fee_payer_key: None,
+            },
+            store,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn x402_exact_signatures_are_consumed_across_replicas() {
+        use pay_kit::x402::server::VerifiedExactPayment;
+        let names = [
+            "PAY_X402_REDIS_URL",
+            "PAY_MPP_REDIS_URL",
+            "PAY_SESSION_REDIS_URL",
+        ];
+        let saved = names.map(std::env::var_os);
+        for name in names {
+            unsafe { std::env::remove_var(name) };
+        }
+        let resolved = super::x402_exact_replay_store().await;
+        for (name, value) in names.into_iter().zip(saved) {
+            if let Some(value) = value {
+                unsafe { std::env::set_var(name, value) };
+            }
+        }
+        let (store, durable) = resolved.unwrap();
+        // Without Redis the store is process-local, which hosted networks refuse.
+        assert!(!durable);
+        assert!(super::requires_durable_store(
+            &SolanaNetwork::Mainnet,
+            false
+        ));
+
+        let fee_payer = pay_kit::mpp::solana_keychain::MemorySigner::from_bytes(&{
+            let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+            let mut bytes = [0u8; 64];
+            bytes[..32].copy_from_slice(&key.to_bytes());
+            bytes[32..].copy_from_slice(key.verifying_key().as_bytes());
+            bytes
+        })
+        .unwrap();
+        // Construction probes the RPC with a blocking client.
+        let (replica_a, replica_b) = tokio::task::spawn_blocking(move || {
+            (exact_replica(store.clone()), exact_replica(store))
+        })
+        .await
+        .unwrap();
+        let signature = solana_signature::Signature::from([9u8; 64]).to_string();
+        let settle = |x402: &pay_kit::x402::server::X402, signature: &str| {
+            let x402 = x402.clone();
+            let signature = signature.to_string();
+            let fee_payer = &fee_payer;
+            async move {
+                x402.settle_exact(VerifiedExactPayment::Signature(signature), fee_payer)
+                    .await
+            }
+        };
+
+        assert_eq!(settle(&replica_a, &signature).await.unwrap(), signature);
+        let replay = settle(&replica_b, &signature).await.unwrap_err();
+        assert!(replay.to_string().contains("already consumed"), "{replay}");
+        let replay = settle(&replica_a, &signature).await.unwrap_err();
+        assert!(replay.to_string().contains("already consumed"), "{replay}");
+
+        let other = solana_signature::Signature::from([10u8; 64]).to_string();
+        assert_eq!(settle(&replica_b, &other).await.unwrap(), other);
     }
 
     #[tokio::test]
