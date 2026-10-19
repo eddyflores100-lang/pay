@@ -1321,6 +1321,17 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
             });
             continue;
         }
+        if candidate.kind == CandidateKind::IdleClose
+            && channel::defer_oversized_distribution(
+                &mut candidate.instructions,
+                &runtime.operator,
+                pay_kit::core::tx::highest(&accepted_versions),
+            )
+        {
+            // Without its distribution this is no longer the terminal step.
+            info!(channel_id = %candidate.channel_id, "close submitted alone; distribution follows on the next pass");
+            candidate.kind = CandidateKind::Watermark;
+        }
         let handle = handle.clone();
         submissions.spawn(async move {
             let SettlementCandidate {
@@ -1775,7 +1786,15 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
         Arc::new(RpcBroadcaster::with_pipeline(pipeline.clone())),
     );
     let mut submissions = JoinSet::new();
-    for candidate in candidates {
+    for mut candidate in candidates {
+        if channel::defer_oversized_distribution(
+            &mut candidate.instructions,
+            &runtime.operator,
+            tx_version,
+        ) {
+            info!(channel_id = %candidate.channel_id, "batch close or claim submitted alone; distribution follows on the next pass");
+            candidate.store_action = BatchStoreAction::Keep;
+        }
         let handle = handle.clone();
         submissions.spawn(async move {
             let result = handle

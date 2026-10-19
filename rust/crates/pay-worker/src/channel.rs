@@ -40,10 +40,24 @@ pub const STATUS_DISTRIBUTED: u8 = 3;
 /// Fixed serialized size of the current epoch-addressed Channel account.
 pub const CHANNEL_ACCOUNT_SIZE: usize = 256;
 
-/// A distribution must fit in a Solana transaction together with the fixed
-/// channel accounts. Keep malformed preimages from requesting an unbounded
-/// allocation and reject plans that cannot be represented safely.
-const MAX_DISTRIBUTION_RECIPIENTS: usize = 64;
+/// Accounts `distribute` names before its recipient-ATA tail.
+const DISTRIBUTE_FIXED_ACCOUNTS: usize = 11;
+
+/// Keys the payer refund-account create adds beyond `distribute`'s own: the
+/// associated-token and system programs.
+const REFUND_ACCOUNT_CREATE_KEYS: usize = 2;
+
+/// The most recipients whose distribution still fits one transaction on its
+/// own: a version-1 message's static keys hold the fixed `distribute`
+/// accounts, the refund-account create, a distinct fee payer and one ATA per
+/// recipient. A larger plan cannot be paid out by this worker, so recovery
+/// reports it instead of retrying a transaction that can never be built.
+pub const MAX_DISTRIBUTION_RECIPIENTS: usize = pay_kit::core::tx::TxVersion::V1
+    .limits()
+    .max_static_accounts
+    - DISTRIBUTE_FIXED_ACCOUNTS
+    - REFUND_ACCOUNT_CREATE_KEYS
+    - 1;
 
 /// Chain discovery cannot prove a channel was never deployment-bound. Only
 /// an extant legacy row permits the fleet reclamation path.
@@ -687,6 +701,40 @@ pub fn payer_refund_account_ix(
     )
 }
 
+/// When `instructions` (a close followed by the payer refund-account create
+/// and `distribute`) cannot be built as one `version` transaction, drop the
+/// distribution so the close lands alone; the next pass reads the sealed
+/// channel and distributes it by itself. Returns whether it split.
+pub fn defer_oversized_distribution(
+    instructions: &mut Vec<Instruction>,
+    fee_payer: &Pubkey,
+    version: pay_kit::core::tx::TxVersion,
+) -> bool {
+    use pay_kit::generated::payment_channels::generated::instructions::DISTRIBUTE_DISCRIMINATOR;
+    let ata_program = to_address(&pay_api_core::ata::ATA_PROGRAM_ID);
+    let Some(split) = instructions.windows(2).position(|pair| {
+        pair[0].program_id == ata_program
+            && pair[0].data == [1]
+            && pair[1].data.first() == Some(&DISTRIBUTE_DISCRIMINATOR)
+    }) else {
+        return false;
+    };
+    if split == 0
+        || pay_kit::core::tx::build_unsigned(
+            version,
+            fee_payer,
+            instructions,
+            solana_hash::Hash::default(),
+            None,
+        )
+        .is_ok()
+    {
+        return false;
+    }
+    instructions.truncate(split);
+    true
+}
+
 /// Accounts derived for a `distribute` instruction, surfaced for logging.
 pub struct DistributeAccounts {
     pub channel_ata: Pubkey,
@@ -1045,6 +1093,132 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn recipients_channel(count: usize) -> (DecodedChannel, DistributionPreimage) {
+        let mut bytes = vec![0; CHANNEL_ACCOUNT_SIZE];
+        bytes[0] = 1;
+        bytes[1] = 1;
+        let mut channel = decode_v1_channel(&Pubkey::new_unique(), &bytes)
+            .unwrap()
+            .unwrap();
+        channel.channel.status = STATUS_CLOSING;
+        for key in [
+            &mut channel.channel.payer,
+            &mut channel.channel.payee,
+            &mut channel.channel.rent_payer,
+            &mut channel.channel.mint,
+            &mut channel.channel.authorized_signer,
+        ] {
+            *key = to_address(&Pubkey::new_unique());
+        }
+        let recipients = (0..count)
+            .map(|_| pay_kit::core::payment_channels::Distribution {
+                recipient: Pubkey::new_unique(),
+                bps: 1,
+            })
+            .collect::<Vec<_>>();
+        channel.channel.distribution_hash =
+            pay_kit::core::payment_channels::distribution_hash(&recipients);
+        let preimage =
+            distribution_preimage_from_snapshot(&recipients, &channel.channel.distribution_hash)
+                .unwrap();
+        (channel, preimage)
+    }
+
+    fn payout(
+        channel: &DecodedChannel,
+        preimage: &DistributionPreimage,
+        fee_payer: &Pubkey,
+    ) -> Vec<Instruction> {
+        vec![
+            payer_refund_account_ix(fee_payer, channel, &SPL_TOKEN_PROGRAM_ID),
+            build_distribute_ix(
+                channel,
+                &Pubkey::new_unique(),
+                &SPL_TOKEN_PROGRAM_ID,
+                preimage,
+            )
+            .0,
+        ]
+    }
+
+    #[test]
+    fn the_largest_accepted_plan_distributes_in_one_transaction() {
+        use pay_kit::core::tx::{TxVersion, build_unsigned};
+        // A fee payer distinct from every channel account is the worst case.
+        let fee_payer = Pubkey::new_unique();
+        let (channel, preimage) = recipients_channel(MAX_DISTRIBUTION_RECIPIENTS);
+        build_unsigned(
+            TxVersion::V1,
+            &fee_payer,
+            &payout(&channel, &preimage, &fee_payer),
+            solana_hash::Hash::default(),
+            None,
+        )
+        .expect("the maximum plan must fit");
+
+        // One more recipient no longer fits, and is refused at recovery
+        // rather than retried forever.
+        let recipients = (0..=MAX_DISTRIBUTION_RECIPIENTS)
+            .map(|_| pay_kit::core::payment_channels::Distribution {
+                recipient: Pubkey::new_unique(),
+                bps: 1,
+            })
+            .collect::<Vec<_>>();
+        let hash = pay_kit::core::payment_channels::distribution_hash(&recipients);
+        assert!(distribution_preimage_from_snapshot(&recipients, &hash).is_err());
+        let mut preimage = (recipients.len() as u32).to_le_bytes().to_vec();
+        for entry in &recipients {
+            preimage.extend_from_slice(entry.recipient.as_ref());
+            preimage.extend_from_slice(&entry.bps.to_le_bytes());
+        }
+        assert!(decode_recipients(&preimage).is_err());
+    }
+
+    #[test]
+    fn a_close_that_cannot_carry_its_distribution_lands_alone() {
+        use pay_kit::core::tx::TxVersion;
+        let fee_payer = Pubkey::new_unique();
+        let (channel, preimage) = recipients_channel(MAX_DISTRIBUTION_RECIPIENTS);
+        // Settling the final voucher adds the payee, the instructions sysvar
+        // and the signature-verify program to the distribution's keys.
+        let close = pay_kit::core::payment_channels::build_settle_and_seal_instructions(
+            &channel.payee(),
+            &channel.address,
+            &Pubkey::from(channel.channel.authorized_signer.to_bytes()),
+            Some(&[3; 64]),
+            10,
+            0,
+            &default_program_id(),
+        )
+        .unwrap();
+        let mut combined = close.clone();
+        combined.extend(payout(&channel, &preimage, &fee_payer));
+        assert!(defer_oversized_distribution(
+            &mut combined,
+            &fee_payer,
+            TxVersion::V1
+        ));
+        assert_eq!(combined, close);
+
+        // A distribution alone is never split, and a fitting pair is kept.
+        let mut alone = payout(&channel, &preimage, &fee_payer);
+        assert!(!defer_oversized_distribution(
+            &mut alone,
+            &fee_payer,
+            TxVersion::V1
+        ));
+        assert_eq!(alone.len(), 2);
+        let (small, small_preimage) = recipients_channel(2);
+        let mut fitting = vec![build_seal_ix(&small.address)];
+        fitting.extend(payout(&small, &small_preimage, &fee_payer));
+        assert!(!defer_oversized_distribution(
+            &mut fitting,
+            &fee_payer,
+            TxVersion::V0
+        ));
+        assert_eq!(fitting.len(), 3);
     }
 
     #[test]
