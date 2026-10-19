@@ -1835,6 +1835,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pingora_rejects_undeclared_proxy_routes_without_planning_upstream() {
+        use pingora::proxy::ProxyHttp;
+        use tokio::io::AsyncReadExt;
+        let mut api = body_signing_api();
+        api.routing = RoutingConfig::Proxy {
+            url: "http://127.0.0.1:1".into(),
+            path_rewrites: vec![],
+            auth: Some(Box::new(AuthConfig::Header {
+                key: "x-api-key".into(),
+                prefix: None,
+                value_from_env: "PATH".into(),
+            })),
+        };
+        api.endpoints.push(pay_types::metering::Endpoint {
+            method: pay_types::metering::HttpMethod::Get,
+            path: "v1/search".into(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: None,
+            subscription: None,
+        });
+        let gate = Http402Gate::new(BodySigningState { apis: vec![api] }, "127.0.0.1:1");
+
+        let (mut session, mut client) = request_session("/admin/users?scope=all").await;
+        let mut ctx = gate.new_ctx();
+        assert!(gate.request_filter(&mut session, &mut ctx).await.unwrap());
+        assert!(ctx.target.is_none(), "must not plan an upstream");
+        let mut response = vec![0_u8; 256];
+        let read = client.read(&mut response).await.unwrap();
+        assert!(String::from_utf8_lossy(&response[..read]).starts_with("HTTP/1.1 404"));
+
+        let (mut session, _client) = request_session("/v1/search").await;
+        let mut ctx = gate.new_ctx();
+        assert!(!gate.request_filter(&mut session, &mut ctx).await.unwrap());
+        assert!(matches!(ctx.target, Some(super::Target::Api { .. })));
+    }
+
+    #[tokio::test]
     async fn pingora_preserves_normal_path_and_query() {
         use pingora::proxy::ProxyHttp;
         let mut api = body_signing_api();
