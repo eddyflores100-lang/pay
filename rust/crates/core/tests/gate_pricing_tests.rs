@@ -38,6 +38,8 @@ fn sol_mpp() -> Mpp {
         network: "localnet".to_string(),
         rpc_url: Some("http://127.0.0.1:8899".to_string()),
         challenge_binding_secret: Some("test-secret-key-do-not-use-32b-pad".to_string()),
+        realm: Some("test-realm".to_string()),
+        store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
         ..Default::default()
     })
     .expect("local MPP backend")

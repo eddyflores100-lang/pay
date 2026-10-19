@@ -48,6 +48,8 @@ pub struct AppState {
     /// caller authentication and fee reimbursement collection are available.
     #[allow(dead_code)]
     pub push: Option<PushState>,
+    /// Process-local replay store shared by every per-request charge `Mpp`.
+    pub charge_store: std::sync::Arc<dyn pay_kit::mpp::store::Store>,
 }
 
 impl AppState {
@@ -103,6 +105,7 @@ impl AppState {
             redemption,
             confidential,
             push,
+            charge_store: std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new()),
         })
     }
 
@@ -165,6 +168,8 @@ fn spawn_confidential_workers(
     fee_payer_pubkey: String,
 ) -> HashMap<Network, ConfidentialHandle> {
     let mut handles = HashMap::with_capacity(config.networks.len());
+    let store: std::sync::Arc<dyn pay_kit::mpp::store::Store> =
+        std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new());
     for (network, net_cfg) in &config.networks {
         // pay-kit's `Mpp::new` validates the canonical MPP wire slug
         // (mainnet/devnet/localnet), so each settlement worker must use the same
@@ -188,6 +193,11 @@ fn spawn_confidential_workers(
                 // facilitator/trust-proofs settlement. The client's range/validity
                 // proofs are verified on-chain; the recipient reconciles the amount.
                 recipient_signer: None,
+                // Without an auditor the amount can't be verified, so settlement
+                // fails closed.
+                auditor: None,
+                accept_unverified_amount: false,
+                store: store.clone(),
             },
             signer.clone(),
             pay_kit::core::tx::TxVersion::V1,

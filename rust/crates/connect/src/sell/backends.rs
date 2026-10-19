@@ -52,6 +52,8 @@ pub struct Operator {
     /// endpoint. Accepted vouchers exist only here, so without one the
     /// scheme is not offered.
     pub batch_store: Option<Arc<dyn ChannelStore>>,
+    /// Process-local replay store shared by every endpoint's charge servers.
+    pub charge_store: Arc<dyn pay_kit::mpp::store::Store>,
 }
 
 impl Operator {
@@ -66,6 +68,7 @@ impl Operator {
             challenge_binding_secret: challenge_binding_secret.into(),
             blockhashes: BlockhashCache::new(),
             batch_store: None,
+            charge_store: Arc::new(pay_kit::mpp::store::MemoryStore::new()),
         }
     }
 
@@ -230,6 +233,10 @@ impl EndpointBackends {
                     network: network.to_string(),
                     rpc_url: rpc_url.clone(),
                     challenge_binding_secret: Some(operator.challenge_binding_secret.clone()),
+                    realm: Some(pay_core::server::payment::recipient_derived_charge_realm(
+                        &sale.recipient,
+                    )),
+                    store: Some(operator.charge_store.clone()),
                     fee_payer: true,
                     fee_payer_signer: Some(operator.signer.clone()),
                     channel_charge: channel_charge.clone(),

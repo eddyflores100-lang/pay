@@ -259,7 +259,7 @@ pub fn build_handler(
         )
     })?;
 
-    let (_amount, decimals, mint) = resolve_amount(spec)?;
+    let (amount_base_units, decimals, mint) = resolve_amount(spec)?;
 
     let (period_unit, period_count) = spec.parse_period().map_err(Error::Config)?;
     let sdk_period_unit = match period_unit {
@@ -278,6 +278,7 @@ pub fn build_handler(
 
     let config = SdkSubscriptionConfig {
         plan_id,
+        amount_base_units,
         mint,
         decimals,
         token_program: pay_kit::mpp::protocol::solana::programs::TOKEN_PROGRAM.to_string(),

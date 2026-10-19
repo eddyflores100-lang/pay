@@ -122,6 +122,8 @@ async fn start_test_server(with_mpp: bool) -> (String, tokio::task::JoinHandle<(
             network: "localnet".to_string(),
             rpc_url: Some("http://localhost:8899".to_string()),
             challenge_binding_secret: Some("test-secret-key-do-not-use-32b-pad".to_string()),
+            realm: Some("test-realm".to_string()),
+            store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .ok()
@@ -165,6 +167,8 @@ async fn start_multi_currency_server() -> (String, tokio::task::JoinHandle<()>) 
                 network: "localnet".to_string(),
                 rpc_url: Some("http://localhost:8899".to_string()),
                 challenge_binding_secret: Some("test-secret-key-do-not-use-32b-pad".to_string()),
+                realm: Some("test-realm".to_string()),
+                store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
                 ..Default::default()
             })
             .unwrap()
@@ -211,6 +215,8 @@ async fn start_respond_server() -> (String, tokio::task::JoinHandle<()>) {
         network: "localnet".to_string(),
         rpc_url: Some("http://localhost:8899".to_string()),
         challenge_binding_secret: Some("test-secret-key-do-not-use-32b-pad".to_string()),
+        realm: Some("test-realm".to_string()),
+        store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
         ..Default::default()
     })
     .ok();
@@ -860,6 +866,8 @@ async fn root_redirects_to_pdb_with_html_accept() {
         network: "localnet".to_string(),
         rpc_url: Some("http://localhost:8899".to_string()),
         challenge_binding_secret: Some("test-secret-key-do-not-use-32b-pad".to_string()),
+        realm: Some("test-realm".to_string()),
+        store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
         ..Default::default()
     })
     .ok();

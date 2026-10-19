@@ -244,6 +244,8 @@ async fn full_payment_flow_with_surfnet() {
         network: "localnet".to_string(),
         rpc_url: Some(surfnet.rpc_url().to_string()),
         challenge_binding_secret: Some("test-secret-key-do-not-use-32b-pad".to_string()),
+        realm: Some("test-realm".to_string()),
+        store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
         ..Default::default()
     })
     .unwrap();
@@ -364,6 +366,8 @@ async fn replayed_authorization_is_rejected() {
         network: "localnet".to_string(),
         rpc_url: Some(surfnet.rpc_url().to_string()),
         challenge_binding_secret: Some("test-secret-key-do-not-use-32b-pad".to_string()),
+        realm: Some("test-realm".to_string()),
+        store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
         ..Default::default()
     })
     .unwrap();
@@ -891,6 +895,8 @@ async fn mpp_build_credential_with_surfnet() {
         network: "localnet".to_string(),
         rpc_url: Some(surfnet.rpc_url().to_string()),
         challenge_binding_secret: Some("test-secret-key-do-not-use-32b-pad".to_string()),
+        realm: Some("test-realm".to_string()),
+        store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
         ..Default::default()
     })
     .unwrap();

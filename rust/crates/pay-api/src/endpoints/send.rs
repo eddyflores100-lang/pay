@@ -907,6 +907,7 @@ async fn new_mpp(
         rpc_url: Some(resolved.rpc_url.clone()),
         challenge_binding_secret: state.send.mpp_challenge_binding_secret.clone(),
         realm: Some(state.send.realm.clone()),
+        store: Some(state.charge_store.clone()),
         fee_payer: has_fee_payer_signer,
         fee_payer_signer,
         html: false,

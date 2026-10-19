@@ -634,6 +634,10 @@ pub(crate) fn build_charge_mpps(
     } else {
         None
     };
+    // One replay store for every currency's charge server, for the gateway's lifetime.
+    let store: Arc<dyn pay_kit::mpp::store::Store> =
+        Arc::new(pay_kit::mpp::store::MemoryStore::new());
+    let realm = pay_core::server::payment::recipient_derived_charge_realm(recipient);
     currency_configs
         .iter()
         .map(|(_, mpp_currency, decimals)| {
@@ -644,6 +648,8 @@ pub(crate) fn build_charge_mpps(
                 network: network_slug.to_string(),
                 rpc_url: Some(rpc_url.to_string()),
                 challenge_binding_secret: Some(challenge_binding_secret.to_string()),
+                realm: Some(realm.clone()),
+                store: Some(store.clone()),
                 fee_payer,
                 fee_payer_signer: fee_payer_signer.clone(),
                 channel_charge: channel_charge.clone(),

@@ -208,6 +208,10 @@ fn build_state(
                 network: "localnet".to_string(),
                 rpc_url: Some(rpc_url.to_string()),
                 challenge_binding_secret: Some("bench-rehearsal-secret-not-for-prod!".to_string()),
+                realm: Some(pay_core::server::payment::recipient_derived_charge_realm(
+                    recipient,
+                )),
+                store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
                 ..Default::default()
             })
             .map_err(|e| anyhow::anyhow!("mpp config: {e}"))?;

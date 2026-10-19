@@ -798,6 +798,16 @@ fn truncate_to_char_boundary(value: &str, max_bytes: usize) -> &str {
     &value[..end]
 }
 
+/// The charge realm pay-kit used to derive from the recipient before `realm`
+/// became a required config field: `"App Id - #<8 digits>"` from
+/// `SHA-256(recipient)`. Kept so existing challenge realms don't change.
+pub fn recipient_derived_charge_realm(recipient: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(recipient.as_bytes());
+    let first_four = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
+    format!("App Id - #{}", first_four % 100_000_000)
+}
+
 /// Whether `candidate` names the same token as `configured` on `network`:
 /// the same string, or a symbol and a mint address that resolve to one mint.
 pub fn same_currency(configured: &str, candidate: &str, network: &str) -> bool {
@@ -1128,6 +1138,8 @@ apis:
             challenge_binding_secret: Some(
                 "test-challenge-binding-secret-must-be-32-bytes".to_string(),
             ),
+            realm: Some("test-realm".to_string()),
+            store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .expect("test MPP server should initialize")
