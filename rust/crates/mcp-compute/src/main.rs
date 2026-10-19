@@ -52,6 +52,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if executor_proof.len() < 32 {
         return Err("COMPUTE_TRIGGER_EXECUTOR_PROOF must contain at least 32 bytes".into());
     }
+    let proxy_proof = std::env::var("COMPUTE_PROXY_PROOF")
+        .map_err(|_| "COMPUTE_PROXY_PROOF must be set")?
+        .into_bytes();
+    if proxy_proof.len() < 32 {
+        return Err("COMPUTE_PROXY_PROOF must contain at least 32 bytes".into());
+    }
     let allowed_hosts = if args.disable_host_validation {
         Vec::new()
     } else if args.allowed_hosts.is_empty() {
@@ -70,6 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             allowed_hosts,
             bindings,
             executor_proof,
+            proxy_proof,
             payments,
         ),
     )

@@ -35,6 +35,7 @@ use crate::types::{
 pub const VERIFIED_PAYER_HEADER: &str = "x-pay-verified-payer";
 pub const VERIFIED_CHANNEL_HEADER: &str = "x-pay-verified-channel";
 pub const ORIGINAL_HOST_HEADER: &str = "x-pay-original-host";
+pub const PROXY_PROOF_HEADER: &str = "x-pay-proxy-proof";
 pub const USAGE_HEADER: &str = "x-pay-gcp-cpu-microusd";
 const MAX_GATEWAY_BODY_BYTES: usize = 10 * 1024 * 1024;
 const TRIGGER_EXECUTOR_PROOF_HEADER: &str = "x-compute-trigger-proof";
@@ -429,6 +430,7 @@ struct AppState {
     trigger_drivers: TriggerDriverRegistry,
     gateway_domain: String,
     executor_proof: Vec<u8>,
+    proxy_proof: Vec<u8>,
 }
 
 pub fn router(
@@ -438,6 +440,7 @@ pub fn router(
     allowed_hosts: Vec<String>,
     bindings: Option<DataBindingClient>,
     executor_proof: Vec<u8>,
+    proxy_proof: Vec<u8>,
 ) -> Router {
     router_with_payments(
         drivers,
@@ -446,10 +449,12 @@ pub fn router(
         allowed_hosts,
         bindings,
         executor_proof,
+        proxy_proof,
         None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn router_with_payments(
     drivers: DriverRegistry,
     trigger_drivers: TriggerDriverRegistry,
@@ -457,6 +462,7 @@ pub fn router_with_payments(
     allowed_hosts: Vec<String>,
     bindings: Option<DataBindingClient>,
     executor_proof: Vec<u8>,
+    proxy_proof: Vec<u8>,
     payments: Option<PaymentService>,
 ) -> Router {
     let transport = StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts);
@@ -498,6 +504,7 @@ pub fn router_with_payments(
             trigger_drivers,
             gateway_domain,
             executor_proof,
+            proxy_proof,
         })
         .merge(payment_routes)
 }
@@ -583,7 +590,21 @@ async fn verified_tenant(mut request: Request, next: Next) -> Response {
     }
 }
 
+fn proxy_verified(state: &AppState, headers: &HeaderMap) -> bool {
+    !state.proxy_proof.is_empty()
+        && headers
+            .get(PROXY_PROOF_HEADER)
+            .is_some_and(|value| constant_time_eq(value.as_bytes(), &state.proxy_proof))
+}
+
 async fn gateway_invoke(State(state): State<AppState>, request: Request) -> Response {
+    if !proxy_verified(&state, request.headers()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "verified_gateway_required" })),
+        )
+            .into_response();
+    }
     match gateway_invoke_inner(state, request).await {
         Ok(response) => response,
         Err(error) => {
@@ -645,14 +666,9 @@ async fn gateway_invoke_inner(
         .iter()
         .filter_map(|(name, value)| {
             let lower = name.as_str();
-            (!matches!(
-                lower,
-                VERIFIED_PAYER_HEADER
-                    | ORIGINAL_HOST_HEADER
-                    | "host"
-                    | "authorization"
-                    | "content-length"
-            ) && !lower.starts_with("payment-")
+            (!matches!(lower, "host" | "authorization" | "content-length")
+                && !lower.starts_with("x-pay-")
+                && !lower.starts_with("payment-")
                 && !lower.starts_with("x-payment"))
             .then(|| {
                 value
@@ -753,7 +769,155 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
+
+    const PROXY_PROOF: &[u8] = b"proxy-proof-that-is-at-least-32-bytes";
+
+    /// Records gateway invocations instead of calling a provider.
+    #[derive(Default)]
+    pub(super) struct GatewayStub {
+        pub(super) invocations: Mutex<Vec<GatewayInvokeRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::driver::ComputeDriver for GatewayStub {
+        fn id(&self) -> &'static str {
+            "stub"
+        }
+        fn gateway_prefix(&self) -> &'static str {
+            "gcf-"
+        }
+        fn capabilities(&self) -> crate::types::DriverCapabilities {
+            unreachable!()
+        }
+        async fn deploy(
+            &self,
+            _: &Tenant,
+            _: DeployRequest,
+        ) -> crate::driver::Result<crate::types::ComputeOperation> {
+            unreachable!()
+        }
+        async fn get(
+            &self,
+            _: &Tenant,
+            _: ResourceRequest,
+        ) -> crate::driver::Result<crate::types::Deployment> {
+            unreachable!()
+        }
+        async fn list(
+            &self,
+            _: &Tenant,
+            _: ListRequest,
+        ) -> crate::driver::Result<crate::types::DeploymentList> {
+            unreachable!()
+        }
+        async fn delete(
+            &self,
+            _: &Tenant,
+            _: ResourceRequest,
+        ) -> crate::driver::Result<crate::types::ComputeOperation> {
+            unreachable!()
+        }
+        async fn operation(
+            &self,
+            _: &Tenant,
+            _: &str,
+        ) -> crate::driver::Result<crate::types::ComputeOperation> {
+            unreachable!()
+        }
+        async fn invoke(
+            &self,
+            _: &Tenant,
+            _: InvokeRequest,
+        ) -> crate::driver::Result<crate::types::InvocationResult> {
+            unreachable!()
+        }
+        async fn invoke_gateway(
+            &self,
+            request: GatewayInvokeRequest,
+        ) -> crate::driver::Result<crate::types::GatewayInvocation> {
+            self.invocations.lock().unwrap().push(request);
+            Ok(crate::types::GatewayInvocation {
+                status: 200,
+                headers: BTreeMap::new(),
+                body: bytes::Bytes::from_static(b"ok"),
+                elapsed_ms: 1,
+                billed_micro_usd: 1,
+            })
+        }
+        async fn cleanup_channel(&self, _: &str) -> crate::driver::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    fn gateway_app(stub: Arc<GatewayStub>) -> Router {
+        router(
+            DriverRegistry::new([stub as Arc<dyn crate::driver::ComputeDriver>]).unwrap(),
+            TriggerDriverRegistry::default(),
+            "cpu.example.invalid".into(),
+            Vec::new(),
+            None,
+            b"correct-proof-that-is-at-least-32-bytes".to_vec(),
+            PROXY_PROOF.to_vec(),
+        )
+    }
+
+    fn gateway_request(proof: Option<&[u8]>) -> Request {
+        let mut builder = Request::post("/summary")
+            .header(
+                ORIGINAL_HOST_HEADER,
+                "gcf-0123456789abcdef-weather.cpu.example.invalid",
+            )
+            .header(VERIFIED_CHANNEL_HEADER, "forgedchannel")
+            .header("x-application-header", "preserved");
+        if let Some(proof) = proof {
+            builder = builder.header(PROXY_PROOF_HEADER, proof);
+        }
+        builder.body(Body::from("{}")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn gateway_invocation_requires_the_proxy_proof() {
+        let stub = Arc::new(GatewayStub::default());
+        let app = gateway_app(stub.clone());
+        for proof in [
+            None,
+            Some(&b""[..]),
+            Some(&b"proxy-proof-that-is-at-least-32-byteX"[..]),
+            Some(&PROXY_PROOF[..PROXY_PROOF.len() - 1]),
+        ] {
+            let response = app.clone().oneshot(gateway_request(proof)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert!(response.headers().get(USAGE_HEADER).is_none());
+        }
+        // Path-selected deployments are gated the same way.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/gcf-0123456789abcdef-weather/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(stub.invocations.lock().unwrap().is_empty());
+
+        let response = app
+            .oneshot(gateway_request(Some(PROXY_PROOF)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let invocations = stub.invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 1);
+        let headers = &invocations[0].headers;
+        assert_eq!(headers["x-application-header"], "preserved");
+        assert!(
+            headers.keys().all(|name| !name.starts_with("x-pay-")),
+            "internal headers, including the proxy proof, never reach tenant code: {headers:?}"
+        );
+    }
 
     #[test]
     fn gateway_path_selects_deployment_and_preserves_query() {
@@ -809,6 +973,7 @@ mod tests {
             Vec::new(),
             None,
             b"correct-proof-that-is-at-least-32-bytes".to_vec(),
+            PROXY_PROOF.to_vec(),
         );
         for (path, expected) in [
             ("/__402/health", StatusCode::OK),
@@ -832,6 +997,7 @@ mod tests {
             Vec::new(),
             None,
             b"correct-proof-that-is-at-least-32-bytes".to_vec(),
+            PROXY_PROOF.to_vec(),
         );
         let body = serde_json::json!({
             "driver": "missing",
