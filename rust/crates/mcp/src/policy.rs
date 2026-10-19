@@ -13,7 +13,7 @@ use pay_core::keystore::{AuthGate, AuthIntent, USD_MINOR_UNITS_PER_DOLLAR};
 use pay_core::signer::AuthOverride;
 use rmcp::service::{Peer, RoleServer};
 
-use crate::context::{ApprovalPolicy, peer_supports_elicitation};
+use crate::context::{ApprovalHold, ApprovalPolicy, peer_supports_elicitation};
 
 /// Limits in USD ten-thousandths ([`USD_MINOR_UNITS_PER_DOLLAR`]).
 /// `None` means no limit of that kind.
@@ -138,7 +138,11 @@ pub struct PolicyGate {
     subject: String,
     policy: SpendPolicy,
     ledger: Arc<dyn SpendLedger>,
+    holds: Option<Holds>,
 }
+
+/// Amounts a gate recorded for one signing operation.
+type Holds = Arc<Mutex<Vec<u64>>>;
 
 impl PolicyGate {
     pub fn new(
@@ -150,7 +154,13 @@ impl PolicyGate {
             subject: subject.into(),
             policy,
             ledger,
+            holds: None,
         }
+    }
+
+    fn holding(mut self, holds: Holds) -> Self {
+        self.holds = Some(holds);
+        self
     }
 }
 
@@ -193,6 +203,9 @@ impl AuthGate for PolicyGate {
                 dollars(self.policy.daily_cap.expect("cap was checked"))
             )));
         }
+        if let Some(holds) = &self.holds {
+            holds.lock().unwrap().push(amount);
+        }
         Ok(())
     }
 
@@ -221,17 +234,35 @@ pub struct PolicyApproval {
     pub ledger: Arc<dyn SpendLedger>,
 }
 
-impl ApprovalPolicy for PolicyApproval {
-    fn gate(&self, peer: Option<&Peer<RoleServer>>) -> AuthOverride {
-        let mut gates: Vec<Box<dyn AuthGate>> = vec![Box::new(PolicyGate::new(
-            self.subject.clone(),
-            self.policy,
-            self.ledger.clone(),
-        ))];
+impl PolicyApproval {
+    fn chain(&self, policy: PolicyGate, peer: Option<&Peer<RoleServer>>) -> AuthOverride {
+        let mut gates: Vec<Box<dyn AuthGate>> = vec![Box::new(policy)];
         if let Some(peer) = peer.filter(|p| peer_supports_elicitation(p)) {
             gates.push(Box::new(crate::ElicitationAuth::new(peer.clone())));
         }
         Some(Box::new(ChainedGate(gates)))
+    }
+
+    fn policy_gate(&self) -> PolicyGate {
+        PolicyGate::new(self.subject.clone(), self.policy, self.ledger.clone())
+    }
+}
+
+impl ApprovalPolicy for PolicyApproval {
+    fn gate(&self, peer: Option<&Peer<RoleServer>>) -> AuthOverride {
+        self.chain(self.policy_gate(), peer)
+    }
+
+    fn gate_with_hold(&self, peer: Option<&Peer<RoleServer>>) -> (AuthOverride, ApprovalHold) {
+        let holds = Holds::default();
+        let gate = self.chain(self.policy_gate().holding(holds.clone()), peer);
+        let (subject, ledger) = (self.subject.clone(), self.ledger.clone());
+        let hold = ApprovalHold::new(move || {
+            for amount in std::mem::take(&mut *holds.lock().unwrap()) {
+                ledger.release(&subject, amount);
+            }
+        });
+        (gate, hold)
     }
 }
 
@@ -385,5 +416,99 @@ mod tests {
                 .is_err()
         );
         assert!(ChainedGate(vec![]).authenticate(&payment("$1")).is_ok());
+    }
+
+    fn approval_scope(ledger: Arc<MemoryLedger>) -> crate::CallScope {
+        crate::CallScope {
+            accounts: Arc::new(pay_core::accounts::MemoryAccountsStore::new()),
+            network_override: None,
+            account_override: None,
+            rpc_url_override: None,
+            approval: Arc::new(PolicyApproval {
+                subject: "tenant".to_string(),
+                policy: SpendPolicy::dollars(1.0, 1.0),
+                ledger,
+            }),
+            payment_permissions: None,
+            body_files: false,
+            outbound_policy: pay_core::client::fetch::OutboundPolicy::PublicInternetOnly,
+        }
+    }
+
+    #[test]
+    fn declined_or_failed_signing_releases_the_policy_reservation() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let scope = approval_scope(ledger.clone());
+
+        // The policy approves, then a later gate (the client's prompt)
+        // declines or the signer fails: no signature, no spend.
+        let result: pay_core::Result<()> = scope.with_approval(None, |gate| {
+            gate.expect("hosted policy always gates")
+                .authenticate(&payment("$0.50"))
+                .map_err(|e| pay_core::Error::Mpp(e.to_string()))?;
+            assert_eq!(
+                ledger.spent_today("tenant"),
+                5_000,
+                "reserved while signing"
+            );
+            Err(pay_core::Error::PaymentRejected("declined".to_string()))
+        });
+        assert!(result.is_err());
+        assert_eq!(ledger.spent_today("tenant"), 0);
+
+        // The full allowance is still available afterwards.
+        scope
+            .with_approval(None, |gate| {
+                gate.unwrap()
+                    .authenticate(&payment("$1.00"))
+                    .map_err(|e| pay_core::Error::Mpp(e.to_string()))
+            })
+            .expect("allowance was not consumed by the failure");
+        assert_eq!(ledger.spent_today("tenant"), 10_000);
+    }
+
+    #[test]
+    fn a_refused_chain_releases_what_the_policy_reserved() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let scope = approval_scope(ledger.clone());
+        let result: pay_core::Result<()> = scope.with_approval(None, |gate| {
+            let gate = gate.unwrap();
+            gate.authenticate(&payment("$0.40"))
+                .map_err(|e| pay_core::Error::Mpp(e.to_string()))?;
+            // A second authorization in the same operation exceeds the cap.
+            gate.authenticate(&payment("$0.70"))
+                .map_err(|e| pay_core::Error::Mpp(e.to_string()))
+        });
+        assert!(result.is_err());
+        assert_eq!(ledger.spent_today("tenant"), 0);
+    }
+
+    #[test]
+    fn a_signed_operation_keeps_its_reservation() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let scope = approval_scope(ledger.clone());
+        let signature = scope
+            .with_approval(None, |gate| {
+                gate.unwrap()
+                    .authenticate(&payment("$0.25"))
+                    .map_err(|e| pay_core::Error::Mpp(e.to_string()))?;
+                Ok("signed")
+            })
+            .unwrap();
+        assert_eq!(signature, "signed");
+        assert_eq!(ledger.spent_today("tenant"), 2_500);
+    }
+
+    #[test]
+    fn non_payment_operations_reserve_nothing() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let scope = approval_scope(ledger.clone());
+        let _: pay_core::Result<()> = scope.with_approval(None, |gate| {
+            gate.unwrap()
+                .authenticate(&AuthIntent::use_account("read"))
+                .map_err(|e| pay_core::Error::Mpp(e.to_string()))?;
+            Err(pay_core::Error::Mpp("failed".to_string()))
+        });
+        assert_eq!(ledger.spent_today("tenant"), 0);
     }
 }

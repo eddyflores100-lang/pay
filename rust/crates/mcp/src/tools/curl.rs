@@ -1093,12 +1093,10 @@ fn do_paid_fetch(
         )
     };
 
-    // A fresh gate per signing operation, chosen by the caller's context:
-    // the platform prompt or the client's elicitation on a laptop, the
-    // tenant's spending policy in the cloud. `None` lets the account's own
-    // policy decide.
-    let make_auth_override =
-        || -> pay_core::signer::AuthOverride { scope.auth_override(peer.as_ref()) };
+    // Every signing operation runs under `scope.with_approval`: a fresh gate
+    // chosen by the caller's context (the platform prompt or the client's
+    // elicitation on a laptop, the tenant's spending policy in the cloud),
+    // whose reservation is released unless a signature is produced.
 
     let store: &dyn pay_core::accounts::AccountsStore = scope.accounts.as_ref();
     let network_override = scope.network_override.clone();
@@ -1188,29 +1186,32 @@ fn do_paid_fetch(
                     if let Some(permissions) = &scope.payment_permissions {
                         permissions.authorize_mpp(ch.as_ref(), &resource_url)?;
                     }
-                    let (auth_header, _ephemeral) =
+                    let (auth_header, _ephemeral) = scope.with_approval(peer.as_ref(), |auth| {
                         pay_core::client::mpp::build_credential_with_override(
                             ch.as_ref(),
                             store,
                             network_override.as_deref(),
                             account_override.as_deref(),
                             Some(url),
-                            make_auth_override(),
-                        )?;
+                            auth,
+                        )
+                    })?;
                     headers.push(("Authorization".to_string(), auth_header));
                 }
                 ChosenPayment::X402(challenge) => {
                     if let Some(permissions) = &scope.payment_permissions {
                         permissions.authorize_x402(challenge.as_ref(), &resource_url)?;
                     }
-                    let built_payment = pay_core::client::x402::build_payment_with_override(
-                        challenge.as_ref(),
-                        store,
-                        network_override.as_deref(),
-                        account_override.as_deref(),
-                        Some(url),
-                        make_auth_override(),
-                    )?;
+                    let built_payment = scope.with_approval(peer.as_ref(), |auth| {
+                        pay_core::client::x402::build_payment_with_override(
+                            challenge.as_ref(),
+                            store,
+                            network_override.as_deref(),
+                            account_override.as_deref(),
+                            Some(url),
+                            auth,
+                        )
+                    })?;
                     headers.extend(
                         built_payment
                             .headers
@@ -1222,14 +1223,16 @@ fn do_paid_fetch(
                     if let Some(permissions) = &scope.payment_permissions {
                         permissions.authorize_upto(challenge.as_ref(), &resource_url)?;
                     }
-                    let built_payment = pay_core::client::x402::build_upto_payment_with_override(
-                        challenge.as_ref(),
-                        store,
-                        network_override.as_deref(),
-                        account_override.as_deref(),
-                        Some(url),
-                        make_auth_override(),
-                    )?;
+                    let built_payment = scope.with_approval(peer.as_ref(), |auth| {
+                        pay_core::client::x402::build_upto_payment_with_override(
+                            challenge.as_ref(),
+                            store,
+                            network_override.as_deref(),
+                            account_override.as_deref(),
+                            Some(url),
+                            auth,
+                        )
+                    })?;
                     headers.extend(
                         built_payment
                             .headers
@@ -1248,14 +1251,16 @@ fn do_paid_fetch(
             if let Some(permissions) = &scope.payment_permissions {
                 permissions.authorize_x402(&challenge, &resource_url)?;
             }
-            let built_payment = pay_core::client::x402::build_payment_with_override(
-                &challenge,
-                store,
-                network_override.as_deref(),
-                account_override.as_deref(),
-                Some(url),
-                make_auth_override(),
-            )?;
+            let built_payment = scope.with_approval(peer.as_ref(), |auth| {
+                pay_core::client::x402::build_payment_with_override(
+                    &challenge,
+                    store,
+                    network_override.as_deref(),
+                    account_override.as_deref(),
+                    Some(url),
+                    auth,
+                )
+            })?;
             let mut headers = extra_headers.to_vec();
             headers.extend(
                 built_payment
@@ -1273,14 +1278,16 @@ fn do_paid_fetch(
             if let Some(permissions) = &scope.payment_permissions {
                 permissions.authorize_upto(&challenge, &resource_url)?;
             }
-            let built_payment = pay_core::client::x402::build_upto_payment_with_override(
-                &challenge,
-                store,
-                network_override.as_deref(),
-                account_override.as_deref(),
-                Some(url),
-                make_auth_override(),
-            )?;
+            let built_payment = scope.with_approval(peer.as_ref(), |auth| {
+                pay_core::client::x402::build_upto_payment_with_override(
+                    &challenge,
+                    store,
+                    network_override.as_deref(),
+                    account_override.as_deref(),
+                    Some(url),
+                    auth,
+                )
+            })?;
             let mut headers = extra_headers.to_vec();
             headers.extend(
                 built_payment
@@ -1298,16 +1305,18 @@ fn do_paid_fetch(
             if let Some(permissions) = &scope.payment_permissions {
                 permissions.authorize_batch(&challenge, &resource_url)?;
             }
-            let built = pay_core::client::x402::build_batch_payment(
-                &challenge,
-                store,
-                &session_cache.batch_channels,
-                None,
-                network_override.as_deref(),
-                account_override.as_deref(),
-                Some(url),
-                make_auth_override(),
-            )?;
+            let built = scope.with_approval(peer.as_ref(), |auth| {
+                pay_core::client::x402::build_batch_payment(
+                    &challenge,
+                    store,
+                    &session_cache.batch_channels,
+                    None,
+                    network_override.as_deref(),
+                    account_override.as_deref(),
+                    Some(url),
+                    auth,
+                )
+            })?;
             let mut headers = extra_headers.to_vec();
             headers.extend(
                 built
@@ -1335,16 +1344,18 @@ fn do_paid_fetch(
                 if let Some(permissions) = &scope.payment_permissions {
                     permissions.authorize_batch(corrective, &resource_url)?;
                 }
-                let retry = pay_core::client::x402::build_batch_payment(
-                    corrective,
-                    store,
-                    &session_cache.batch_channels,
-                    None,
-                    network_override.as_deref(),
-                    account_override.as_deref(),
-                    Some(url),
-                    make_auth_override(),
-                )?;
+                let retry = scope.with_approval(peer.as_ref(), |auth| {
+                    pay_core::client::x402::build_batch_payment(
+                        corrective,
+                        store,
+                        &session_cache.batch_channels,
+                        None,
+                        network_override.as_deref(),
+                        account_override.as_deref(),
+                        Some(url),
+                        auth,
+                    )
+                })?;
                 let mut headers = extra_headers.to_vec();
                 headers.extend(
                     retry
@@ -1381,14 +1392,16 @@ fn do_paid_fetch(
             // retry. The sign-in signature takes one Touch ID / approval; if
             // sign-in doesn't grant access and we fall back to paying below,
             // the payment signature requires a second approval.
-            let built = pay_core::client::x402::build_siwx_auth_header_with_override(
-                &challenge,
-                store,
-                network_override.as_deref(),
-                account_override.as_deref(),
-                Some(url),
-                make_auth_override(),
-            )?;
+            let built = scope.with_approval(peer.as_ref(), |auth| {
+                pay_core::client::x402::build_siwx_auth_header_with_override(
+                    &challenge,
+                    store,
+                    network_override.as_deref(),
+                    account_override.as_deref(),
+                    Some(url),
+                    auth,
+                )
+            })?;
             let mut headers = extra_headers.to_vec();
             headers.extend(
                 built
@@ -1408,14 +1421,16 @@ fn do_paid_fetch(
                 if let Some(permissions) = &scope.payment_permissions {
                     permissions.authorize_x402(&pay_challenge, &resource_url)?;
                 }
-                let built_payment = pay_core::client::x402::build_payment_with_override(
-                    &pay_challenge,
-                    store,
-                    network_override.as_deref(),
-                    account_override.as_deref(),
-                    Some(url),
-                    make_auth_override(),
-                )?;
+                let built_payment = scope.with_approval(peer.as_ref(), |auth| {
+                    pay_core::client::x402::build_payment_with_override(
+                        &pay_challenge,
+                        store,
+                        network_override.as_deref(),
+                        account_override.as_deref(),
+                        Some(url),
+                        auth,
+                    )
+                })?;
                 let mut headers = extra_headers.to_vec();
                 headers.extend(
                     built_payment
@@ -1447,14 +1462,16 @@ fn do_paid_fetch(
                 )
             })?;
             let (open_authorization, use_authorization) =
-                pay_core::session::open_operator_signed_session_authorizations(
-                    &challenge,
-                    store,
-                    network_override.as_deref(),
-                    account_override.as_deref(),
-                    url,
-                    make_auth_override(),
-                )?;
+                scope.with_approval(peer.as_ref(), |auth| {
+                    pay_core::session::open_operator_signed_session_authorizations(
+                        &challenge,
+                        store,
+                        network_override.as_deref(),
+                        account_override.as_deref(),
+                        url,
+                        auth,
+                    )
+                })?;
             let mut headers = extra_headers.to_vec();
             headers.push(("Authorization".to_string(), open_authorization));
             let retry = fetch_request(&headers)?;
@@ -1484,7 +1501,7 @@ fn do_paid_fetch(
             // `authenticate` challenge in the 402, we sign it with the
             // same unlocked signer and cache the resulting token so
             // subsequent requests in the period skip the prompt.
-            let built =
+            let built = scope.with_approval(peer.as_ref(), |auth| {
                 pay_core::client::subscription::build_credential_with_authenticate_and_override(
                     &challenge,
                     authenticate.as_deref(),
@@ -1492,8 +1509,9 @@ fn do_paid_fetch(
                     network_override.as_deref(),
                     account_override.as_deref(),
                     Some(url),
-                    make_auth_override(),
-                )?;
+                    auth,
+                )
+            })?;
             let mut headers = extra_headers.to_vec();
             headers.push(("Authorization".to_string(), built.authorization.clone()));
             let retry = fetch_request(&headers)?;
