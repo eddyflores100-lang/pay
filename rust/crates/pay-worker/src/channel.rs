@@ -243,6 +243,39 @@ pub async fn channel_absence_proven(
     })
 }
 
+/// Whether `address` reads as distributed at finalized commitment: a channel
+/// account in `Distributed` status, or the program's closed tombstone. A
+/// confirmed distribution can still be dropped by a fork, so durable records
+/// are only finished on this proof.
+pub async fn finalized_distributed(
+    rpc: &RpcClient,
+    rpc_url: &str,
+    address: &Pubkey,
+    program_id: &Pubkey,
+) -> Result<bool, JobError> {
+    let (_, accounts) = rpc
+        .get_multiple_accounts_with_owner_at(
+            rpc_url,
+            &[address.to_string()],
+            pay_api_core::rpc::Commitment::Finalized,
+        )
+        .await?;
+    let Some(account) = accounts.into_iter().next().flatten() else {
+        return Ok(false);
+    };
+    if account.owner != program_id.to_string() {
+        return Err(JobError::Config(format!(
+            "channel {address} is owned by {}, not its program",
+            account.owner
+        )));
+    }
+    Ok(match account.data.first() {
+        Some(1) => account.data.get(3) == Some(&STATUS_DISTRIBUTED),
+        Some(&CLOSED_CHANNEL_DISCRIMINATOR) => account.data.len() < CHANNEL_ACCOUNT_SIZE,
+        _ => false,
+    })
+}
+
 /// Validate persisted ABI selection before any recovery or transaction building.
 pub fn session_deployment(config: &SessionConfig) -> Result<Deployment, JobError> {
     config
@@ -993,6 +1026,39 @@ mod tests {
             url,
             tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
         )
+    }
+
+    #[tokio::test]
+    async fn only_a_finalized_distributed_read_finishes_a_close() {
+        use base64::Engine;
+        let rpc = RpcClient::new(std::time::Duration::from_secs(5)).unwrap();
+        let address = Pubkey::new_unique();
+        let program = default_program_id();
+        let account = |status: u8| {
+            let mut data = vec![0; CHANNEL_ACCOUNT_SIZE];
+            data[0] = 1;
+            data[1] = 1;
+            data[3] = status;
+            serde_json::json!({
+                "owner": program.to_string(),
+                "data": [base64::engine::general_purpose::STANDARD.encode(data), "base64"]
+            })
+        };
+        for (value, expected) in [
+            (account(STATUS_DISTRIBUTED), true),
+            // A close rolled back by a fork reads open or closing again.
+            (account(STATUS_OPEN), false),
+            (account(STATUS_CLOSING), false),
+            (account(STATUS_SEALED), false),
+            (serde_json::Value::Null, false),
+        ] {
+            let (url, server) = serve_account(1, value).await;
+            let distributed = finalized_distributed(&rpc, &url, &address, &program)
+                .await
+                .unwrap();
+            server.abort();
+            assert_eq!(distributed, expected);
+        }
     }
 
     #[tokio::test]

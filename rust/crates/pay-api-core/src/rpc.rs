@@ -519,6 +519,20 @@ impl RpcClient {
         signature: &str,
         max_wait: Duration,
     ) -> Result<()> {
+        self.confirm_signature_at(rpc_url, signature, max_wait, Commitment::Confirmed)
+            .await
+    }
+
+    /// [`Self::confirm_signature`] waiting for `commitment`. Durable terminal
+    /// state must wait for `Finalized`: a confirmed transaction can still be
+    /// dropped by a fork.
+    pub async fn confirm_signature_at(
+        &self,
+        rpc_url: &str,
+        signature: &str,
+        max_wait: Duration,
+        commitment: Commitment,
+    ) -> Result<()> {
         // Total polling budget; we re-check on a short loop. Cancel-class
         // transactions usually land within 1–2 slots.
         let deadline = std::time::Instant::now() + max_wait;
@@ -553,7 +567,7 @@ impl RpcClient {
                     .get("confirmationStatus")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if confirmation == "confirmed" || confirmation == "finalized" {
+                if reaches_commitment(confirmation, commitment) {
                     return Ok(());
                 }
             }
@@ -674,6 +688,13 @@ impl Commitment {
     }
 }
 
+fn reaches_commitment(status: &str, commitment: Commitment) -> bool {
+    match commitment {
+        Commitment::Confirmed => status == "confirmed" || status == "finalized",
+        Commitment::Finalized => status == "finalized",
+    }
+}
+
 fn multiple_accounts_body(addresses: &[String], commitment: Commitment) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -780,6 +801,16 @@ fn json_number(value: &Value) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_confirmed_status_does_not_satisfy_finality() {
+        assert!(reaches_commitment("confirmed", Commitment::Confirmed));
+        assert!(reaches_commitment("finalized", Commitment::Confirmed));
+        assert!(!reaches_commitment("processed", Commitment::Confirmed));
+        assert!(!reaches_commitment("confirmed", Commitment::Finalized));
+        assert!(reaches_commitment("finalized", Commitment::Finalized));
+        assert!(!reaches_commitment("", Commitment::Finalized));
+    }
 
     #[test]
     fn signature_infos_keep_slot_and_failure() {

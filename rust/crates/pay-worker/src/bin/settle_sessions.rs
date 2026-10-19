@@ -1064,6 +1064,15 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
                 };
                 match result.store_disposition {
                     StoreDisposition::Keep => {}
+                    StoreDisposition::Seal => {
+                        if !runtime.dry_run
+                            && let Err(error) =
+                                retain_sealed_record(&session.store, &result.channel_id).await
+                        {
+                            failures += 1;
+                            warn!(channel_id = %result.channel_id, %error, "failed to retain sealed bound record");
+                        }
+                    }
                     StoreDisposition::Expire { newly_finalized } => {
                         finalized += usize::from(newly_finalized);
                         if !runtime.dry_run
@@ -1389,6 +1398,27 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
             continue;
         }
         transactions += 1;
+        // A close is persisted as terminal only once it can no longer be
+        // rolled back; otherwise the next pass finishes it from a finalized read.
+        let finalized = !submitted
+            .iter()
+            .any(|(_, kind, ..)| *kind == CandidateKind::IdleClose)
+            || match runtime
+                .rpc
+                .confirm_signature_at(
+                    &runtime.rpc_url,
+                    signature,
+                    runtime.confirm_timeout,
+                    pay_api_core::rpc::Commitment::Finalized,
+                )
+                .await
+            {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!(%signature, %error, "close confirmed but not finalized; finishing it on a later pass");
+                    false
+                }
+            };
 
         for (channel_id, kind, before, after) in submitted {
             inventory.replace(*before, *after);
@@ -1404,23 +1434,11 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
                 channel_id,
                 !after.rent_unclaimed,
             );
-            if *kind != CandidateKind::IdleClose {
+            if *kind != CandidateKind::IdleClose || !finalized {
                 continue;
             }
             if bound_configs.contains_key(channel_id) {
-                match session
-                    .store
-                    .update_channel(
-                        channel_id,
-                        Box::new(|current| {
-                            let mut state = current
-                                .ok_or_else(|| StoreError::Internal("Channel not found".into()))?;
-                            state.sealed = true;
-                            Ok(state)
-                        }),
-                    )
-                    .await
-                {
+                match retain_sealed_record(&session.store, channel_id).await {
                     Ok(_) => idle_closed += 1,
                     Err(error) => {
                         failures += 1;
@@ -1880,7 +1898,26 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
                 metrics.failures += 1;
                 warn!(channel_id = %candidate.channel_id, %error, "failed to persist confirmed batch settlement watermark");
             }
-            match candidate.store_action {
+            let store_action = match candidate.store_action {
+                BatchStoreAction::Keep => BatchStoreAction::Keep,
+                terminal => match runtime
+                    .rpc
+                    .confirm_signature_at(
+                        &runtime.rpc_url,
+                        &signature,
+                        runtime.confirm_timeout,
+                        pay_api_core::rpc::Commitment::Finalized,
+                    )
+                    .await
+                {
+                    Ok(()) => terminal,
+                    Err(error) => {
+                        warn!(channel_id = %candidate.channel_id, %signature, %error, "batch lifecycle confirmed but not finalized; finishing it on a later pass");
+                        BatchStoreAction::Keep
+                    }
+                },
+            };
+            match store_action {
                 BatchStoreAction::Keep => {}
                 BatchStoreAction::MarkFinalized => {
                     if let Err(error) = batch.store.mark_finalized(&candidate.channel_id).await {
@@ -1947,6 +1984,24 @@ fn settlement_config(
         config.max_voucher_settlements_per_tx = config.max_voucher_settlements_per_tx.min(14);
     }
     config
+}
+
+async fn retain_sealed_record(
+    store: &impl ChannelStore,
+    channel_id: &str,
+) -> Result<(), StoreError> {
+    store
+        .update_channel(
+            channel_id,
+            Box::new(|current| {
+                let mut state =
+                    current.ok_or_else(|| StoreError::Internal("Channel not found".into()))?;
+                state.sealed = true;
+                Ok(state)
+            }),
+        )
+        .await
+        .map(|_| ())
 }
 
 fn log_summary(metrics: &SettleSessionsMetrics) {
@@ -2173,7 +2228,11 @@ struct ReconcileResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoreDisposition {
     Keep,
-    Expire { newly_finalized: bool },
+    /// Retain the bound ownership record, marked sealed.
+    Seal,
+    Expire {
+        newly_finalized: bool,
+    },
     Delete,
 }
 
@@ -2946,14 +3005,24 @@ async fn reconcile_channel(
     let escrow_active = Some(onchain.channel.status != STATUS_DISTRIBUTED);
 
     if onchain.channel.status == STATUS_DISTRIBUTED {
+        // Finish the durable record only on a finalized read: a confirmed
+        // distribution can still be dropped by a fork.
+        let finished = state.sealed
+            || channel::finalized_distributed(rpc, rpc_url, &channel_id, &program).await?;
         return Ok(ReconcileResult {
             onchain_status: Some(onchain.channel.status),
             channel_id: state_channel_id,
             candidate: None,
-            store_disposition: if bound_config.is_some() {
+            store_disposition: if !finished {
+                StoreDisposition::Keep
+            } else if bound_config.is_some() {
                 // Keep the ownership record: expiring it would permit the
                 // fleet reclamation job to mistake it for a legacy channel.
-                StoreDisposition::Keep
+                if state.sealed {
+                    StoreDisposition::Keep
+                } else {
+                    StoreDisposition::Seal
+                }
             } else {
                 StoreDisposition::Expire {
                     newly_finalized: !state.sealed,
@@ -5338,6 +5407,58 @@ mod tests {
             .unwrap();
             server.abort();
             assert_eq!(result.store_disposition, expected, "slot {finalized_slot}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_close_is_finished_only_once_finalized() {
+        use base64::Engine;
+        let program = payment_channels::default_program_id();
+        let account = move |status: u8| {
+            let mut data = vec![0; channel::CHANNEL_ACCOUNT_SIZE];
+            data[0] = 1;
+            data[1] = 1;
+            data[3] = status;
+            serde_json::json!({
+                "owner": program.to_string(),
+                "data": [base64::engine::general_purpose::STANDARD.encode(data), "base64"]
+            })
+        };
+        let rpc = RpcClient::new(Duration::from_secs(5)).unwrap();
+        for (finalized_status, expected) in [
+            // The distribution is not final yet, or a fork dropped it.
+            (STATUS_CLOSING, StoreDisposition::Keep),
+            (STATUS_OPEN, StoreDisposition::Keep),
+            (
+                STATUS_DISTRIBUTED,
+                StoreDisposition::Expire {
+                    newly_finalized: true,
+                },
+            ),
+        ] {
+            let (url, server) = spawn_rpc(move |request| {
+                let status = if request["params"][1]["commitment"] == "finalized" {
+                    finalized_status
+                } else {
+                    STATUS_DISTRIBUTED
+                };
+                serde_json::json!({"context": {"slot": 1}, "value": [account(status)]})
+            })
+            .await;
+            let result = reconcile_channel(
+                &rpc,
+                &url,
+                channel_state(),
+                0,
+                0,
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                None,
+            )
+            .await
+            .unwrap();
+            server.abort();
+            assert_eq!(result.store_disposition, expected);
         }
     }
 
