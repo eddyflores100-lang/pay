@@ -38,7 +38,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 const DEFAULT_REDIS_PREFIX: &str = "pay:session:v1:";
-const DEFAULT_BATCH_REDIS_PREFIX: &str = "pay:batch:v1:";
+const BATCH_REDIS_PREFIX_BASE: &str = "pay:batch:v1:";
 const SESSION_SETTLEMENT_LOCK_KEY: &str = "pay:jobs:settle-sessions:lock";
 const BATCH_SETTLEMENT_LOCK_KEY: &str = "pay:jobs:settle-batch:lock";
 const DEFAULT_RECONCILIATION_INTERVAL_SECONDS: u64 = 10;
@@ -521,7 +521,7 @@ impl SettlementRuntime {
                 .or_else(|| session_redis_url.clone())
                 .ok_or_else(|| JobError::Config("batch Redis URL is missing".into()))?;
             let redis_prefix = optional_env("PAY_X402_REDIS_PREFIX")
-                .unwrap_or_else(|| DEFAULT_BATCH_REDIS_PREFIX.to_string());
+                .unwrap_or_else(|| default_batch_redis_prefix(&network));
             let store = RedisChannelStore::connect_with_finalized_retention(
                 &redis_url,
                 redis_prefix,
@@ -3672,10 +3672,35 @@ fn unix_nanos() -> u128 {
         .as_nanos()
 }
 
+/// Mirrors the gateway's per-network batch store namespace: mainnet keeps the
+/// original prefix, every other cluster gets its own.
+fn default_batch_redis_prefix(network: &str) -> String {
+    match network.trim() {
+        "mainnet" | "mainnet-beta" => BATCH_REDIS_PREFIX_BASE.to_string(),
+        "localnet" | "sandbox" => format!("{BATCH_REDIS_PREFIX_BASE}localnet:"),
+        other => format!("{BATCH_REDIS_PREFIX_BASE}{other}:"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pay_kit::core::store::ChannelLifecycle;
+
+    #[test]
+    fn default_batch_prefix_matches_the_gateway_per_network_namespace() {
+        assert_eq!(default_batch_redis_prefix("mainnet"), "pay:batch:v1:");
+        assert_eq!(default_batch_redis_prefix("mainnet-beta"), "pay:batch:v1:");
+        assert_eq!(default_batch_redis_prefix("devnet"), "pay:batch:v1:devnet:");
+        assert_eq!(
+            default_batch_redis_prefix("localnet"),
+            "pay:batch:v1:localnet:"
+        );
+        assert_eq!(
+            default_batch_redis_prefix("sandbox"),
+            "pay:batch:v1:localnet:"
+        );
+    }
 
     fn channel_state() -> ChannelState {
         ChannelState {

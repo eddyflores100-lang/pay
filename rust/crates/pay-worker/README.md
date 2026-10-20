@@ -53,7 +53,7 @@ hand-copied program logic or account layout.
 | `PAY_SESSION_REDIS_PREFIX` | no | — | Legacy fallback for `PAY_MPP_REDIS_PREFIX`. |
 | `PAY_SESSION_FINALIZED_RETENTION_SECONDS` | no | — | Legacy fallback for `PAY_MPP_FINALIZED_RETENTION_SECONDS`. |
 | `PAY_X402_REDIS_URL` | no | MPP Redis URL | x402 Redis URL shared with the gateway. |
-| `PAY_X402_REDIS_PREFIX` | no | `pay:batch:v1:` | x402 batch channel key namespace; must match the gateway. |
+| `PAY_X402_REDIS_PREFIX` | no | `pay:batch:v1:` on mainnet, `pay:batch:v1:<network>:` otherwise (`sandbox` uses `localnet`) | x402 batch channel key namespace; must match the gateway, which namespaces batch channels per network. |
 | `PAY_X402_SETTLE_ACTIVE_CHANNELS` | no | `false` | Include active channels with positive off-chain watermarks in every worker run. Keep false for idle-only production reconciliation; enable it for an explicitly scheduled full-fleet sweep. |
 | `PAY_X402_DISTRIBUTION_THRESHOLD_BASE_UNITS` | no | unset | Per-channel claimed-but-undistributed token balance that triggers distribution from an open channel. Must be greater than zero. Unset keeps intermediate claims in escrow; closing and sealed channels are still finalized regardless. |
 | `PAY_X402_SETTLEMENT_MAX_IDLE_SECONDS` | no | `300` | Settle a positive residual after the channel has remained untouched for this long. Closing and sealed channels are never deferred. |
