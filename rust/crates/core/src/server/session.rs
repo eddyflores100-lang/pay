@@ -217,14 +217,6 @@ pub enum SessionOutcome {
     },
 }
 
-/// How a delegated charge is expressed: an increment on whatever the
-/// watermark is, or the cumulative total it must reach.
-#[derive(Debug, Clone, Copy)]
-enum UsageCharge {
-    Delta(u64),
-    Cumulative(u64),
-}
-
 /// State needed to emit a canonical receipt after delegated usage is accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelegatedUsageAuthorization {
@@ -2055,45 +2047,48 @@ impl SessionMpp {
             .await
     }
 
-    /// Bring the channel's operator-signed cumulative to `target`.
-    ///
-    /// Idempotent: a target the durable watermark already covers is applied,
-    /// so a settlement retried after an interrupted attempt never charges the
-    /// same usage twice.
-    pub async fn authorize_delegated_cumulative(
-        &self,
-        channel_id: &str,
-        target: u64,
-    ) -> Result<DelegatedUsageAuthorization> {
-        self.authorize_usage(channel_id, UsageCharge::Cumulative(target), None)
-            .await
-    }
-
     pub async fn authorize_reserved_usage(
         &self,
         channel_id: &str,
         amount: u64,
         lease: Option<&DelegatedCapacityLease>,
     ) -> Result<DelegatedUsageAuthorization> {
-        self.authorize_usage(channel_id, UsageCharge::Delta(amount), lease)
-            .await
+        let accepted = self
+            .commit_reserved_usage(channel_id, amount, lease)
+            .await?;
+        self.touch_after_delegated_usage(channel_id).await?;
+        Ok(accepted)
     }
 
-    async fn authorize_usage(
+    /// The durable half of [`Self::authorize_delegated_usage`]: persist the
+    /// voucher for `amount` and return its cumulative, without the lifecycle
+    /// touch that follows ([`Self::touch_after_delegated_usage`]). A caller
+    /// that must learn whether a charge landed even when the touch fails, or
+    /// is cancelled, uses the two halves.
+    pub async fn commit_delegated_usage(
         &self,
         channel_id: &str,
-        charge: UsageCharge,
+        amount: u64,
+    ) -> Result<DelegatedUsageAuthorization> {
+        self.commit_reserved_usage(channel_id, amount, None).await
+    }
+
+    /// Extend the channel lifecycle after a committed delegated charge.
+    pub async fn touch_after_delegated_usage(&self, channel_id: &str) -> Result<()> {
+        // Bound voucher acceptance updates lifecycle in the same durable CAS.
+        // A second fallible write here could report a failed response after debit.
+        if self.channel_binding.is_none() {
+            self.touch_channel(channel_id.to_string()).await?;
+        }
+        Ok(())
+    }
+
+    async fn commit_reserved_usage(
+        &self,
+        channel_id: &str,
+        amount: u64,
         lease: Option<&DelegatedCapacityLease>,
     ) -> Result<DelegatedUsageAuthorization> {
-        let requested = match charge {
-            UsageCharge::Delta(amount) => amount,
-            UsageCharge::Cumulative(_) if lease.is_some() => {
-                return Err(Error::Mpp(
-                    "a reserved charge is priced per request, not as a cumulative".into(),
-                ));
-            }
-            UsageCharge::Cumulative(_) => 0,
-        };
         let lease_id = lease.and_then(|lease| lease.durable_id.clone());
         if self.channel_binding.is_some() && lease_id.is_none() {
             return Err(Error::PaymentRejected(
@@ -2106,9 +2101,9 @@ impl SessionMpp {
                     "reservation belongs to another channel".into(),
                 ));
             }
-            lease.require_active(requested).await?;
+            lease.require_active(amount).await?;
         }
-        if self.channel_binding.is_some() && requested != self.session_config.amount {
+        if self.channel_binding.is_some() && amount != self.session_config.amount {
             return Err(Error::PaymentRejected(
                 "deployment charge differs from policy price".into(),
             ));
@@ -2149,10 +2144,6 @@ impl SessionMpp {
             ))
         })?;
         self.record_committed_watermark(channel_id.to_string(), current);
-        let amount = match charge {
-            UsageCharge::Delta(amount) => amount,
-            UsageCharge::Cumulative(target) => target.saturating_sub(current),
-        };
         if amount == 0 {
             return Ok(DelegatedUsageAuthorization {
                 cumulative: current,
@@ -2238,11 +2229,6 @@ impl SessionMpp {
             accepted.charged,
         );
         self.record_committed_watermark(channel_id.to_string(), accepted.cumulative);
-        // Bound voucher acceptance updates lifecycle in the same durable CAS.
-        // A second fallible write here could report a failed response after debit.
-        if self.channel_binding.is_none() {
-            self.touch_channel(channel_id.to_string()).await?;
-        }
         Ok(DelegatedUsageAuthorization {
             cumulative: accepted.cumulative,
             idle_timeout_seconds,

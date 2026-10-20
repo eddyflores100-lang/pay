@@ -18,7 +18,7 @@ use crate::server::gate::SessionForward;
 use crate::server::metering::{
     RequestProperties, provider_token_quantity, quota_tokens_per_unit, resolve_variant,
 };
-use crate::server::session::SessionMpp;
+use crate::server::session::{DelegatedUsageAuthorization, SessionMpp};
 use crate::server::session_metering::{
     GateMode, Result as MeteringResult, SessionGateDecision, SessionMeterDimension,
     SessionMeterSpec, SessionMeteringContext, SessionUsageGate, StablecoinSettlement,
@@ -176,6 +176,16 @@ pub struct DelegatedSessionStreamMeter {
     authorization_exhausted: bool,
     next_lifecycle_touch: Instant,
     observer: Option<MeteredSettlement>,
+    /// This stream's charge in progress. It runs detached, so a cancelled
+    /// stream still learns whether it landed before charging again.
+    in_flight: Option<InFlightCharge>,
+}
+
+/// One delegated charge for this stream, running to completion on its own
+/// task whatever happens to the stream that started it.
+struct InFlightCharge {
+    amount: u64,
+    commit: tokio::task::JoinHandle<crate::Result<DelegatedUsageAuthorization>>,
 }
 
 impl DelegatedSessionStreamMeter {
@@ -215,6 +225,7 @@ impl DelegatedSessionStreamMeter {
             authorization_exhausted: false,
             next_lifecycle_touch: Instant::now() + LIFECYCLE_TOUCH_INTERVAL,
             observer: None,
+            in_flight: None,
         })
     }
 
@@ -288,6 +299,7 @@ impl DelegatedSessionStreamMeter {
     }
 
     async fn settle(&mut self, decision: SessionGateDecision) -> Result<(), BoxError> {
+        self.resolve_in_flight().await?;
         let clamp_reprice_to_authorized = std::mem::take(&mut self.clamp_reprice_to_authorized);
         if !decision.requires_voucher() {
             return Ok(());
@@ -315,19 +327,41 @@ impl DelegatedSessionStreamMeter {
             self.authorization_exhausted |= exhausted_by_reprice;
             return Ok(());
         }
-        // A fixed cumulative target, never a delta: an attempt interrupted
-        // after its voucher was saved is then not charged again on retry.
-        let accepted = self
-            .forward
+        let handle = Arc::clone(&self.forward.handle);
+        let channel_id = self.forward.channel_id.clone();
+        self.in_flight = Some(InFlightCharge {
+            amount,
+            commit: tokio::spawn(async move {
+                handle.commit_delegated_usage(&channel_id, amount).await
+            }),
+        });
+        self.resolve_in_flight().await?;
+        self.authorization_exhausted |= exhausted_by_reprice;
+        self.forward
             .handle
-            .authorize_delegated_cumulative(&self.forward.channel_id, target)
+            .touch_after_delegated_usage(&self.forward.channel_id)
             .await
-            .map_err(box_error)?;
-        self.gate.record_commit(accepted.cumulative);
+            .map_err(box_error)
+    }
+
+    /// Wait for this stream's charge in progress and account for it. The
+    /// stream's own commits are additive: another stream's charges on the
+    /// same channel never count toward this one.
+    async fn resolve_in_flight(&mut self) -> Result<(), BoxError> {
+        let Some(in_flight) = self.in_flight.as_mut() else {
+            return Ok(());
+        };
+        // Awaiting a join handle is cancel-safe: dropping this future leaves
+        // the charge running and recorded here for the next attempt.
+        let joined = (&mut in_flight.commit).await;
+        let amount = in_flight.amount;
+        self.in_flight = None;
+        joined.map_err(box_error)?.map_err(box_error)?;
+        self.gate
+            .record_commit(self.gate.committed_base_units().saturating_add(amount));
         if let Some(observer) = &self.observer {
             observer.record(amount, self.forward.handle.decimals());
         }
-        self.authorization_exhausted |= exhausted_by_reprice;
         Ok(())
     }
 
@@ -401,6 +435,7 @@ impl DelegatedSessionStreamMeter {
 
     /// Persist the usage a stream that ended early implies.
     async fn abort_stream(&mut self) -> Result<(), BoxError> {
+        self.resolve_in_flight().await?;
         if self.accumulator.abort_stream()? {
             self.current = self.accumulator.observation();
         }
@@ -1927,6 +1962,20 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         label: &str,
         store: Arc<dyn ChannelStore>,
     ) -> (Arc<SessionMpp>, String, DelegatedSessionStreamMeter) {
+        let channel = delegated_channel(label, &store).await;
+        let meter = delegated_meter(&channel.session, &channel.channel_id, dimensions).await;
+        (channel.session, channel.channel_id, meter)
+    }
+
+    struct DelegatedChannel {
+        config: SessionConfig,
+        operator: Arc<dyn TransactionSigner>,
+        session: Arc<SessionMpp>,
+        channel_id: String,
+    }
+
+    /// A funded operator-signed channel in `store`, served by one replica.
+    async fn delegated_channel(label: &str, store: &Arc<dyn ChannelStore>) -> DelegatedChannel {
         use ed25519_dalek::SigningKey;
 
         let signing_key = SigningKey::generate(&mut rand::thread_rng());
@@ -1935,24 +1984,17 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         operator_keypair[32..].copy_from_slice(signing_key.verifying_key().as_bytes());
         let operator: Arc<dyn TransactionSigner> =
             Arc::new(MemorySigner::from_bytes(&operator_keypair).unwrap());
-        let session = Arc::new(
-            SessionMpp::new_with_channel_store(
-                SessionConfig {
-                    operator: operator.pubkey().to_string(),
-                    recipient: solana_pubkey::Pubkey::new_unique().to_string(),
-                    suggested_deposit: Some(1_000_000),
-                    currency: solana_pubkey::Pubkey::new_unique().to_string(),
-                    network: "localnet".to_string(),
-                    min_voucher_delta: 1,
-                    voucher_signer: VoucherSigner::Operator,
-                    ..SessionConfig::default()
-                },
-                label,
-                Arc::clone(&store),
-            )
-            .with_blockhash_cache(stream_test_blockhash_cache())
-            .with_payment_channel_signer(Arc::clone(&operator)),
-        );
+        let config = SessionConfig {
+            operator: operator.pubkey().to_string(),
+            recipient: solana_pubkey::Pubkey::new_unique().to_string(),
+            suggested_deposit: Some(1_000_000),
+            currency: solana_pubkey::Pubkey::new_unique().to_string(),
+            network: "localnet".to_string(),
+            min_voucher_delta: 1,
+            voucher_signer: VoucherSigner::Operator,
+            ..SessionConfig::default()
+        };
+        let session = delegated_replica(&config, &operator, label, store);
         let challenge = session.challenge(None).unwrap();
         let channel_id = solana_pubkey::Pubkey::new_unique().to_string();
         store
@@ -1970,14 +2012,42 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             )
             .await
             .unwrap();
+        DelegatedChannel {
+            config,
+            operator,
+            session,
+            channel_id,
+        }
+    }
+
+    /// One gateway replica over `store`.
+    fn delegated_replica(
+        config: &SessionConfig,
+        operator: &Arc<dyn TransactionSigner>,
+        label: &str,
+        store: &Arc<dyn ChannelStore>,
+    ) -> Arc<SessionMpp> {
+        Arc::new(
+            SessionMpp::new_with_channel_store(config.clone(), label, Arc::clone(store))
+                .with_blockhash_cache(stream_test_blockhash_cache())
+                .with_payment_channel_signer(Arc::clone(operator)),
+        )
+    }
+
+    /// A stream admitted on `session` at the channel's current watermark.
+    async fn delegated_meter(
+        session: &Arc<SessionMpp>,
+        channel_id: &str,
+        dimensions: Vec<MeterDimension>,
+    ) -> DelegatedSessionStreamMeter {
         let reservation = session
-            .reserve_delegated_capacity(&channel_id, 100_000)
+            .reserve_delegated_capacity(channel_id, 100_000)
             .await
             .unwrap()
             .expect("session capacity should be available");
         let forward = SessionForward::delegated(
             session.clone(),
-            channel_id.clone(),
+            channel_id.to_string(),
             0,
             crate::server::metering::UptoSettlementPlan {
                 metering: metering(dimensions),
@@ -1990,8 +2060,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             solana_pubkey::Pubkey::new_unique().to_string(),
             reservation,
         );
-        let meter = DelegatedSessionStreamMeter::from_forward(forward).unwrap();
-        (session, channel_id, meter)
+        DelegatedSessionStreamMeter::from_forward(forward).unwrap()
     }
 
     fn token_dimension(direction: MeterDirection, path: &str) -> MeterDimension {
@@ -2013,6 +2082,17 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
                 header: None,
             }),
         }
+    }
+
+    async fn drain_delegated_bytes(
+        chunks: Vec<Bytes>,
+        meter: DelegatedSessionStreamMeter,
+    ) -> Result<Vec<u8>, BoxError> {
+        drain_delegated(
+            chunks.into_iter().map(|chunk| chunk.to_vec()).collect(),
+            meter,
+        )
+        .await
     }
 
     async fn drain_delegated(
@@ -2276,13 +2356,46 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         );
     }
 
-    /// A store whose first read after the watermark reaches `stall_at` never
-    /// answers: an attempt that saved its voucher is then cancelled while it
-    /// waits on the lifecycle touch that follows.
+    /// A store that stalls once the watermark reaches `stall_at`: its next
+    /// read never answers (cancelling an attempt in the lifecycle touch after
+    /// its voucher saved), or with `slow_write`, the write that saved it is
+    /// slow to return (cancelling the attempt inside the commit itself).
     struct StallingStore {
         inner: MemoryChannelStore,
         stall_at: u64,
+        slow_write: bool,
         stalled: std::sync::atomic::AtomicBool,
+    }
+
+    impl StallingStore {
+        fn new(stall_at: u64, slow_write: bool) -> Arc<Self> {
+            Arc::new(Self {
+                inner: MemoryChannelStore::new(),
+                stall_at,
+                slow_write,
+                stalled: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        async fn after_write(&self, channel_id: &str) {
+            if !self.slow_write {
+                return;
+            }
+            let saved = self
+                .inner
+                .get_channel(channel_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|state| state.cumulative >= self.stall_at);
+            if saved && !self.stalled.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+            }
+        }
+
+        fn stalled(&self) -> bool {
+            self.stalled.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     type StoreFuture<'a, T> = std::pin::Pin<
@@ -2305,9 +2418,10 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             let channel_id = channel_id.to_string();
             Box::pin(async move {
                 let state = self.inner.get_channel(&channel_id).await?;
-                if state
-                    .as_ref()
-                    .is_some_and(|state| state.cumulative >= self.stall_at)
+                if !self.slow_write
+                    && state
+                        .as_ref()
+                        .is_some_and(|state| state.cumulative >= self.stall_at)
                     && !self.stalled.swap(true, std::sync::atomic::Ordering::SeqCst)
                 {
                     std::future::pending::<()>().await;
@@ -2340,13 +2454,23 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
                     > + Send,
             >,
         ) -> StoreFuture<'_, pay_kit::mpp::store::ChannelState> {
-            self.inner.update_channel(channel_id, updater)
+            let channel_id = channel_id.to_string();
+            Box::pin(async move {
+                let state = self.inner.update_channel(&channel_id, updater).await?;
+                self.after_write(&channel_id).await;
+                Ok(state)
+            })
         }
 
         fn read_channel(
             &self,
             channel_id: &str,
-            reader: pay_kit::mpp::store::ChannelReader,
+            reader: Box<
+                dyn FnOnce(
+                        Option<&pay_kit::mpp::store::ChannelState>,
+                    ) -> Result<(), pay_kit::mpp::store::StoreError>
+                    + Send,
+            >,
         ) -> StoreFuture<'_, ()> {
             self.inner.read_channel(channel_id, reader)
         }
@@ -2355,9 +2479,21 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             &self,
             channel_id: &str,
             seed: Option<pay_kit::mpp::store::ChannelState>,
-            mutator: pay_kit::mpp::store::ChannelMutator,
+            mutator: Box<
+                dyn FnOnce(
+                        &mut pay_kit::mpp::store::ChannelState,
+                    ) -> Result<(), pay_kit::mpp::store::StoreError>
+                    + Send,
+            >,
         ) -> StoreFuture<'_, ()> {
-            self.inner.mutate_channel(channel_id, seed, mutator)
+            let channel_id = channel_id.to_string();
+            Box::pin(async move {
+                self.inner
+                    .mutate_channel(&channel_id, seed, mutator)
+                    .await?;
+                self.after_write(&channel_id).await;
+                Ok(())
+            })
         }
 
         fn touch_channel_lifecycle(
@@ -2392,11 +2528,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
 
     #[tokio::test]
     async fn a_cancelled_settlement_is_never_charged_twice() {
-        let store = Arc::new(StallingStore {
-            inner: MemoryChannelStore::new(),
-            stall_at: 5,
-            stalled: std::sync::atomic::AtomicBool::new(false),
-        });
+        let store = StallingStore::new(5, false);
         let (session, channel_id, meter) = delegated_test_meter_on(
             vec![token_dimension(
                 MeterDirection::Output,
@@ -2406,10 +2538,8 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             store.clone(),
         )
         .await;
-        let upstream = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
-            Bytes::from_static(b"data: {\"choices\":[],\"usage\":{\"completion_tokens\":5}}\n\n"),
-        )])
-        .chain(futures_util::stream::pending());
+        let upstream = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(usage_event(5))])
+            .chain(futures_util::stream::pending());
         let mut metered = Box::pin(meter_delegated_response_stream(upstream, meter, true));
         // The voucher for 5 is saved, then the lifecycle touch never returns.
         assert!(
@@ -2417,7 +2547,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
                 .await
                 .is_err()
         );
-        assert!(store.stalled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(store.stalled());
         // The buyer disconnects mid-settlement; the finalizer retries.
         drop(metered);
 
@@ -2427,13 +2557,73 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         assert_eq!(session.committed_watermark(&channel_id), Some(5));
     }
 
+    fn usage_event(completion_tokens: u64) -> Bytes {
+        Bytes::from(format!(
+            "data: {{\"choices\":[],\"usage\":{{\"completion_tokens\":{completion_tokens}}}}}\n\n"
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_charge_cancelled_inside_its_commit_is_never_charged_twice() {
+        let store = StallingStore::new(5, true);
+        let (session, channel_id, meter) = delegated_test_meter_on(
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )],
+            "cancelled-commit",
+            store.clone(),
+        )
+        .await;
+        let upstream = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(usage_event(5))])
+            .chain(futures_util::stream::pending());
+        let mut metered = Box::pin(meter_delegated_response_stream(upstream, meter, true));
+        // The voucher for 5 is saved; the write reporting it is still out.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), metered.next())
+                .await
+                .is_err()
+        );
+        assert!(store.stalled());
+        drop(metered);
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let state = store.inner.get_channel(&channel_id).await.unwrap().unwrap();
+        assert_eq!(state.cumulative, 5, "the usage is charged exactly once");
+        assert_eq!(session.committed_watermark(&channel_id), Some(5));
+    }
+
+    #[tokio::test]
+    async fn streams_on_two_replicas_each_pay_their_own_usage() {
+        let store: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::new());
+        let dimensions = || {
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )]
+        };
+        let channel = delegated_channel("two-replicas", &store).await;
+        let channel_id = channel.channel_id.clone();
+        let first_meter = delegated_meter(&channel.session, &channel_id, dimensions()).await;
+        // A second gateway over the same store admits a stream on the same
+        // channel at the same watermark.
+        let second = delegated_replica(&channel.config, &channel.operator, "two-replicas", &store);
+        let second_meter = delegated_meter(&second, &channel_id, dimensions()).await;
+
+        drain_delegated_bytes(vec![usage_event(5)], first_meter)
+            .await
+            .unwrap();
+        drain_delegated_bytes(vec![usage_event(5), usage_event(7)], second_meter)
+            .await
+            .unwrap();
+
+        let state = store.get_channel(&channel_id).await.unwrap().unwrap();
+        assert_eq!(state.cumulative, 12, "each stream pays its own usage");
+    }
+
     #[tokio::test]
     async fn a_cancelled_settlement_reports_its_earnings_once() {
-        let store = Arc::new(StallingStore {
-            inner: MemoryChannelStore::new(),
-            stall_at: 5,
-            stalled: std::sync::atomic::AtomicBool::new(false),
-        });
+        let store = StallingStore::new(5, false);
         let (session, _, meter) = delegated_test_meter_on(
             vec![token_dimension(
                 MeterDirection::Output,
@@ -2448,10 +2638,8 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         let meter = meter.with_observer(Some(MeteredSettlement::with_callback(move |usd| {
             *sink.lock().unwrap() = Some(usd);
         })));
-        let upstream = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
-            Bytes::from_static(b"data: {\"choices\":[],\"usage\":{\"completion_tokens\":5}}\n\n"),
-        )])
-        .chain(futures_util::stream::pending());
+        let upstream = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(usage_event(5))])
+            .chain(futures_util::stream::pending());
         let mut metered = Box::pin(meter_delegated_response_stream(upstream, meter, true));
         assert!(
             tokio::time::timeout(Duration::from_millis(200), metered.next())
