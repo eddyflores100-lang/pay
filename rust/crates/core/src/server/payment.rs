@@ -27,6 +27,11 @@ pub struct TrustedPaymentIdentity {
     pub payer: Option<String>,
     pub channel_id: Option<String>,
     pub original_host: Option<String>,
+    /// Durable deployment policy snapshot the request was admitted under
+    /// ([`ResolvedDeploymentPolicy::binding_identity`]).
+    ///
+    /// [`ResolvedDeploymentPolicy::binding_identity`]: crate::server::deployment_policy::ResolvedDeploymentPolicy::binding_identity
+    pub payment_policy: Option<String>,
 }
 
 /// Axum middleware that gates metered endpoints behind MPP payment.
@@ -146,10 +151,12 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
             let mut delegated_session = None;
             let mut verified_payer = None;
             let mut verified_channel = None;
+            let mut payment_policy = None;
             if let Some(sf) = session {
                 let mut sf = *sf;
                 verified_payer = sf.verified_payer.clone();
                 verified_channel = Some(sf.channel_id.clone());
+                payment_policy = sf.payment_policy.clone();
                 if sf.settlement.is_some() {
                     // Delegated sessions are settled from the completed
                     // response below. The client-voucher stream context waits
@@ -183,6 +190,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                 payer: verified_payer,
                 channel_id: verified_channel,
                 original_host: host,
+                payment_policy,
             });
             let deadline = delegated_session
                 .as_ref()
@@ -395,6 +403,16 @@ pub fn inject_verified_payer_headers(
         {
             headers.insert("x-pay-original-host", value);
         }
+    }
+}
+
+/// Forward the deployment policy snapshot a request was admitted under, so the
+/// upstream serves exactly the admitted incarnation and price.
+pub fn inject_payment_policy_header(headers: &mut HeaderMap, policy: Option<&str>) {
+    if let Some(policy) = policy
+        && let Ok(value) = HeaderValue::from_str(policy)
+    {
+        headers.insert("x-pay-payment-policy", value);
     }
 }
 

@@ -435,6 +435,10 @@ pub async fn prepare_upstream_with_identity(
                 identity.channel_id.as_deref(),
             );
         }
+        payment::inject_payment_policy_header(
+            &mut trusted_headers,
+            identity.payment_policy.as_deref(),
+        );
         for (name, value) in trusted_headers {
             if let Some(name) = name
                 && let Ok(value) = value.to_str()
@@ -2104,6 +2108,7 @@ mod tests {
             payer: Some("trusted-payer".into()),
             channel_id: Some("trusted-channel".into()),
             original_host: Some("worker.cpu.gcp.gateway-402.com".into()),
+            payment_policy: None,
         };
         let UpstreamPlan::Forward(prepared) = prepare_upstream_with_identity(
             &api,
@@ -2134,6 +2139,7 @@ mod tests {
             payer: None,
             channel_id: None,
             original_host: Some("worker.cpu.gcp.gateway-402.com".into()),
+            payment_policy: None,
         };
         let UpstreamPlan::Forward(prepared) = prepare_upstream_with_identity(
             &api,
@@ -2153,6 +2159,55 @@ mod tests {
             prepared.header_value("x-pay-original-host"),
             Some("worker.cpu.gcp.gateway-402.com")
         );
+        assert_eq!(prepared.header_value("x-pay-payment-policy"), None);
+    }
+
+    #[tokio::test]
+    async fn admitted_payment_policy_replaces_a_spoofed_policy_header() {
+        let api = make_api("test");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-pay-payment-policy",
+            HeaderValue::from_static(r#"{"version":999}"#),
+        );
+        let admitted =
+            r#"{"deployment":{"hostname":"w.example"},"version":3,"price_micro_usd":10}"#;
+        let identity = TrustedPaymentIdentity {
+            payer: Some("trusted-payer".into()),
+            payment_policy: Some(admitted.into()),
+            ..Default::default()
+        };
+        let UpstreamPlan::Forward(prepared) = prepare_upstream_with_identity(
+            &api,
+            &Method::POST,
+            &"/summary".parse().unwrap(),
+            &headers,
+            &[],
+            Some(&identity),
+        )
+        .await
+        .unwrap() else {
+            panic!("expected proxy forwarding");
+        };
+        assert_eq!(
+            prepared.header_value("x-pay-payment-policy"),
+            Some(admitted)
+        );
+
+        // Without an admitted policy the caller's value never reaches upstream.
+        let UpstreamPlan::Forward(prepared) = prepare_upstream_with_identity(
+            &api,
+            &Method::POST,
+            &"/summary".parse().unwrap(),
+            &headers,
+            &[],
+            Some(&TrustedPaymentIdentity::default()),
+        )
+        .await
+        .unwrap() else {
+            panic!("expected proxy forwarding");
+        };
+        assert_eq!(prepared.header_value("x-pay-payment-policy"), None);
     }
 
     #[test]

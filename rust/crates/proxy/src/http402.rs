@@ -1041,6 +1041,9 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                         .as_ref()
                         .map(|pending| pending.channel_id.clone()),
                     original_host: host.clone(),
+                    payment_policy: session_forward
+                        .as_ref()
+                        .and_then(|pending| pending.payment_policy.clone()),
                 });
                 ctx.receipt = receipt;
                 ctx.paid_request = paid_request;

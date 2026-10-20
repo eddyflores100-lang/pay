@@ -190,6 +190,9 @@ pub struct SessionForward {
     /// Exact size of the request body the adapter forwarded upstream, when it
     /// buffered it: the bound for input usage the provider does not report.
     pub request_body_bytes: Option<u64>,
+    /// Deployment policy snapshot the request was admitted under, forwarded
+    /// upstream as `x-pay-payment-policy`.
+    pub payment_policy: Option<String>,
     /// Releases the exclusive capacity reservation on every terminal path.
     pub(crate) _reservation: Option<DelegatedCapacityLease>,
 }
@@ -244,6 +247,7 @@ impl SessionForward {
             authorized_base_units: capacity_base_units.1,
             verified_payer: Some(verified_payer),
             request_body_bytes: None,
+            payment_policy: None,
             _reservation: Some(reservation),
         }
     }
@@ -534,7 +538,7 @@ impl<S: PaymentState> PaymentGate<S> {
                     if credential.challenge.intent.as_str() == "session"
                         && credential.challenge.method.as_str() == "solana" =>
                 {
-                    return session_authorized(
+                    let mut decision = session_authorized(
                         &session,
                         Some(Arc::clone(&session)),
                         credential,
@@ -544,6 +548,14 @@ impl<S: PaymentState> PaymentGate<S> {
                         req.path,
                     )
                     .await;
+                    if let GateDecision::Forward {
+                        session: Some(forward),
+                        ..
+                    } = &mut decision
+                    {
+                        forward.payment_policy = Some(policy.binding_identity());
+                    }
+                    return decision;
                 }
                 Err(_) => {
                     return GateDecision::Respond(GateResponse::json(
@@ -2701,6 +2713,7 @@ async fn session_authorized(
                     authorized_base_units: state.deposit,
                     verified_payer: Some(state.payer.clone()),
                     request_body_bytes: None,
+                    payment_policy: None,
                     _reservation: Some(reservation),
                 })),
                 receipt: signature
@@ -2729,6 +2742,7 @@ async fn session_authorized(
                     authorized_base_units: cumulative,
                     verified_payer,
                     request_body_bytes: None,
+                    payment_policy: None,
                     _reservation: None,
                 })
             }),

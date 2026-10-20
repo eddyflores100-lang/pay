@@ -3542,6 +3542,7 @@ mod tests {
                 authorized_base_units: CAP,
                 verified_payer: None,
                 request_body_bytes: None,
+                payment_policy: None,
                 _reservation: Some(lease),
             };
             let body = if broken {
