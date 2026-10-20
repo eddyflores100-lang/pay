@@ -89,6 +89,9 @@ impl GoogleTriggerConfig {
     }
 }
 
+/// Proof that a trigger's prepaid budget was written.
+struct FundedBudget(());
+
 #[derive(Clone)]
 pub struct GoogleTriggerDriver {
     config: Arc<GoogleTriggerConfig>,
@@ -153,7 +156,7 @@ impl GoogleTriggerDriver {
         )
     }
 
-    async fn fund_budget(&self, resource: &str, channel: &str) -> Result<()> {
+    async fn fund_budget(&self, resource: &str, channel: &str) -> Result<FundedBudget> {
         let expires_at = unix_seconds()?.saturating_add(BUDGET_LIFETIME_SECONDS);
         let mut connection = self.budgets.clone();
         redis::pipe()
@@ -167,7 +170,21 @@ impl GoogleTriggerDriver {
             )
             .query_async::<()>(&mut connection)
             .await?;
-        Ok(())
+        Ok(FundedBudget(()))
+    }
+
+    /// Create a Scheduler job. Requiring the funded budget means no job can
+    /// exist without one, so a retry after a funding fault takes this path again.
+    async fn create_job(&self, region: &str, body: &Value, _: FundedBudget) -> Result<Value> {
+        self.require(
+            Method::POST,
+            format!(
+                "{}/v1/projects/{}/locations/{region}/jobs",
+                self.config.scheduler_api_base, self.config.project
+            ),
+            Some(body),
+        )
+        .await
     }
 
     async fn consume_budget(&self, resource: &str, channel: &str) -> Result<bool> {
@@ -552,40 +569,20 @@ impl TriggerDriver for GoogleTriggerDriver {
             self.config.scheduler_api_base
         );
         let (status, value) = self.request(Method::PATCH, url, Some(&body)).await?;
-        let (value, created) = if status == StatusCode::NOT_FOUND {
-            let value = self
-                .require(
-                    Method::POST,
-                    format!(
-                        "{}/v1/projects/{}/locations/{region}/jobs",
-                        self.config.scheduler_api_base, self.config.project
-                    ),
-                    Some(&body),
-                )
-                .await?;
-            (value, true)
+        // Only a new Scheduler job is a funding event; updates keep the
+        // remaining budget and expiry of the existing incarnation. Funding
+        // precedes creation, so a failed create leaves at most an unbound
+        // budget that the next create overwrites and the TTL reaps.
+        let value = if status == StatusCode::NOT_FOUND {
+            let funded = self.fund_budget(&resource, &channel).await?;
+            self.create_job(region, &body, funded).await?
         } else if status.is_success() {
-            (value, false)
+            value
         } else {
             return Err(TriggerError::Provider(format!(
                 "Google API returned {status}: {value}"
             )));
         };
-        // Only a new Scheduler job is a funding event; updates keep the
-        // remaining budget and expiry of the existing incarnation.
-        if !created {
-            return trigger_from_value(&value, region);
-        }
-        if let Err(error) = self.fund_budget(&resource, &channel).await {
-            let _ = self
-                .request(
-                    Method::POST,
-                    format!("{}/v1/{resource}:pause", self.config.scheduler_api_base),
-                    Some(&json!({})),
-                )
-                .await;
-            return Err(error);
-        }
         trigger_from_value(&value, region)
     }
 

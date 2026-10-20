@@ -449,6 +449,64 @@ async fn trigger_updates_preserve_the_remaining_prepaid_budget() {
 
 #[tokio::test]
 #[ignore = "requires redis-server on PATH; run with --ignored"]
+async fn trigger_creation_retries_after_a_funding_fault_are_funded() {
+    let mut harness = Harness::new().await;
+    harness.add_function(FUNCTION, "channelA", "2026-01-01T00:00:00Z");
+    let owner = tenant("channelA");
+    let physical = harness.driver.physical_name(&owner, "refresh").unwrap();
+    let resource = harness.driver.resource("us-central1", &physical).unwrap();
+
+    // A non-hash value makes the budget write fail like a transient Redis fault.
+    redis::cmd("SET")
+        .arg(GoogleTriggerDriver::budget_key(&resource))
+        .arg("fault")
+        .query_async::<()>(&mut harness.redis)
+        .await
+        .unwrap();
+    assert!(
+        harness
+            .driver
+            .create(&owner, create_request("refresh", "weather", "*/5 * * * *"))
+            .await
+            .is_err()
+    );
+    assert!(
+        harness.state.lock().unwrap().jobs.is_empty(),
+        "no Scheduler job may exist without a funded budget"
+    );
+
+    redis::cmd("DEL")
+        .arg(GoogleTriggerDriver::budget_key(&resource))
+        .query_async::<()>(&mut harness.redis)
+        .await
+        .unwrap();
+    let created = harness
+        .driver
+        .create(&owner, create_request("refresh", "weather", "*/5 * * * *"))
+        .await
+        .unwrap();
+    assert_eq!(created.id, resource);
+    assert_eq!(
+        harness.remaining(&resource).await,
+        Some(PREPAID_RUNS.into()),
+        "the healthy retry must fund the new job"
+    );
+    let request = harness.executor_request(&resource);
+    harness.driver.execute(request).await.unwrap();
+    assert_eq!(harness.invocations(), 1);
+
+    // Once created, an exhausted budget stays exhausted across updates.
+    harness.set_remaining(&resource, 0).await;
+    harness
+        .driver
+        .create(&owner, create_request("refresh", "weather", "*/10 * * * *"))
+        .await
+        .unwrap();
+    assert_eq!(harness.remaining(&resource).await, Some(0));
+}
+
+#[tokio::test]
+#[ignore = "requires redis-server on PATH; run with --ignored"]
 async fn trigger_control_is_scoped_to_the_funding_channel() {
     let mut harness = Harness::new().await;
     harness.add_function(FUNCTION, "channelA", "2026-01-01T00:00:00Z");
