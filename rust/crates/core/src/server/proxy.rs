@@ -1657,6 +1657,7 @@ mod tests {
     };
 
     /// Unit tests exercise upstream preparation for an already-admitted request.
+    #[allow(clippy::result_large_err)]
     async fn forward_request(
         api: &ApiSpec,
         method: Method,
@@ -1668,6 +1669,7 @@ mod tests {
         super::forward_request(api, &route, method, uri, headers, body).await
     }
 
+    #[allow(clippy::result_large_err)]
     async fn prepare_upstream_with_identity(
         api: &ApiSpec,
         method: &Method,
