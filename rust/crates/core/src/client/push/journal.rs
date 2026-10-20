@@ -147,14 +147,27 @@ pub struct ChunkBroadcastPermit {
     _private: (),
 }
 
-/// An append-only JSONL writer for one `pay push` run. A single writer
-/// should own the file for the run's lifetime; the plan's "single writer
-/// task serializes events" requirement is the caller's responsibility (this
-/// type is not internally synchronized across threads).
+/// An append-only JSONL writer for one `pay push` run. Every constructor
+/// takes an exclusive lock on the file, held until the `Journal` drops, so
+/// no two processes can ever write — or resume — the same run at once. Within
+/// a process, the "single writer task serializes events" requirement is the
+/// caller's responsibility (this type is not internally synchronized).
 pub struct Journal {
     file: File,
     path: PathBuf,
     next_sequence: u64,
+}
+
+fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
+    file.try_lock().map_err(|e| match e {
+        std::fs::TryLockError::WouldBlock => Error::Config(format!(
+            "journal {} is in use by another pay process; wait for it to finish",
+            path.display()
+        )),
+        std::fs::TryLockError::Error(e) => {
+            Error::Config(format!("failed to lock journal {}: {e}", path.display()))
+        }
+    })
 }
 
 impl Journal {
@@ -182,6 +195,7 @@ impl Journal {
         let file = options.open(&path).map_err(|e| {
             Error::Config(format!("failed to create journal {}: {e}", path.display()))
         })?;
+        lock_exclusive(&file, &path)?;
 
         Ok(Self {
             file,
@@ -193,12 +207,16 @@ impl Journal {
     /// Re-open an existing journal for a resumed run. `next_sequence` picks
     /// up after the highest sequence number [`load_events`] can recover
     /// (tolerating one truncated final line).
+    ///
+    /// The lock is taken before the events are read, so they cannot change
+    /// under the resumed run.
     pub fn open_existing(path: PathBuf) -> Result<(Self, Vec<JournalEvent>)> {
-        let events = load_events(&path)?;
-        let next_sequence = events.last().map(|e| e.sequence + 1).unwrap_or(1);
         let file = OpenOptions::new().append(true).open(&path).map_err(|e| {
             Error::Config(format!("failed to open journal {}: {e}", path.display()))
         })?;
+        lock_exclusive(&file, &path)?;
+        let events = load_events(&path)?;
+        let next_sequence = events.last().map(|e| e.sequence + 1).unwrap_or(1);
         Ok((
             Self {
                 file,
@@ -705,6 +723,7 @@ mod tests {
         assert!(contents.ends_with('\n'));
         assert_eq!(contents.lines().count(), 2);
 
+        drop(journal);
         let (mut reopened, _) = Journal::open_existing(path.clone()).unwrap();
         reopened
             .append_chunk_prepared(2, vec![4], "memo".into())
@@ -799,6 +818,28 @@ mod tests {
 
         let err = load_events(&path).unwrap_err();
         assert!(err.to_string().contains("non-monotonic"), "{err}");
+    }
+
+    #[test]
+    fn a_journal_has_one_writer_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.jsonl");
+        let mut writer = Journal::create_new(path.clone()).unwrap();
+        writer
+            .append_run_interrupted("still running".into(), 0, 0, 1)
+            .unwrap();
+
+        // Neither a resume nor a second resume may open it while held.
+        let err = Journal::open_existing(path.clone()).err().unwrap();
+        assert!(err.to_string().contains("in use"), "{err}");
+        drop(writer);
+
+        let (resumed, events) = Journal::open_existing(path.clone()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(Journal::open_existing(path.clone()).is_err());
+        drop(resumed);
+        // Positive control: once released, it opens again.
+        assert!(Journal::open_existing(path).is_ok());
     }
 
     #[test]
