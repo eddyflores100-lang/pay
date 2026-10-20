@@ -158,16 +158,34 @@ pub struct Journal {
     next_sequence: u64,
 }
 
+/// A child forked by another thread briefly shares our descriptors (and the
+/// lock) until it execs, so contention is retried for a short window first.
+const LOCK_RETRIES: u32 = 40;
+const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
 fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
-    file.try_lock().map_err(|e| match e {
-        std::fs::TryLockError::WouldBlock => Error::Config(format!(
-            "journal {} is in use by another pay process; wait for it to finish",
-            path.display()
-        )),
-        std::fs::TryLockError::Error(e) => {
-            Error::Config(format!("failed to lock journal {}: {e}", path.display()))
+    let mut attempt = 0;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) if attempt < LOCK_RETRIES => {
+                attempt += 1;
+                std::thread::sleep(LOCK_RETRY_DELAY);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(Error::Config(format!(
+                    "journal {} is in use by another pay process; wait for it to finish",
+                    path.display()
+                )));
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(Error::Config(format!(
+                    "failed to lock journal {}: {e}",
+                    path.display()
+                )));
+            }
         }
-    })
+    }
 }
 
 impl Journal {
