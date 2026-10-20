@@ -406,15 +406,23 @@ pub enum PlanStatus {
     WrongOwner { actual_owner: String },
 }
 
-/// Deterministic numeric `plan_id` derived from `(operator, endpoint_path)`.
-/// Stable across runs so the same YAML always points at the same on-chain
-/// Plan. FNV-1a 64-bit — no extra dependency, plenty of mixing for path
-/// strings.
-pub fn compute_plan_id_numeric(operator: &str, endpoint_path: &str) -> u64 {
+/// Deterministic numeric `plan_id` derived from the full route identity: the
+/// operator, the API, the HTTP method and the path. Two routes never share a
+/// Plan, so a proof activated on one cannot unlock another. Stable across
+/// runs so the same YAML always points at the same on-chain Plan. FNV-1a
+/// 64-bit over NUL-separated fields.
+pub fn compute_plan_id_numeric(
+    operator: &str,
+    api: &str,
+    method: &str,
+    endpoint_path: &str,
+) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in operator.bytes().chain(*b"/").chain(endpoint_path.bytes()) {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
+    for field in ["pay-plan-v2", operator, api, method, endpoint_path] {
+        for byte in field.bytes().chain(std::iter::once(0)) {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
     }
     // `plan_id_numeric` crosses the MPP wire as a JSON number. Keep it within
     // JavaScript's exact integer range so RFC 8785/JCS canonicalization cannot
@@ -427,6 +435,106 @@ pub fn compute_plan_id_numeric(operator: &str, endpoint_path: &str) -> u64 {
     } else {
         json_safe_hash
     }
+}
+
+/// The HTTP method as it enters [`compute_plan_id_numeric`].
+pub fn plan_route_method(method: &pay_types::metering::HttpMethod) -> String {
+    format!("{method:?}").to_uppercase()
+}
+
+/// The immutable terms of an on-chain Plan account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnchainPlan {
+    pub owner: solana_pubkey::Pubkey,
+    pub mint: solana_pubkey::Pubkey,
+    pub amount: u64,
+    pub period_hours: u64,
+    pub created_at: i64,
+}
+
+impl OnchainPlan {
+    /// Decode a Plan account: discriminator, owner, bump, status, plan id,
+    /// mint, then terms (amount, period_hours, created_at).
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        if data.len() < 99 {
+            return Err(Error::Mpp(format!(
+                "Plan account is too short ({} bytes)",
+                data.len()
+            )));
+        }
+        let pubkey = |at: usize| {
+            solana_pubkey::Pubkey::new_from_array(data[at..at + 32].try_into().expect("32 bytes"))
+        };
+        let word = |at: usize| <[u8; 8]>::try_from(&data[at..at + 8]).expect("8 bytes");
+        Ok(Self {
+            owner: pubkey(1),
+            mint: pubkey(43),
+            amount: u64::from_le_bytes(word(75)),
+            period_hours: u64::from_le_bytes(word(83)),
+            created_at: i64::from_le_bytes(word(91)),
+        })
+    }
+
+    /// Refuse to attach `spec` to a Plan whose immutable terms differ from it.
+    pub fn require_terms(
+        &self,
+        spec: &SubscriptionEndpoint,
+        owner: &solana_pubkey::Pubkey,
+    ) -> Result<()> {
+        let (amount, _decimals, mint) = resolve_amount(spec)?;
+        let (unit, count) = spec.parse_period().map_err(Error::Config)?;
+        let expected = (
+            *owner,
+            mint,
+            amount
+                .parse::<u64>()
+                .map_err(|e| Error::Config(format!("invalid amount: {e}")))?,
+            period_hours_for(unit, count),
+        );
+        let actual = (
+            self.owner,
+            self.mint.to_string(),
+            self.amount,
+            self.period_hours,
+        );
+        if actual != expected {
+            return Err(Error::Config(format!(
+                "on-chain Plan terms (owner {}, mint {}, amount {}, period {}h) do not match \
+                 the endpoint (owner {}, mint {}, amount {}, period {}h)",
+                actual.0,
+                actual.1,
+                actual.2,
+                actual.3,
+                expected.0,
+                expected.1,
+                expected.2,
+                expected.3
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn period_hours_for(unit: TypesPeriodUnit, count: u32) -> u64 {
+    match unit {
+        TypesPeriodUnit::Day => count as u64 * 24,
+        TypesPeriodUnit::Week => count as u64 * 168,
+    }
+}
+
+/// Read and decode a Plan account.
+pub async fn fetch_plan(rpc_url: &str, plan_pda: &solana_pubkey::Pubkey) -> Result<OnchainPlan> {
+    let url = rpc_url.to_string();
+    let pda = *plan_pda;
+    tokio::task::spawn_blocking(move || -> Result<OnchainPlan> {
+        use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
+        let account = RpcClient::new(url)
+            .get_account(&pda)
+            .map_err(|e| Error::Mpp(format!("Could not fetch Plan account {pda}: {e}")))?;
+        OnchainPlan::decode(&account.data)
+    })
+    .await
+    .map_err(|e| Error::Mpp(format!("RPC task join: {e}")))?
 }
 
 /// Check whether the expected Plan PDA exists on-chain.
@@ -570,38 +678,7 @@ pub async fn publish_plan(
 /// account at the canonical offset. Avoids vendoring the full Plan
 /// account decoder for the one field `pay gate api` actually needs.
 pub async fn fetch_plan_created_at(rpc_url: &str, plan_pda: &solana_pubkey::Pubkey) -> Result<i64> {
-    let url = rpc_url.to_string();
-    let pda = *plan_pda;
-    tokio::task::spawn_blocking(move || -> Result<i64> {
-        use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
-        let rpc = RpcClient::new(url);
-        let account = rpc
-            .get_account(&pda)
-            .map_err(|e| Error::Mpp(format!("Could not fetch Plan account {pda}: {e}")))?;
-        // Plan layout:
-        //   0   discriminator (u8)
-        //   1   owner (32B)
-        //   33  bump (u8)
-        //   34  status (u8)
-        //   35  data.plan_id (u64)
-        //   43  data.mint (32B)
-        //   75  data.terms.amount (u64)
-        //   83  data.terms.period_hours (u64)
-        //   91  data.terms.created_at (i64)  ← our target
-        const CREATED_AT_OFFSET: usize = 91;
-        if account.data.len() < CREATED_AT_OFFSET + 8 {
-            return Err(Error::Mpp(format!(
-                "Plan account is too short ({} bytes)",
-                account.data.len()
-            )));
-        }
-        let bytes: [u8; 8] = account.data[CREATED_AT_OFFSET..CREATED_AT_OFFSET + 8]
-            .try_into()
-            .map_err(|_| Error::Mpp("Plan.created_at slice".into()))?;
-        Ok(i64::from_le_bytes(bytes))
-    })
-    .await
-    .map_err(|e| Error::Mpp(format!("RPC task join: {e}")))?
+    Ok(fetch_plan(rpc_url, plan_pda).await?.created_at)
 }
 
 /// Sign a one-or-more-instruction transaction with the operator's signer
@@ -679,14 +756,84 @@ mod tests {
         let operator = "F82JMeQmD7Lfbh6vCJWsz2ABJ5AAthhVjUyqzgHyUtog";
         let endpoint = "api/v1/feed";
 
-        let plan_id = compute_plan_id_numeric(operator, endpoint);
+        let plan_id = compute_plan_id_numeric(operator, "api", "GET", endpoint);
 
-        assert_eq!(plan_id, compute_plan_id_numeric(operator, endpoint));
+        assert_eq!(
+            plan_id,
+            compute_plan_id_numeric(operator, "api", "GET", endpoint)
+        );
         assert!(plan_id > 0);
         assert!(plan_id < 1_u64 << 53);
         let json = serde_json::to_string(&plan_id).unwrap();
         let round_trip: f64 = serde_json::from_str(&json).unwrap();
         assert_eq!(round_trip as u64, plan_id);
+    }
+
+    #[test]
+    fn plan_ids_distinguish_every_part_of_the_route() {
+        let operator = "F82JMeQmD7Lfbh6vCJWsz2ABJ5AAthhVjUyqzgHyUtog";
+        let base = compute_plan_id_numeric(operator, "api", "GET", "v1/feed");
+        assert_ne!(
+            base,
+            compute_plan_id_numeric(operator, "api", "POST", "v1/feed")
+        );
+        assert_ne!(
+            base,
+            compute_plan_id_numeric(operator, "other", "GET", "v1/feed")
+        );
+        assert_ne!(
+            base,
+            compute_plan_id_numeric(operator, "api", "GET", "v1/feeds")
+        );
+        // Field boundaries are unambiguous.
+        assert_ne!(
+            compute_plan_id_numeric(operator, "ap", "iGET", "v1/feed"),
+            compute_plan_id_numeric(operator, "api", "GET", "v1/feed")
+        );
+        assert_eq!(
+            plan_route_method(&pay_types::metering::HttpMethod::Post),
+            "POST"
+        );
+    }
+
+    fn plan_bytes(
+        owner: &solana_pubkey::Pubkey,
+        mint: &str,
+        amount: u64,
+        period_hours: u64,
+    ) -> Vec<u8> {
+        let mut data = vec![0u8];
+        data.extend_from_slice(owner.as_ref());
+        data.extend_from_slice(&[255, 0]);
+        data.extend_from_slice(&7u64.to_le_bytes());
+        data.extend_from_slice(solana_pubkey::Pubkey::from_str(mint).unwrap().as_ref());
+        data.extend_from_slice(&amount.to_le_bytes());
+        data.extend_from_slice(&period_hours.to_le_bytes());
+        data.extend_from_slice(&1_780_000_000i64.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn existing_plans_must_carry_the_endpoint_terms() {
+        let owner = solana_pubkey::Pubkey::new_unique();
+        let mut spec = make_spec();
+        spec.amount_base_units = Some("9990000".into());
+        let (_, _, mint) = resolve_amount(&spec).unwrap();
+        let plan = OnchainPlan::decode(&plan_bytes(&owner, &mint, 9_990_000, 720)).unwrap();
+        assert_eq!(plan.created_at, 1_780_000_000);
+        plan.require_terms(&spec, &owner).unwrap();
+
+        // A cheaper Plan, a different cadence or owner is never reused.
+        for (plan_owner, amount, period) in [
+            (owner, 1_000_000, 720),
+            (owner, 9_990_000, 168),
+            (solana_pubkey::Pubkey::new_unique(), 9_990_000, 720),
+        ] {
+            let other =
+                OnchainPlan::decode(&plan_bytes(&plan_owner, &mint, amount, period)).unwrap();
+            assert!(other.require_terms(&spec, &owner).is_err());
+        }
+        assert!(OnchainPlan::decode(&[0; 98]).is_err());
     }
 
     /// Run with a dedicated disposable Redis via PAY_TEST_SUBSCRIPTION_REDIS_URL.

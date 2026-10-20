@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use owo_colors::OwoColorize;
-use pay_core::server::subscription::compute_plan_id_numeric;
+use pay_core::server::subscription::{compute_plan_id_numeric, plan_route_method};
 use pay_kit::mpp::program::subscriptions::{default_program_id, find_plan_pda, plan_id_seed};
 use solana_pubkey::Pubkey;
 
@@ -87,9 +87,14 @@ impl PublishCommand {
             //
             // Reuse a YAML-pinned `plan_id_numeric` when present so an
             // operator who hand-edited the value keeps a stable PDA.
-            let plan_id_numeric = sub
-                .plan_id_numeric
-                .unwrap_or_else(|| compute_plan_id_numeric(&owner_str, &endpoint.path));
+            let plan_id_numeric = sub.plan_id_numeric.unwrap_or_else(|| {
+                compute_plan_id_numeric(
+                    &owner_str,
+                    &api.subdomain,
+                    &plan_route_method(&endpoint.method),
+                    &endpoint.path,
+                )
+            });
             let seed = plan_id_seed(plan_id_numeric);
             let (plan_pda, _) = find_plan_pda(&owner, &seed, &program_id);
             rows.push(PlanRow {

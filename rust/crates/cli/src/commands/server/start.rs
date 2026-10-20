@@ -3205,7 +3205,8 @@ async fn ensure_subscription_plans(
     use dialoguer::Confirm;
     use dialoguer::theme::ColorfulTheme;
     use pay_core::server::subscription::{
-        PlanStatus, check_plan_exists, compute_plan_id_numeric, fetch_plan_created_at, publish_plan,
+        PlanStatus, check_plan_exists, compute_plan_id_numeric, fetch_plan, plan_route_method,
+        publish_plan,
     };
     use pay_kit::mpp::program::subscriptions::{default_program_id, find_plan_pda, plan_id_seed};
     use solana_pubkey::Pubkey;
@@ -3246,6 +3247,8 @@ async fn ensure_subscription_plans(
     let program_id = default_program_id();
 
     let mut publications: Vec<pay_core::server::subscription::PublishedPlan> = Vec::new();
+    let api_subdomain = api.subdomain.clone();
+    let mut plans_in_use = HashMap::new();
 
     for endpoint in api.endpoints.iter_mut() {
         let Some(sub_spec) = endpoint.subscription.as_mut() else {
@@ -3267,13 +3270,26 @@ async fn ensure_subscription_plans(
             );
         }
 
-        // Stable id derived from `(operator, endpoint.path)`. Reuse the
-        // value persisted in YAML if present so manual edits stick.
-        let plan_id_numeric = sub_spec
-            .plan_id_numeric
-            .unwrap_or_else(|| compute_plan_id_numeric(operator_pubkey_str, &endpoint.path));
+        // Stable id derived from the route (operator, API, method, path).
+        // Reuse the value persisted in YAML if present so manual edits stick.
+        let route = format!("{} {}", plan_route_method(&endpoint.method), endpoint.path);
+        let plan_id_numeric = sub_spec.plan_id_numeric.unwrap_or_else(|| {
+            compute_plan_id_numeric(
+                operator_pubkey_str,
+                &api_subdomain,
+                &plan_route_method(&endpoint.method),
+                &endpoint.path,
+            )
+        });
         let seed = plan_id_seed(plan_id_numeric);
         let (plan_pda, plan_bump) = find_plan_pda(&operator, &seed, &program_id);
+        // A Plan authorizes every route it is attached to, so one per route.
+        if let Some(other) = plans_in_use.insert(plan_pda, route.clone()) {
+            return Err(pay_core::Error::Config(format!(
+                "endpoints `{other}` and `{route}` resolve to the same subscription Plan \
+                 `{plan_pda}`; give each its own plan_id_numeric"
+            )));
+        }
 
         // Treat a YAML-pinned plan_id that disagrees with our derivation
         // as a configuration error — the operator probably edited the
@@ -3297,7 +3313,13 @@ async fn ensure_subscription_plans(
                     plan = %plan_pda,
                     "subscription Plan already on-chain — reusing",
                 );
-                let plan_created_at = fetch_plan_created_at(rpc_url, &plan_pda).await?;
+                let plan = fetch_plan(rpc_url, &plan_pda).await?;
+                plan.require_terms(sub_spec, &operator).map_err(|error| {
+                    pay_core::Error::Config(format!(
+                        "endpoint `{route}` cannot reuse Plan `{plan_pda}`: {error}"
+                    ))
+                })?;
+                let plan_created_at = plan.created_at;
                 sub_spec.plan_id = Some(plan_pda.to_string());
                 sub_spec.plan_id_numeric = Some(plan_id_numeric);
                 sub_spec.plan_bump = Some(plan_bump);
