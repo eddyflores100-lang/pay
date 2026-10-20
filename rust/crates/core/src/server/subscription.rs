@@ -69,6 +69,24 @@ pub struct OperatorDefaults<'a> {
 #[cfg(feature = "redis-session-store")]
 pub const REPLAY_RESERVATION_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
+#[cfg(feature = "redis-session-store")]
+// Values are only ever written by this store as `serde_json::to_string`, which
+// is canonical for a decoded value, so the stored bytes compare exactly.
+const PUT_IF_EQ_SCRIPT: &str = r#"
+local current = redis.call('GET', KEYS[1])
+if ARGV[1] == 'absent' then
+  if current then return 0 end
+elseif current ~= ARGV[2] then
+  return 0
+end
+if ARGV[4] == '' then
+  redis.call('SET', KEYS[1], ARGV[3])
+else
+  redis.call('SET', KEYS[1], ARGV[3], 'EX', ARGV[4])
+end
+return 1
+"#;
+
 /// Durable subscription proof and replay store for multi-instance gateways.
 #[cfg(feature = "redis-session-store")]
 #[derive(Clone)]
@@ -203,6 +221,45 @@ impl pay_kit::mpp::store::Store for RedisSubscriptionStore {
                 .await
                 .map_err(|e| pay_kit::mpp::store::StoreError::Internal(e.to_string()))?;
             Ok(result.is_some())
+        })
+    }
+
+    fn put_if_eq(
+        &self,
+        key: &str,
+        expected: Option<serde_json::Value>,
+        value: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = std::result::Result<bool, pay_kit::mpp::store::StoreError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let mut connection = self.connection.clone();
+        let key = self.key(key);
+        Box::pin(async move {
+            let encode = |value: &serde_json::Value| {
+                serde_json::to_string(value)
+                    .map_err(|e| pay_kit::mpp::store::StoreError::Serialization(e.to_string()))
+            };
+            let expected = expected.as_ref().map(encode).transpose()?;
+            let written: i64 = redis::Script::new(PUT_IF_EQ_SCRIPT)
+                .key(key)
+                .arg(if expected.is_some() {
+                    "present"
+                } else {
+                    "absent"
+                })
+                .arg(expected.unwrap_or_default())
+                .arg(encode(&value)?)
+                // Proof bindings persist, like `put`.
+                .arg("")
+                .invoke_async(&mut connection)
+                .await
+                .map_err(|e| pay_kit::mpp::store::StoreError::Internal(e.to_string()))?;
+            Ok(written == 1)
         })
     }
 }

@@ -170,6 +170,23 @@ fn encode(value: &serde_json::Value) -> Result<String, StoreError> {
     serde_json::to_string(value).map_err(|e| StoreError::Serialization(e.to_string()))
 }
 
+// Values are only ever written by this store as `serde_json::to_string`, which
+// is canonical for a decoded value, so the stored bytes compare exactly.
+const PUT_IF_EQ_SCRIPT: &str = r#"
+local current = redis.call('GET', KEYS[1])
+if ARGV[1] == 'absent' then
+  if current then return 0 end
+elseif current ~= ARGV[2] then
+  return 0
+end
+if ARGV[4] == '' then
+  redis.call('SET', KEYS[1], ARGV[3])
+else
+  redis.call('SET', KEYS[1], ARGV[3], 'EX', ARGV[4])
+end
+return 1
+"#;
+
 impl Store for RedisStore {
     fn get(&self, key: &str) -> StoreFuture<'_, Option<serde_json::Value>> {
         let mut connection = self.connection.clone();
@@ -228,6 +245,33 @@ impl Store for RedisStore {
                 .await
                 .map_err(internal)?;
             Ok(set.is_some())
+        })
+    }
+
+    fn put_if_eq(
+        &self,
+        key: &str,
+        expected: Option<serde_json::Value>,
+        value: serde_json::Value,
+    ) -> StoreFuture<'_, bool> {
+        let mut connection = self.connection.clone();
+        let key = format!("{}{key}", self.prefix);
+        Box::pin(async move {
+            let expected = expected.as_ref().map(encode).transpose()?;
+            let written: i64 = redis::Script::new(PUT_IF_EQ_SCRIPT)
+                .key(key)
+                .arg(if expected.is_some() {
+                    "present"
+                } else {
+                    "absent"
+                })
+                .arg(expected.unwrap_or_default())
+                .arg(encode(&value)?)
+                .arg(RECORD_TTL_SECONDS)
+                .invoke_async(&mut connection)
+                .await
+                .map_err(internal)?;
+            Ok(written == 1)
         })
     }
 }
@@ -296,6 +340,44 @@ mod tests {
             .unwrap()
             .reservations("cancel");
         exercise_reservations(&a, &b).await;
+    }
+
+    #[tokio::test]
+    async fn redis_put_if_eq_compares_and_writes_atomically_across_replicas() {
+        let Some(redis) = spawn_redis().await else {
+            return;
+        };
+        let url = format!("redis://127.0.0.1:{}/", redis.1);
+        let a = StoreBackend::connect(&url).await.unwrap().namespace("cas");
+        let b = StoreBackend::connect(&url).await.unwrap().namespace("cas");
+        let v1 = json!({ "z": 1, "a": { "note": "café", "n": 1.5 } });
+        let v2 = json!({ "v": 2 });
+
+        assert!(
+            !a.put_if_eq("k", Some(v1.clone()), v2.clone())
+                .await
+                .unwrap()
+        );
+        assert!(a.put_if_eq("k", None, v1.clone()).await.unwrap());
+        assert!(!b.put_if_eq("k", None, v2.clone()).await.unwrap());
+
+        // A value read back from the store is a valid expectation.
+        let read = b.get("k").await.unwrap();
+        assert_eq!(read.as_ref(), Some(&v1));
+        assert!(
+            !b.put_if_eq("k", Some(v2.clone()), v2.clone())
+                .await
+                .unwrap()
+        );
+
+        // Two writers racing from the same read: exactly one lands.
+        let (wa, wb) = tokio::join!(
+            a.put_if_eq("k", read.clone(), json!("a")),
+            b.put_if_eq("k", read.clone(), json!("b")),
+        );
+        assert!(wa.unwrap() ^ wb.unwrap());
+        let winner = a.get("k").await.unwrap().unwrap();
+        assert!(winner == json!("a") || winner == json!("b"));
     }
 
     #[tokio::test]
