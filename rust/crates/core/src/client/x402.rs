@@ -301,8 +301,12 @@ pub fn build_payment_for_attempt(
             (X402_V1_PAYMENT_HEADER, header)
         }
         _ => {
+            let payer = signer.pubkey();
             let payment_identifier = || match attempt {
-                Some(attempt) => attempt.reuse_or_insert(
+                Some(attempt) => crate::client::attempt::PaymentCacheKey::new(
+                    attempt,
+                    &payer,
+                    &network,
                     "x402-payment-identifier",
                     &[
                         &requirements.network,
@@ -312,6 +316,8 @@ pub fn build_payment_for_attempt(
                         &requirements.recipient,
                         &requirements.resource,
                     ],
+                )
+                .reuse_or_insert(
                     std::time::Duration::from_secs(
                         requirements.max_age.unwrap_or(300).clamp(1, 3_600),
                     ),
@@ -2080,6 +2086,41 @@ mod tests {
         assert_ne!(
             sent_payment_identifier(&first),
             sent_payment_identifier(&next)
+        );
+        attempt.resolved();
+    }
+
+    #[test]
+    fn a_pending_payment_identifier_is_never_reused_by_another_wallet() {
+        let attempt = crate::client::attempt::PaymentAttempt::new(
+            "POST",
+            "https://provider.example/resource",
+            Some(b"{\"q\":\"other-wallet\"}"),
+        );
+        let build = |store: &MemoryAccountsStore, seed| {
+            build_payment_for_attempt(
+                &payment_identifier_challenge(seed, "1000"),
+                store,
+                Some("devnet"),
+                None,
+                Some("https://provider.example/resource"),
+                None,
+                Some(&attempt),
+            )
+            .unwrap()
+        };
+        let payer = payment_identifier_store();
+        let first = build(&payer, 1);
+        // Another tenant's wallet (a fresh ephemeral) makes the same request.
+        let other = build(&MemoryAccountsStore::new(), 2);
+        assert_ne!(
+            sent_payment_identifier(&first),
+            sent_payment_identifier(&other)
+        );
+        // Positive control: the first wallet's retry still reuses its own.
+        assert_eq!(
+            sent_payment_identifier(&first),
+            sent_payment_identifier(&build(&payer, 3))
         );
         attempt.resolved();
     }
