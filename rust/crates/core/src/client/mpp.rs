@@ -122,7 +122,16 @@ pub fn build_credential_with_override(
     // Reject untrusted hook descriptors before loading a wallet or asking it
     // to sign. The SDK checks the same exact descriptor again when building.
     let channel_hooks = crate::mpp_channel_profile::validate_charge_challenge(&request)?;
-    let amount = format_amount(&request.amount, &request.currency);
+    let amount = crate::client::prompt::payment_display_amount(
+        &request.amount,
+        &request.currency,
+        request
+            .method_details
+            .as_ref()
+            .and_then(|details| details.get("decimals"))
+            .and_then(|decimals| decimals.as_u64())
+            .and_then(|decimals| u8::try_from(decimals).ok()),
+    )?;
     let prompt_context = crate::client::prompt::payment_prompt_context(
         charge_prompt_reason(
             request.description.as_deref(),
@@ -660,41 +669,9 @@ pub(crate) fn check_client_network_intent(
     Ok(())
 }
 
+#[cfg(test)]
 fn format_amount(amount: &str, currency: &str) -> String {
-    if let Some(native) = crate::client::prompt::native_sol_display(amount, currency) {
-        return native;
-    }
-    let base: u64 = amount.parse().unwrap_or(0);
-    format!("${}", format_value(base as f64 / 1_000_000.0))
-}
-
-fn format_value(v: f64) -> String {
-    if v == 0.0 {
-        "0".to_string()
-    } else if v >= 0.01 && is_cent_exact(v) {
-        format!("{v:.2}")
-    } else if v >= 0.01 {
-        format_precise_value(v, 6)
-    } else if v >= 0.001 {
-        format!("{v:.3}")
-    } else if v >= 0.0001 {
-        format!("{v:.4}")
-    } else {
-        format!("{v:.6}")
-    }
-}
-
-fn is_cent_exact(v: f64) -> bool {
-    let rounded_to_cent = (v * 100.0).round() / 100.0;
-    (v - rounded_to_cent).abs() < 0.0000005
-}
-
-fn format_precise_value(v: f64, decimals: usize) -> String {
-    let mut value = format!("{v:.decimals$}");
-    while value.contains('.') && value.ends_with('0') {
-        value.pop();
-    }
-    value
+    crate::client::prompt::payment_display_amount(amount, currency, None).unwrap()
 }
 
 #[cfg(test)]
@@ -703,37 +680,37 @@ mod tests {
 
     #[test]
     fn format_value_zero() {
-        assert_eq!(format_value(0.0), "0");
+        assert_eq!(crate::client::prompt::format_value(0.0), "0");
     }
 
     #[test]
     fn format_value_large() {
-        assert_eq!(format_value(1.5), "1.50");
+        assert_eq!(crate::client::prompt::format_value(1.5), "1.50");
     }
 
     #[test]
     fn format_value_preserves_fractional_cent_fees() {
-        assert_eq!(format_value(1.0015), "1.0015");
+        assert_eq!(crate::client::prompt::format_value(1.0015), "1.0015");
     }
 
     #[test]
     fn format_value_cents() {
-        assert_eq!(format_value(0.01), "0.01");
+        assert_eq!(crate::client::prompt::format_value(0.01), "0.01");
     }
 
     #[test]
     fn format_value_milli() {
-        assert_eq!(format_value(0.005), "0.005");
+        assert_eq!(crate::client::prompt::format_value(0.005), "0.005");
     }
 
     #[test]
     fn format_value_micro() {
-        assert_eq!(format_value(0.0005), "0.0005");
+        assert_eq!(crate::client::prompt::format_value(0.0005), "0.0005");
     }
 
     #[test]
     fn format_value_tiny() {
-        assert_eq!(format_value(0.00005), "0.000050");
+        assert_eq!(crate::client::prompt::format_value(0.00005), "0.000050");
     }
 
     #[test]

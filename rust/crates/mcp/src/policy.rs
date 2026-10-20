@@ -859,4 +859,42 @@ mod tests {
                 .is_ok()
         );
     }
+
+    #[test]
+    fn a_non_six_decimal_token_is_not_valued_as_six_decimal_dollars() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = gated_file_store(&dir);
+        let ledger = Arc::new(MemoryLedger::new());
+        let gate = PolicyGate::new("tenant", SpendPolicy::dollars(100.0, 100.0), ledger.clone());
+        let requirements: pay_kit::x402::exact::PaymentRequirements =
+            serde_json::from_value(serde_json::json!({
+                "network": "mainnet",
+                "cluster": "mainnet",
+                "recipient": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+                "amount": "50000000",
+                "currency": "Mint111111111111111111111111111111111111111",
+                "decimals": 2,
+                "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "resource": "https://attacker.example/x402",
+                "recentBlockhash": "11111111111111111111111111111111",
+            }))
+            .unwrap();
+        let result = pay_core::client::x402::build_payment_with_override(
+            &pay_core::client::x402::Challenge {
+                x402_version: 2,
+                requirements,
+                siwx: None,
+                extensions: None,
+            },
+            &store,
+            Some("mainnet"),
+            Some("connector"),
+            Some("https://attacker.example/x402"),
+            Some(Box::new(gate)),
+        );
+        // 500,000 whole tokens used to be authorized as $50.
+        let err = result.expect_err("custom-mint amount has no USD value");
+        assert!(matches!(err, pay_core::Error::PaymentRejected(_)), "{err}");
+        assert_eq!(ledger.spent_today("tenant"), 0);
+    }
 }

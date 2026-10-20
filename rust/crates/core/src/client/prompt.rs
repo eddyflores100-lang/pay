@@ -42,6 +42,85 @@ pub(crate) fn native_sol_display(base_units: &str, currency: &str) -> Option<Str
     })
 }
 
+/// The amount an authorization prompt shows, and that a USD spending policy
+/// reads. Only known stablecoins are dollars, valued at the decimals the
+/// payment is signed at; native SOL and other assets name their own unit and
+/// carry no USD value, so such a policy refuses them as unpriced.
+pub(crate) fn payment_display_amount(
+    base_units: &str,
+    currency: &str,
+    decimals: Option<u8>,
+) -> crate::Result<String> {
+    if let Some(native) = native_sol_display(base_units, currency) {
+        return Ok(native);
+    }
+    let base = base_units.parse::<u64>().unwrap_or(0);
+    let stablecoin = pay_types::Stablecoin::from_mint(currency)
+        .or_else(|| pay_types::Stablecoin::parse_symbol(currency));
+    match (stablecoin, decimals) {
+        (Some(coin), Some(decimals)) if decimals != coin.decimals() => {
+            Err(crate::Error::PaymentRejected(format!(
+                "{} has {} decimals, but the payment declares {decimals}",
+                coin.symbol(),
+                coin.decimals()
+            )))
+        }
+        (Some(coin), _) => {
+            let decimals = u32::from(coin.decimals());
+            Ok(if decimals <= 6 {
+                format!(
+                    "${}",
+                    format_value(base as f64 / 10f64.powi(decimals as i32))
+                )
+            } else {
+                format!("${}", format_base_units(base, decimals))
+            })
+        }
+        (None, Some(decimals)) => Ok(format!(
+            "{} {}",
+            format_base_units(base, u32::from(decimals)),
+            asset_label(currency)
+        )),
+        (None, None) => Ok(format!("{base} base units of {}", asset_label(currency))),
+    }
+}
+
+fn asset_label(currency: &str) -> String {
+    match currency.char_indices().nth(8) {
+        Some((end, _)) => format!("{}…", &currency[..end]),
+        None => currency.to_string(),
+    }
+}
+
+pub(crate) fn format_value(v: f64) -> String {
+    if v == 0.0 {
+        "0".to_string()
+    } else if v >= 0.01 && is_cent_exact(v) {
+        format!("{v:.2}")
+    } else if v >= 0.01 {
+        format_precise_value(v, 6)
+    } else if v >= 0.001 {
+        format!("{v:.3}")
+    } else if v >= 0.0001 {
+        format!("{v:.4}")
+    } else {
+        format!("{v:.6}")
+    }
+}
+
+fn is_cent_exact(v: f64) -> bool {
+    let rounded_to_cent = (v * 100.0).round() / 100.0;
+    (v - rounded_to_cent).abs() < 0.0000005
+}
+
+fn format_precise_value(v: f64, decimals: usize) -> String {
+    let mut value = format!("{v:.decimals$}");
+    while value.contains('.') && value.ends_with('0') {
+        value.pop();
+    }
+    value
+}
+
 pub(crate) fn payment_description(
     challenge_description: Option<&str>,
     resource_urls: &[Option<&str>],
@@ -206,5 +285,45 @@ mod tests {
             Some("0.000000001 SOL")
         );
         assert_eq!(native_sol_display("1000000", "USDC"), None);
+    }
+
+    #[test]
+    fn stablecoins_are_dollars_at_their_own_decimals() {
+        const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        assert_eq!(
+            payment_display_amount("1000000", USDC, Some(6)).unwrap(),
+            "$1.00"
+        );
+        assert_eq!(
+            payment_display_amount("1000000", "USDC", None).unwrap(),
+            "$1.00"
+        );
+        assert_eq!(
+            payment_display_amount("1", USDC, None).unwrap(),
+            "$0.000001"
+        );
+        // A stablecoin claimed at other decimals is refused outright.
+        assert!(payment_display_amount("50000000", USDC, Some(2)).is_err());
+    }
+
+    #[test]
+    fn other_assets_name_their_unit_and_carry_no_usd_value() {
+        let mint = "Mint111111111111111111111111111111111111111";
+        let shown = payment_display_amount("50000000", mint, Some(2)).unwrap();
+        assert_eq!(shown, "500000 Mint1111…");
+        let intent = crate::keystore::AuthIntent::authorize_payment_details(&shown, "api", "op");
+        assert_eq!(intent.amount_minor_units(), None);
+
+        let shown = payment_display_amount("7", mint, None).unwrap();
+        assert_eq!(shown, "7 base units of Mint1111…");
+        assert_eq!(
+            crate::keystore::AuthIntent::authorize_payment_details(&shown, "api", "op")
+                .amount_minor_units(),
+            None
+        );
+        assert_eq!(
+            payment_display_amount("1000000000", "SOL", Some(9)).unwrap(),
+            "1 SOL"
+        );
     }
 }

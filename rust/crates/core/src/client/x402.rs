@@ -190,17 +190,6 @@ pub fn build_payment_for_attempt(
     attempt: Option<&crate::client::attempt::PaymentAttempt>,
 ) -> Result<BuiltPayment> {
     let requirements = &challenge.requirements;
-    let amount = format_amount(&requirements.amount, &requirements.currency);
-    let prompt_context = crate::client::prompt::payment_prompt_context(
-        requirements.description.as_deref(),
-        &[Some(requirements.resource.as_str()), resource_url],
-    );
-    let intent = crate::keystore::AuthIntent::authorize_payment_details(
-        &amount,
-        &prompt_context.reason,
-        &prompt_context.operator,
-    );
-
     let cluster_raw = normalize_network(
         requirements
             .cluster
@@ -234,16 +223,6 @@ pub fn build_payment_for_attempt(
         should_auto_fund_surfpool_for_x402(network_override, embedded_blockhash);
     let network = network_override.map(str::to_string).unwrap_or(cluster);
 
-    let (signer, ephemeral_notice) =
-        crate::signer::load_signer_for_network_payment_with_intent_and_override(
-            &network,
-            store,
-            account_override,
-            &amount,
-            &intent,
-            auth_override,
-        )?;
-
     let rpc_url = std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {
         if surfpool_detected {
             // `default_rpc_url("localnet")` is `http://localhost:8899`
@@ -258,6 +237,31 @@ pub fn build_payment_for_attempt(
         }
     });
     let rpc = RpcClient::new(rpc_url.clone());
+
+    // Value the payment at the decimals it is signed at, before approval.
+    let amount = crate::client::prompt::payment_display_amount(
+        &requirements.amount,
+        &requirements.currency,
+        exact_payment_decimals(&rpc, requirements)?,
+    )?;
+    let prompt_context = crate::client::prompt::payment_prompt_context(
+        requirements.description.as_deref(),
+        &[Some(requirements.resource.as_str()), resource_url],
+    );
+    let intent = crate::keystore::AuthIntent::authorize_payment_details(
+        &amount,
+        &prompt_context.reason,
+        &prompt_context.operator,
+    );
+    let (signer, ephemeral_notice) =
+        crate::signer::load_signer_for_network_payment_with_intent_and_override(
+            &network,
+            store,
+            account_override,
+            &amount,
+            &intent,
+            auth_override,
+        )?;
 
     debug!(
         amount = %requirements.amount,
@@ -343,6 +347,24 @@ pub fn build_payment_for_attempt(
         headers,
         ephemeral_notice,
     })
+}
+
+/// Decimals of an exact payment's asset: the challenge's, else the mint's
+/// on-chain decimals. Native SOL and known stablecoins need no lookup.
+fn exact_payment_decimals(
+    rpc: &RpcClient,
+    requirements: &PaymentRequirements,
+) -> Result<Option<u8>> {
+    if requirements.decimals.is_some()
+        || requirements.currency.eq_ignore_ascii_case("SOL")
+        || pay_types::Stablecoin::from_mint(&requirements.currency).is_some()
+        || pay_types::Stablecoin::parse_symbol(&requirements.currency).is_some()
+    {
+        return Ok(requirements.decimals);
+    }
+    pay_kit::x402::client::exact::payment_decimals(rpc, requirements)
+        .map(Some)
+        .map_err(|e| Error::Mpp(format!("Failed to resolve x402 asset decimals: {e}")))
 }
 
 /// The shared preamble every x402 payment-channel scheme needs before it can
@@ -458,7 +480,8 @@ fn prepare_channel_payment(
     // `PaymentLimit::from_amount`, which would drop the amount-specific spend
     // limit and fall back to the generic authorization action. Keep the amount
     // canonical and carry the escrow context in the intent kind instead.
-    let display_amount = format_amount(offer.amount, offer.asset);
+    let display_amount =
+        crate::client::prompt::payment_display_amount(offer.amount, offer.asset, None)?;
     let prompt_context = crate::client::prompt::payment_prompt_context(None, &[resource_url]);
     let intent = if offer.channel_escrow {
         crate::keystore::AuthIntent::authorize_channel_escrow(
@@ -1193,41 +1216,9 @@ fn parse_payment_required_envelope_header(value: &str) -> Option<PaymentRequired
     serde_json::from_slice::<PaymentRequiredEnvelope>(&decoded).ok()
 }
 
+#[cfg(test)]
 fn format_amount(amount: &str, currency: &str) -> String {
-    if let Some(native) = crate::client::prompt::native_sol_display(amount, currency) {
-        return native;
-    }
-    let base: u64 = amount.parse().unwrap_or(0);
-    format!("${}", format_value(base as f64 / 1_000_000.0))
-}
-
-fn format_value(v: f64) -> String {
-    if v == 0.0 {
-        "0".to_string()
-    } else if v >= 0.01 && is_cent_exact(v) {
-        format!("{v:.2}")
-    } else if v >= 0.01 {
-        format_precise_value(v, 6)
-    } else if v >= 0.001 {
-        format!("{v:.3}")
-    } else if v >= 0.0001 {
-        format!("{v:.4}")
-    } else {
-        format!("{v:.6}")
-    }
-}
-
-fn is_cent_exact(v: f64) -> bool {
-    let rounded_to_cent = (v * 100.0).round() / 100.0;
-    (v - rounded_to_cent).abs() < 0.0000005
-}
-
-fn format_precise_value(v: f64, decimals: usize) -> String {
-    let mut value = format!("{v:.decimals$}");
-    while value.contains('.') && value.ends_with('0') {
-        value.pop();
-    }
-    value
+    crate::client::prompt::payment_display_amount(amount, currency, None).unwrap()
 }
 
 fn detect_x402_version(headers: &[(String, String)], body: Option<&str>) -> u64 {
@@ -1417,37 +1408,37 @@ mod tests {
 
     #[test]
     fn format_value_zero() {
-        assert_eq!(format_value(0.0), "0");
+        assert_eq!(crate::client::prompt::format_value(0.0), "0");
     }
 
     #[test]
     fn format_value_large() {
-        assert_eq!(format_value(1.5), "1.50");
+        assert_eq!(crate::client::prompt::format_value(1.5), "1.50");
     }
 
     #[test]
     fn format_value_preserves_fractional_cent_fees() {
-        assert_eq!(format_value(1.0015), "1.0015");
+        assert_eq!(crate::client::prompt::format_value(1.0015), "1.0015");
     }
 
     #[test]
     fn format_value_cents() {
-        assert_eq!(format_value(0.01), "0.01");
+        assert_eq!(crate::client::prompt::format_value(0.01), "0.01");
     }
 
     #[test]
     fn format_value_milli() {
-        assert_eq!(format_value(0.005), "0.005");
+        assert_eq!(crate::client::prompt::format_value(0.005), "0.005");
     }
 
     #[test]
     fn format_value_micro() {
-        assert_eq!(format_value(0.0005), "0.0005");
+        assert_eq!(crate::client::prompt::format_value(0.0005), "0.0005");
     }
 
     #[test]
     fn format_value_tiny() {
-        assert_eq!(format_value(0.00005), "0.000050");
+        assert_eq!(crate::client::prompt::format_value(0.00005), "0.000050");
     }
 
     #[test]
