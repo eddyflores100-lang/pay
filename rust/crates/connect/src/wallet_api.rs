@@ -550,7 +550,7 @@ mod tests {
         let VersionedMessage::Legacy(message) = &mut transaction.message else {
             unreachable!()
         };
-        message.account_keys.insert(0, Pubkey::new_unique());
+        message.account_keys.splice(0..0, [Pubkey::new_unique()]);
         message.header.num_required_signatures += 1;
         for instruction in &mut message.instructions {
             instruction.program_id_index += 1;
