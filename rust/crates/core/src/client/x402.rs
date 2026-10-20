@@ -647,6 +647,72 @@ pub fn build_upto_payment_with_override(
     })
 }
 
+const UPTO_HEADER_KIND: &str = "x402-upto-header";
+
+/// The terms that identify an upto offer across challenges: blockhash and
+/// slot hints change on every challenge, the offer does not.
+fn upto_offer_terms(requirements: &pay_kit::x402::upto::UptoRequirements) -> Result<[String; 6]> {
+    let mut extra = serde_json::to_value(&requirements.extra)?;
+    if let Some(extra) = extra.as_object_mut() {
+        for hint in ["recentBlockhash", "lastValidBlockHeight", "recentSlot"] {
+            extra.remove(hint);
+        }
+    }
+    Ok([
+        requirements.network.clone(),
+        requirements.amount.clone(),
+        requirements.asset.clone(),
+        requirements.pay_to.clone(),
+        requirements.max_timeout_seconds.to_string(),
+        extra.to_string(),
+    ])
+}
+
+/// [`build_upto_payment_with_override`] for one logical request. While
+/// `attempt` is unresolved, a retry for the same offer resends the exact
+/// header already signed — same nonce, same channel — instead of opening
+/// another channel whose settlement could charge the payer again.
+#[allow(clippy::too_many_arguments)]
+pub fn build_upto_payment_for_attempt(
+    challenge: &UptoChallenge,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+    auth_override: crate::signer::AuthOverride,
+    attempt: &crate::client::attempt::PaymentAttempt,
+) -> Result<BuiltPayment> {
+    let requirements = &challenge.requirements;
+    let terms = upto_offer_terms(requirements)?;
+    let terms = terms.each_ref().map(String::as_str);
+    let mut ephemeral_notice = None;
+    let header = attempt.reuse_or_insert(
+        UPTO_HEADER_KIND,
+        &terms,
+        std::time::Duration::from_secs(requirements.max_timeout_seconds.clamp(1, 3_600)),
+        || {
+            let mut built = build_upto_payment_with_override(
+                challenge,
+                store,
+                network_override,
+                account_override,
+                resource_url,
+                auth_override,
+            )?;
+            ephemeral_notice = built.ephemeral_notice.take();
+            built
+                .headers
+                .pop()
+                .map(|(_, value)| value)
+                .ok_or_else(|| Error::Mpp("x402 upto payment built no header".to_string()))
+        },
+    )?;
+    Ok(BuiltPayment {
+        headers: vec![(X402_V2_PAYMENT_HEADER, header)],
+        ephemeral_notice,
+    })
+}
+
 /// Try to parse an x402 `batch-settlement` challenge from headers and/or body.
 ///
 /// Checked before `exact`: a `batch-settlement`-only 402 also parses leniently
@@ -1724,6 +1790,80 @@ mod tests {
         let id = pid.info.id.as_deref().expect("id appended");
         assert!(id.starts_with("pay_"));
         assert!(id.len() >= 16 && id.len() <= 128);
+    }
+
+    fn upto_challenge(blockhash: &str, amount: &str) -> UptoChallenge {
+        UptoChallenge {
+            requirements: serde_json::from_value(serde_json::json!({
+                "scheme": "upto",
+                "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "amount": amount,
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "payTo": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+                "maxTimeoutSeconds": 300,
+                "extra": {
+                    "feePayer": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                    "receiverAuthorizer": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                    "withdrawDelay": 3600,
+                    "recentBlockhash": blockhash,
+                    "recentSlot": "42",
+                }
+            }))
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn an_ambiguous_upto_retry_resends_the_original_header() {
+        let attempt = crate::client::attempt::PaymentAttempt::new(
+            "POST",
+            "https://api.example/metered",
+            Some(b"{\"prompt\":\"hi\"}"),
+        );
+        let first = upto_challenge("11111111111111111111111111111111", "250000");
+        let terms = upto_offer_terms(&first.requirements).unwrap();
+        // The first attempt signed this header; its response was lost.
+        attempt
+            .reuse_or_insert(
+                UPTO_HEADER_KIND,
+                &terms.each_ref().map(String::as_str),
+                std::time::Duration::from_secs(300),
+                || Ok("original-signed-header".to_string()),
+            )
+            .unwrap();
+
+        // The retry's challenge carries fresh hints. No wallet is available,
+        // so anything but a resend would fail.
+        let store = MemoryAccountsStore::new();
+        let retry = upto_challenge("SysvarRent111111111111111111111111111111111", "250000");
+        let built = build_upto_payment_for_attempt(
+            &retry,
+            &store,
+            None,
+            None,
+            Some("https://api.example/metered"),
+            None,
+            &attempt,
+        )
+        .expect("pending header is resent without signing");
+        assert_eq!(
+            built.headers,
+            vec![(X402_V2_PAYMENT_HEADER, "original-signed-header".to_string())]
+        );
+
+        // A different ceiling is a different offer and must be built afresh.
+        let repriced = upto_challenge("SysvarRent111111111111111111111111111111111", "500000");
+        assert!(
+            build_upto_payment_for_attempt(&repriced, &store, None, None, None, None, &attempt)
+                .is_err()
+        );
+
+        // A definitive answer ends the attempt: the next call builds anew.
+        attempt.resolved();
+        assert!(
+            build_upto_payment_for_attempt(&retry, &store, None, None, None, None, &attempt)
+                .is_err()
+        );
     }
 
     fn payment_identifier_store() -> MemoryAccountsStore {

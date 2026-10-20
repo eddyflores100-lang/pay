@@ -1286,13 +1286,14 @@ fn do_paid_fetch(
                         permissions.authorize_upto(challenge.as_ref(), &resource_url)?;
                     }
                     let built_payment = scope.with_approval(peer.as_ref(), |auth| {
-                        pay_core::client::x402::build_upto_payment_with_override(
+                        pay_core::client::x402::build_upto_payment_for_attempt(
                             challenge.as_ref(),
                             store,
                             network_override.as_deref(),
                             account_override.as_deref(),
                             Some(url),
                             auth,
+                            &attempt,
                         )
                     })?;
                     headers.extend(
@@ -1342,13 +1343,14 @@ fn do_paid_fetch(
                 permissions.authorize_upto(&challenge, &resource_url)?;
             }
             let built_payment = scope.with_approval(peer.as_ref(), |auth| {
-                pay_core::client::x402::build_upto_payment_with_override(
+                pay_core::client::x402::build_upto_payment_for_attempt(
                     &challenge,
                     store,
                     network_override.as_deref(),
                     account_override.as_deref(),
                     Some(url),
                     auth,
+                    &attempt,
                 )
             })?;
             let mut headers = extra_headers.to_vec();
