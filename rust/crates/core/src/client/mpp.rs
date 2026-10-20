@@ -221,12 +221,7 @@ pub fn build_credential_with_override(
 
     // Cap the transaction version at what the wallet can sign (a Ledger
     // signs v0 only); the kit negotiates against what the server advertises.
-    let options = BuildChargeTransactionOptions {
-        max_tx_version: signer.max_tx_version(),
-        // Split ATA rent would be spent outside the approved amount.
-        allow_payer_funded_ata_creation: false,
-        ..Default::default()
-    };
+    let options = charge_build_options(&network, signer.max_tx_version());
     let header = if let Some(hooks) = channel_hooks {
         // A separate ephemeral voucher key avoids asking hardware wallets to
         // sign arbitrary messages. The payer still signs the complete transaction.
@@ -258,6 +253,21 @@ pub fn build_credential_with_override(
     };
 
     Ok((header, ephemeral_notice))
+}
+
+/// The kit re-checks the challenge against the network the wallet was loaded
+/// for, so a challenge cannot be signed for a cluster other than the selected one.
+fn charge_build_options(
+    network: &str,
+    max_tx_version: Option<pay_kit::core::tx::TxVersion>,
+) -> BuildChargeTransactionOptions {
+    BuildChargeTransactionOptions {
+        max_tx_version,
+        expected_network: Some(network.to_string()),
+        // Split ATA rent would be spent outside the approved amount.
+        allow_payer_funded_ata_creation: false,
+        ..Default::default()
+    }
 }
 
 /// Select a stablecoin charge challenge the configured wallet can actually pay.
@@ -737,6 +747,33 @@ mod tests {
             }))
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn charge_options_pin_the_selected_network() {
+        let options = charge_build_options("devnet", None);
+        assert_eq!(options.expected_network.as_deref(), Some("devnet"));
+        assert!(!options.allow_payer_funded_ata_creation);
+    }
+
+    #[test]
+    fn a_challenge_for_another_network_than_the_selected_one_is_not_signed() {
+        let challenge = challenge_for_currency("USDC", "1000");
+        let rpc = RpcClient::new("http://127.0.0.1:9".to_string());
+        let signer = pay_kit::mpp::solana_keychain::MemorySigner::from_bytes(
+            &ed25519_dalek::SigningKey::generate(&mut rand::thread_rng()).to_keypair_bytes(),
+        )
+        .unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt
+            .block_on(build_credential_header_with_options(
+                &signer,
+                &rpc,
+                &challenge,
+                charge_build_options("devnet", None),
+            ))
+            .expect_err("a mainnet challenge must not be signed for devnet");
+        assert!(err.to_string().contains("expected_network"), "{err}");
     }
 
     #[test]
