@@ -683,12 +683,38 @@ pub fn build_upto_payment_for_attempt(
     attempt: &crate::client::attempt::PaymentAttempt,
 ) -> Result<BuiltPayment> {
     let requirements = &challenge.requirements;
+    let route = resolve_channel_route(
+        &ChannelOffer {
+            network: &requirements.network,
+            amount: &requirements.amount,
+            asset: &requirements.asset,
+            channel_escrow: false,
+            recent_blockhash: requirements.extra.recent_blockhash.as_deref(),
+        },
+        network_override,
+    )?;
+    // Signed material is reusable only by the wallet that signed it; with no
+    // payer known up front, sign afresh.
+    let Some(payer) = configured_channel_payer(store, &route.network, account_override)? else {
+        return build_upto_payment_with_override(
+            challenge,
+            store,
+            network_override,
+            account_override,
+            resource_url,
+            auth_override,
+        );
+    };
     let terms = upto_offer_terms(requirements)?;
-    let terms = terms.each_ref().map(String::as_str);
-    let mut ephemeral_notice = None;
-    let header = attempt.reuse_or_insert(
+    let key = crate::client::attempt::PaymentCacheKey::new(
+        attempt,
+        &payer,
+        &route.network,
         UPTO_HEADER_KIND,
-        &terms,
+        &terms.each_ref().map(String::as_str),
+    );
+    let mut ephemeral_notice = None;
+    let header = key.reuse_or_insert(
         std::time::Duration::from_secs(requirements.max_timeout_seconds.clamp(1, 3_600)),
         || {
             let mut built = build_upto_payment_with_override(
@@ -1813,6 +1839,52 @@ mod tests {
         }
     }
 
+    /// A mainnet wallet known by its public key only: anything that needs
+    /// to sign with it fails.
+    fn upto_payer_store(pubkey: &str) -> MemoryAccountsStore {
+        let mut file = AccountsFile::default();
+        file.upsert(
+            "mainnet",
+            "default",
+            Account {
+                backend: BackendKind::Ephemeral,
+                provider: None,
+                active: true,
+                auth_required: Some(false),
+                pubkey: Some(pubkey.to_string()),
+                vault: None,
+                account: None,
+                path: None,
+                secret_key_b58: None,
+                created_at: None,
+                subscriptions: Default::default(),
+            },
+        );
+        MemoryAccountsStore::with_file(file)
+    }
+
+    const UPTO_PAYER: &str = "4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR";
+    const OTHER_UPTO_PAYER: &str = "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY";
+
+    fn record_signed_upto_header(
+        attempt: &crate::client::attempt::PaymentAttempt,
+        payer: &str,
+        challenge: &UptoChallenge,
+    ) {
+        let terms = upto_offer_terms(&challenge.requirements).unwrap();
+        crate::client::attempt::PaymentCacheKey::new(
+            attempt,
+            &payer.parse().unwrap(),
+            "mainnet",
+            UPTO_HEADER_KIND,
+            &terms.each_ref().map(String::as_str),
+        )
+        .reuse_or_insert(std::time::Duration::from_secs(300), || {
+            Ok("original-signed-header".to_string())
+        })
+        .unwrap();
+    }
+
     #[test]
     fn an_ambiguous_upto_retry_resends_the_original_header() {
         let attempt = crate::client::attempt::PaymentAttempt::new(
@@ -1820,21 +1892,16 @@ mod tests {
             "https://api.example/metered",
             Some(b"{\"prompt\":\"hi\"}"),
         );
-        let first = upto_challenge("11111111111111111111111111111111", "250000");
-        let terms = upto_offer_terms(&first.requirements).unwrap();
         // The first attempt signed this header; its response was lost.
-        attempt
-            .reuse_or_insert(
-                UPTO_HEADER_KIND,
-                &terms.each_ref().map(String::as_str),
-                std::time::Duration::from_secs(300),
-                || Ok("original-signed-header".to_string()),
-            )
-            .unwrap();
+        record_signed_upto_header(
+            &attempt,
+            UPTO_PAYER,
+            &upto_challenge("11111111111111111111111111111111", "250000"),
+        );
 
-        // The retry's challenge carries fresh hints. No wallet is available,
+        // The retry's challenge carries fresh hints. The wallet cannot sign,
         // so anything but a resend would fail.
-        let store = MemoryAccountsStore::new();
+        let store = upto_payer_store(UPTO_PAYER);
         let retry = upto_challenge("SysvarRent111111111111111111111111111111111", "250000");
         let built = build_upto_payment_for_attempt(
             &retry,
@@ -1864,6 +1931,44 @@ mod tests {
             build_upto_payment_for_attempt(&retry, &store, None, None, None, None, &attempt)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_pending_upto_header_is_never_resent_for_another_wallet() {
+        let attempt = crate::client::attempt::PaymentAttempt::new(
+            "POST",
+            "https://api.example/metered-other-wallet",
+            Some(b"{}"),
+        );
+        let challenge = upto_challenge("11111111111111111111111111111111", "250000");
+        record_signed_upto_header(&attempt, UPTO_PAYER, &challenge);
+
+        for store in [
+            upto_payer_store(OTHER_UPTO_PAYER),
+            MemoryAccountsStore::new(),
+        ] {
+            assert!(
+                build_upto_payment_for_attempt(
+                    &challenge, &store, None, None, None, None, &attempt
+                )
+                .is_err(),
+                "another wallet must sign its own payment"
+            );
+        }
+        // Positive control: the signing wallet still gets its header back.
+        assert!(
+            build_upto_payment_for_attempt(
+                &challenge,
+                &upto_payer_store(UPTO_PAYER),
+                None,
+                None,
+                None,
+                None,
+                &attempt
+            )
+            .is_ok()
+        );
+        attempt.resolved();
     }
 
     fn payment_identifier_store() -> MemoryAccountsStore {
