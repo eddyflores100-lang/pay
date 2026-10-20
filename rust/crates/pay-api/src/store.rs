@@ -293,6 +293,11 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn standalone_build_supports_tls_store_urls() {
+        redis::Client::open("rediss://127.0.0.1:6380").expect("rediss:// needs a TLS transport");
+    }
+
     async fn exercise_reservations(a: &Reservations, b: &Reservations) {
         let ttl = std::time::Duration::from_secs(60);
         let held = a
