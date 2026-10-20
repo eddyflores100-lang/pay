@@ -385,7 +385,15 @@ impl SessionOperatorRuntime {
     /// operator-bound payer proof), so idle close cannot go through
     /// [`SessionServer::process_close`] — the server closes on its own
     /// authority and seals at the highest accepted watermark.
-    async fn request_server_close(&self, channel_id: &str) -> Result<()> {
+    ///
+    /// `observed` is the idle lifecycle a due scan saw: the claim only lands
+    /// if the record still carries it, so a voucher that re-armed the
+    /// deadline after the scan keeps the channel open.
+    async fn request_server_close(
+        &self,
+        channel_id: &str,
+        observed: Option<ChannelLifecycle>,
+    ) -> Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -408,6 +416,11 @@ impl SessionOperatorRuntime {
                     if state.close_requested_at.is_some() {
                         return Err(StoreError::Internal("Close already requested".to_string()));
                     }
+                    if observed.is_some() && state.lifecycle != observed {
+                        return Err(StoreError::Internal(
+                            IDLE_CLOSE_LIFECYCLE_CHANGED.to_string(),
+                        ));
+                    }
                     state.close_requested_at = Some(now);
                     Ok(state)
                 }),
@@ -417,7 +430,11 @@ impl SessionOperatorRuntime {
         Ok(())
     }
 
-    async fn operator_close_channel(&self, channel_id: &str) -> Result<SessionCloseResult> {
+    async fn operator_close_channel(
+        &self,
+        channel_id: &str,
+        observed: Option<ChannelLifecycle>,
+    ) -> Result<SessionCloseResult> {
         if self.channel_is_tombstoned_on_chain(channel_id).await {
             self.server
                 .mark_sealed(channel_id)
@@ -426,8 +443,11 @@ impl SessionOperatorRuntime {
             return Ok(SessionCloseResult::AlreadyFinalized);
         }
 
-        match self.request_server_close(channel_id).await {
+        match self.request_server_close(channel_id, observed).await {
             Ok(()) => {}
+            Err(error) if error.to_string().contains(IDLE_CLOSE_LIFECYCLE_CHANGED) => {
+                return Ok(SessionCloseResult::Rearmed);
+            }
             Err(error) if session_close_already_finalized(&error.to_string()) => {
                 return Ok(SessionCloseResult::AlreadyFinalized);
             }
@@ -1203,12 +1223,12 @@ impl SessionLifecycleRunloop {
                     "payment-channel idle-close check"
                 );
                 (owned && close_after.is_some_and(|close_after| close_after <= now_ms))
-                    .then_some(state.channel_id)
+                    .then_some((state.channel_id, state.lifecycle))
             })
             .collect::<Vec<_>>();
 
         let mut closing = Vec::with_capacity(due.len());
-        for channel_id in due {
+        for (channel_id, observed) in due {
             // Closing and serving both claim the same channel slot. This makes
             // the reservation check atomic with the start of close: a request
             // already in flight defers close, while a close already in progress
@@ -1221,7 +1241,7 @@ impl SessionLifecycleRunloop {
             }
             let runtime = self.runtime.clone();
             closing.push(async move {
-                let result = runtime.operator_close_channel(&channel_id).await;
+                let result = runtime.operator_close_channel(&channel_id, observed).await;
                 (channel_id, result)
             });
         }
@@ -1234,6 +1254,9 @@ impl SessionLifecycleRunloop {
                 }
                 Ok(SessionCloseResult::AlreadyFinalized) => {
                     tracing::debug!(channel_id, "payment channel already finalized");
+                }
+                Ok(SessionCloseResult::Rearmed) => {
+                    tracing::debug!(channel_id, "payment channel re-armed since the idle scan");
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -1407,9 +1430,15 @@ fn next_lifecycle_wakeup(
 }
 
 enum SessionCloseResult {
-    Closed { settled: u64 },
+    Closed {
+        settled: u64,
+    },
     AlreadyFinalized,
+    /// Activity re-armed the idle deadline after the due scan; not closed.
+    Rearmed,
 }
+
+const IDLE_CLOSE_LIFECYCLE_CHANGED: &str = "channel lifecycle changed since the idle scan";
 
 // ── Session manager ────────────────────────────────────────────────────────
 
@@ -4200,6 +4229,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_close_skips_a_channel_rearmed_after_the_scan() {
+        let session = test_session_mpp();
+        session.start_lifecycle_runloop(Duration::from_secs(3600));
+        let challenge = session.challenge(None).unwrap();
+        let (channel_id, handle) = client_voucher_channel(&session, &challenge).await;
+        session.touch_channel(channel_id.clone()).await.unwrap();
+        // Age the deadline so the channel is due, and take the scan's view.
+        let store = &session.operator_runtime.channel_store;
+        store
+            .update_channel(
+                &channel_id,
+                Box::new(|state| {
+                    let mut state = state.unwrap();
+                    state.lifecycle.as_mut().unwrap().close_after = 0;
+                    Ok(state)
+                }),
+            )
+            .await
+            .unwrap();
+        let observed = stored_channel(&session, &channel_id).await.lifecycle;
+
+        // A voucher lands between the scan and the close claim.
+        let header = handle().voucher_header(25).await.unwrap();
+        session.process(&header).await.unwrap();
+        let error = session
+            .operator_runtime
+            .request_server_close(&channel_id, observed)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(IDLE_CLOSE_LIFECYCLE_CHANGED),
+            "{error}"
+        );
+        let state = stored_channel(&session, &channel_id).await;
+        assert!(state.close_requested_at.is_none());
+        // The request that paid is still served.
+        session.touch_channel(channel_id.clone()).await.unwrap();
+
+        // A channel still idle as scanned is claimed.
+        let observed = stored_channel(&session, &channel_id).await.lifecycle;
+        session
+            .operator_runtime
+            .request_server_close(&channel_id, observed)
+            .await
+            .unwrap();
+        assert!(
+            stored_channel(&session, &channel_id)
+                .await
+                .close_requested_at
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn voucher_must_pay_the_challenged_request_amount() {
         // The static session amount is 25; this route was challenged at 100.
         let session = test_session_mpp();
@@ -5320,7 +5403,7 @@ mod tests {
         // Server-initiated close (idle path) seals at the accepted watermark.
         session
             .operator_runtime
-            .request_server_close(&channel)
+            .request_server_close(&channel, None)
             .await
             .unwrap();
         let params = session.server.seal_params(&channel).await.unwrap();
