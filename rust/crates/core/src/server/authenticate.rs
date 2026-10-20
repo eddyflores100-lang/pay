@@ -402,26 +402,24 @@ mod tests {
     async fn legacy_identity_without_a_subscription_is_not_authorized() {
         let outcome = legacy_outcome(Vec::new()).await;
         assert!(
-            matches!(&outcome, LegacyAuthentication::NotSubscribed { message, .. } if message.contains("not found")),
-            "{outcome:?}"
+            matches!(&outcome, LegacyAuthentication::NotSubscribed { message, .. } if message.contains("not found"))
         );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn legacy_identity_with_an_unpaid_period_is_not_authorized() {
         let outcome = legacy_outcome(subscription_accounts(0)).await;
-        assert!(
-            matches!(outcome, LegacyAuthentication::NotSubscribed { .. }),
-            "{outcome:?}"
-        );
+        assert!(matches!(
+            outcome,
+            LegacyAuthentication::NotSubscribed { .. }
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn legacy_identity_with_a_live_subscription_is_authorized() {
         let outcome = legacy_outcome(subscription_accounts(AMOUNT)).await;
         assert!(
-            matches!(outcome, LegacyAuthentication::Live(subscriber) if subscriber == test_subscriber()),
-            "{outcome:?}"
+            matches!(outcome, LegacyAuthentication::Live(subscriber) if subscriber == test_subscriber())
         );
     }
 
