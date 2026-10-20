@@ -129,8 +129,15 @@ pub fn build_credential_with_override(
             .method_details
             .as_ref()
             .and_then(|details| details.get("decimals"))
-            .and_then(|decimals| decimals.as_u64())
-            .and_then(|decimals| u8::try_from(decimals).ok()),
+            .map(|decimals| {
+                decimals
+                    .as_u64()
+                    .ok_or_else(|| {
+                        Error::InvalidChallenge("asset decimals must be an integer".to_string())
+                    })
+                    .and_then(crate::client::prompt::Decimals::new)
+            })
+            .transpose()?,
     )?;
     let prompt_context = crate::client::prompt::payment_prompt_context(
         charge_prompt_reason(

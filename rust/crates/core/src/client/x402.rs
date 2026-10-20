@@ -360,17 +360,21 @@ pub fn build_payment_for_attempt(
 fn exact_payment_decimals(
     rpc: &RpcClient,
     requirements: &PaymentRequirements,
-) -> Result<Option<u8>> {
-    if requirements.decimals.is_some()
+) -> Result<Option<crate::client::prompt::Decimals>> {
+    let decimals = if requirements.decimals.is_some()
         || requirements.currency.eq_ignore_ascii_case("SOL")
         || pay_types::Stablecoin::from_mint(&requirements.currency).is_some()
         || pay_types::Stablecoin::parse_symbol(&requirements.currency).is_some()
     {
-        return Ok(requirements.decimals);
-    }
-    pay_kit::x402::client::exact::payment_decimals(rpc, requirements)
-        .map(Some)
-        .map_err(|e| Error::Mpp(format!("Failed to resolve x402 asset decimals: {e}")))
+        requirements.decimals
+    } else {
+        pay_kit::x402::client::exact::payment_decimals(rpc, requirements)
+            .map(Some)
+            .map_err(|e| Error::Mpp(format!("Failed to resolve x402 asset decimals: {e}")))?
+    };
+    decimals
+        .map(|decimals| crate::client::prompt::Decimals::new(u64::from(decimals)))
+        .transpose()
 }
 
 /// The shared preamble every x402 payment-channel scheme needs before it can

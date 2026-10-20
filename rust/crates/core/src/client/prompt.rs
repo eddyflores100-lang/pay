@@ -19,6 +19,33 @@ pub(crate) fn payment_prompt_context(
     }
 }
 
+/// Token decimals a challenge asks a payment to be valued at, bounded so a
+/// `u64` base-unit amount always has a meaningful decimal rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Decimals(u8);
+
+impl Decimals {
+    /// `u64::MAX` has 20 digits.
+    pub(crate) const MAX: u8 = 19;
+
+    pub(crate) fn new(decimals: u64) -> crate::Result<Self> {
+        u8::try_from(decimals)
+            .ok()
+            .filter(|decimals| *decimals <= Self::MAX)
+            .map(Self)
+            .ok_or_else(|| {
+                crate::Error::InvalidChallenge(format!(
+                    "asset decimals {decimals} exceed the supported maximum of {}",
+                    Self::MAX
+                ))
+            })
+    }
+
+    pub(crate) fn get(self) -> u8 {
+        self.0
+    }
+}
+
 /// Exact decimal rendering of `base` units at `decimals` places, without
 /// trailing zeros (`1500000000`, 9 -> `1.5`).
 pub(crate) fn format_base_units(base: u64, decimals: u32) -> String {
@@ -49,7 +76,7 @@ pub(crate) fn native_sol_display(base_units: &str, currency: &str) -> Option<Str
 pub(crate) fn payment_display_amount(
     base_units: &str,
     currency: &str,
-    decimals: Option<u8>,
+    decimals: Option<Decimals>,
 ) -> crate::Result<String> {
     if let Some(native) = native_sol_display(base_units, currency) {
         return Ok(native);
@@ -57,7 +84,7 @@ pub(crate) fn payment_display_amount(
     let base = base_units.parse::<u64>().unwrap_or(0);
     let stablecoin = pay_types::Stablecoin::from_mint(currency)
         .or_else(|| pay_types::Stablecoin::parse_symbol(currency));
-    match (stablecoin, decimals) {
+    match (stablecoin, decimals.map(Decimals::get)) {
         (Some(coin), Some(decimals)) if decimals != coin.decimals() => {
             Err(crate::Error::PaymentRejected(format!(
                 "{} has {} decimals, but the payment declares {decimals}",
@@ -281,6 +308,23 @@ mod tests {
     }
 
     #[test]
+    fn absurd_decimals_are_an_invalid_challenge() {
+        for decimals in [20, 128, 255, 256, u64::MAX] {
+            assert!(matches!(
+                Decimals::new(decimals),
+                Err(crate::Error::InvalidChallenge(_))
+            ));
+        }
+        // Positive control: the largest supported scale still renders.
+        let max = Decimals::new(u64::from(Decimals::MAX)).unwrap();
+        let mint = "Mint111111111111111111111111111111111111111";
+        assert_eq!(
+            payment_display_amount(&u64::MAX.to_string(), mint, Some(max)).unwrap(),
+            "1.8446744073709551615 Mint1111…"
+        );
+    }
+
+    #[test]
     fn native_sol_display_only_for_sol() {
         assert_eq!(
             native_sol_display("1000000000", "SOL").as_deref(),
@@ -297,7 +341,7 @@ mod tests {
     fn stablecoins_are_dollars_at_their_own_decimals() {
         const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
         assert_eq!(
-            payment_display_amount("1000000", USDC, Some(6)).unwrap(),
+            payment_display_amount("1000000", USDC, Some(Decimals::new(6).unwrap())).unwrap(),
             "$1.00"
         );
         assert_eq!(
@@ -309,13 +353,14 @@ mod tests {
             "$0.000001"
         );
         // A stablecoin claimed at other decimals is refused outright.
-        assert!(payment_display_amount("50000000", USDC, Some(2)).is_err());
+        assert!(payment_display_amount("50000000", USDC, Some(Decimals::new(2).unwrap())).is_err());
     }
 
     #[test]
     fn other_assets_name_their_unit_and_carry_no_usd_value() {
         let mint = "Mint111111111111111111111111111111111111111";
-        let shown = payment_display_amount("50000000", mint, Some(2)).unwrap();
+        let shown =
+            payment_display_amount("50000000", mint, Some(Decimals::new(2).unwrap())).unwrap();
         assert_eq!(shown, "500000 Mint1111…");
         let intent = crate::keystore::AuthIntent::authorize_payment_details(&shown, "api", "op");
         assert_eq!(intent.amount_minor_units(), None);
@@ -328,7 +373,7 @@ mod tests {
             None
         );
         assert_eq!(
-            payment_display_amount("1000000000", "SOL", Some(9)).unwrap(),
+            payment_display_amount("1000000000", "SOL", Some(Decimals::new(9).unwrap())).unwrap(),
             "1 SOL"
         );
     }
