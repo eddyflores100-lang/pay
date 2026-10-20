@@ -503,6 +503,57 @@ async fn trigger_creation_retries_after_a_funding_fault_are_funded() {
         .await
         .unwrap();
     assert_eq!(harness.remaining(&resource).await, Some(0));
+
+    // A create that lost the race funds after the winner's job is live; it
+    // must not restore spent runs.
+    let key = GoogleTriggerDriver::budget_key(&resource);
+    let channel: String = redis::cmd("HGET")
+        .arg(&key)
+        .arg("channel")
+        .query_async(&mut harness.redis)
+        .await
+        .unwrap();
+    harness
+        .driver
+        .fund_budget(&resource, &channel)
+        .await
+        .unwrap();
+    assert_eq!(harness.remaining(&resource).await, Some(0));
+    assert!(
+        harness
+            .driver
+            .execute(harness.executor_request(&resource))
+            .await
+            .is_err()
+    );
+    assert_eq!(harness.invocations(), 1);
+
+    // Another channel's budget is never adopted or replaced.
+    assert!(
+        harness
+            .driver
+            .fund_budget(&resource, "channelB")
+            .await
+            .is_err()
+    );
+
+    // Only an expired budget is refreshed.
+    redis::cmd("HSET")
+        .arg(&key)
+        .arg("expires_at")
+        .arg(0)
+        .query_async::<()>(&mut harness.redis)
+        .await
+        .unwrap();
+    harness
+        .driver
+        .fund_budget(&resource, &channel)
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.remaining(&resource).await,
+        Some(PREPAID_RUNS.into())
+    );
 }
 
 #[tokio::test]

@@ -156,19 +156,38 @@ impl GoogleTriggerDriver {
         )
     }
 
+    /// Fund the trigger's budget unless a live one already exists. A create
+    /// that loses a race (or retries after a failed POST) therefore keeps the
+    /// existing budget instead of restoring spent runs.
     async fn fund_budget(&self, resource: &str, channel: &str) -> Result<FundedBudget> {
-        let expires_at = unix_seconds()?.saturating_add(BUDGET_LIFETIME_SECONDS);
+        let script = redis::Script::new(
+            r#"
+local kind = redis.call('TYPE', KEYS[1]).ok
+if kind == 'hash' then
+  if redis.call('HGET', KEYS[1], 'channel') ~= ARGV[1] then
+    return redis.error_reply('trigger budget belongs to another channel')
+  end
+  local expires = tonumber(redis.call('HGET', KEYS[1], 'expires_at') or '0')
+  if expires > tonumber(ARGV[4]) then return 0 end
+elseif kind ~= 'none' then
+  return redis.error_reply('trigger budget key holds a non-budget value')
+end
+redis.call('DEL', KEYS[1])
+redis.call('HSET', KEYS[1], 'channel', ARGV[1], 'remaining', ARGV[2], 'expires_at', ARGV[3])
+redis.call('EXPIRE', KEYS[1], ARGV[5])
+return 1
+"#,
+        );
+        let now = unix_seconds()?;
         let mut connection = self.budgets.clone();
-        redis::pipe()
-            .atomic()
-            .hset(Self::budget_key(resource), "channel", channel)
-            .hset(Self::budget_key(resource), "remaining", PREPAID_RUNS)
-            .hset(Self::budget_key(resource), "expires_at", expires_at)
-            .expire(
-                Self::budget_key(resource),
-                i64::try_from(BUDGET_LIFETIME_SECONDS + 3600).unwrap_or(i64::MAX),
-            )
-            .query_async::<()>(&mut connection)
+        script
+            .key(Self::budget_key(resource))
+            .arg(channel)
+            .arg(PREPAID_RUNS)
+            .arg(now.saturating_add(BUDGET_LIFETIME_SECONDS))
+            .arg(now)
+            .arg(BUDGET_LIFETIME_SECONDS + 3600)
+            .invoke_async::<i64>(&mut connection)
             .await?;
         Ok(FundedBudget(()))
     }
@@ -571,8 +590,8 @@ impl TriggerDriver for GoogleTriggerDriver {
         let (status, value) = self.request(Method::PATCH, url, Some(&body)).await?;
         // Only a new Scheduler job is a funding event; updates keep the
         // remaining budget and expiry of the existing incarnation. Funding
-        // precedes creation, so a failed create leaves at most an unbound
-        // budget that the next create overwrites and the TTL reaps.
+        // precedes creation and never replaces a live budget, so a failed or
+        // losing create leaves at most an unbound budget that the TTL reaps.
         let value = if status == StatusCode::NOT_FOUND {
             let funded = self.fund_budget(&resource, &channel).await?;
             self.create_job(region, &body, funded).await?
