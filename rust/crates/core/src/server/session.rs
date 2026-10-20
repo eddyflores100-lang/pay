@@ -233,7 +233,6 @@ struct SessionOperatorRuntime {
     network: String,
     token_program: String,
     payment_channel_signer: Arc<Mutex<Option<Arc<dyn TransactionSigner>>>>,
-    payment_channel_payer_signer: Arc<Mutex<Option<Arc<dyn TransactionSigner>>>>,
     committed_watermarks: Arc<dashmap::DashMap<String, u64>>,
     reserved_capacity: Arc<Mutex<HashMap<String, u64>>>,
     delegated_voucher_lock: Arc<tokio::sync::Mutex<()>>,
@@ -295,14 +294,6 @@ impl SessionOperatorRuntime {
             .lock()
             .ok()
             .and_then(|signer| signer.clone())
-    }
-
-    fn payment_channel_payer_signer(&self) -> Option<Arc<dyn TransactionSigner>> {
-        self.payment_channel_payer_signer
-            .lock()
-            .ok()
-            .and_then(|signer| signer.clone())
-            .or_else(|| self.payment_channel_signer())
     }
 
     /// Push the latest accepted cumulative voucher on-chain without sealing
@@ -534,17 +525,12 @@ impl SessionOperatorRuntime {
         // `settle_and_finalize` requires the **merchant** (recipient) to sign,
         // and for client-voucher pull the recipient is pinned to the settlement
         // signer — so the worker must sign with that. The channel's `rent_payer`
-        // (the advertised operator / channel payer, distinct in sandbox) is a
-        // *non-signer* account on `distribute`; it only has to equal the
-        // channel's stored rent_payer (else 0xA InvalidChannelRentPayer). Keeping
-        // these separate fixes both the rent-payer check and the merchant sig.
+        // is a *non-signer* account on `distribute` that must equal the one
+        // recorded at open (else 0xA InvalidChannelRentPayer); it is read from
+        // stored and on-chain state, never inferred from a signer.
         let Some(signer) = self.payment_channel_signer() else {
             return Ok(None);
         };
-        let rent_payer = self
-            .payment_channel_payer_signer()
-            .map(|s| s.pubkey())
-            .unwrap_or_else(|| signer.pubkey());
         let tx_pipeline = self.transaction_pipeline().await?;
         let authorized_signer = params.authorized_signer.ok_or_else(|| {
             Error::Mpp("payment-channel settlement missing authorized signer".to_string())
@@ -563,11 +549,17 @@ impl SessionOperatorRuntime {
         // fails with VoucherWatermarkNotMonotonic (0xEA). When chain already
         // has the latest accepted watermark, seal it without another voucher.
         let channel_id = params.channel_id.to_string();
-        let onchain_settled = self
-            .fetch_payment_channel(&channel_id)
-            .await?
+        let onchain = self.fetch_payment_channel(&channel_id).await?;
+        let onchain_settled = onchain
+            .as_ref()
             .map(|channel| channel.settlement.settled)
             .unwrap_or_default();
+        let rent_payer = close_rent_payer(
+            params.rent_payer,
+            onchain
+                .as_ref()
+                .map(|channel| solana_pubkey::Pubkey::from(channel.rent_payer.to_bytes())),
+        )?;
         let voucher_required = close_voucher_required(onchain_settled, params.settled);
         let signature = match (voucher_required, params.voucher_signature.as_deref()) {
             (false, _) => None,
@@ -658,6 +650,23 @@ async fn settlement_tx_version(rpc_url: Option<String>) -> pay_kit::core::tx::Tx
     })
     .await
     .unwrap_or(pay_kit::core::tx::TxVersion::V0)
+}
+
+/// The rent payer a close must name: the one recorded at open, cross-checked
+/// against a fresh channel read when there is one.
+fn close_rent_payer(
+    stored: Option<solana_pubkey::Pubkey>,
+    onchain: Option<solana_pubkey::Pubkey>,
+) -> Result<solana_pubkey::Pubkey> {
+    match (stored, onchain) {
+        (Some(stored), Some(onchain)) if stored != onchain => Err(Error::Mpp(format!(
+            "payment-channel rent payer {stored} recorded at open does not match on-chain {onchain}"
+        ))),
+        (Some(rent_payer), _) | (None, Some(rent_payer)) => Ok(rent_payer),
+        (None, None) => Err(Error::Mpp(
+            "payment-channel settlement has no recorded rent payer".to_string(),
+        )),
+    }
 }
 
 fn close_voucher_required(onchain_settled: u64, latest_accepted: u64) -> bool {
@@ -1592,7 +1601,6 @@ impl SessionMpp {
                     .to_string()
                 }),
             payment_channel_signer: Arc::clone(&payment_channel_signer),
-            payment_channel_payer_signer: Arc::clone(&payment_channel_payer_signer),
             committed_watermarks: Arc::clone(&committed_watermarks),
             reserved_capacity: Arc::clone(&reserved_capacity),
             delegated_voucher_lock,
@@ -4166,6 +4174,29 @@ mod tests {
             error.to_string().contains("Unrecognized session action"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn close_names_the_rent_payer_recorded_at_open() {
+        let operator = solana_pubkey::Pubkey::new_unique();
+        let client_payer = solana_pubkey::Pubkey::new_unique();
+        // A client-funded channel distributes rent back to the client.
+        assert_eq!(
+            close_rent_payer(Some(client_payer), Some(client_payer)).unwrap(),
+            client_payer
+        );
+        assert_eq!(
+            close_rent_payer(Some(client_payer), None).unwrap(),
+            client_payer
+        );
+        assert_eq!(
+            close_rent_payer(None, Some(client_payer)).unwrap(),
+            client_payer
+        );
+        // Stored and on-chain state disagreeing, or neither known, is refused
+        // rather than guessed from the operator signer.
+        assert!(close_rent_payer(Some(operator), Some(client_payer)).is_err());
+        assert!(close_rent_payer(None, None).is_err());
     }
 
     #[tokio::test]
