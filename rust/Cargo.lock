@@ -5040,6 +5040,7 @@ dependencies = [
  "opentelemetry_sdk",
  "pay-api-core",
  "pay-api-types",
+ "pay-types",
  "redis",
  "reqwest 0.12.28",
  "serde",

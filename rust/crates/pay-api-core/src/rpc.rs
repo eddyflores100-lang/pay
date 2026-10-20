@@ -405,6 +405,51 @@ impl RpcClient {
         Ok(Some(entry))
     }
 
+    /// `getSignatureStatuses` with `searchTransactionHistory`: the slot of the
+    /// state the answer reflects, and one entry per signature (`Null` when
+    /// the cluster does not know it).
+    pub async fn get_signature_statuses(
+        &self,
+        rpc_url: &str,
+        signatures: &[String],
+    ) -> Result<(u64, Vec<Value>)> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignatureStatuses",
+            "params": [signatures, { "searchTransactionHistory": true }],
+        });
+        let result = self.post_rpc_value(rpc_url, body).await?;
+        let slot = result
+            .pointer("/context/slot")
+            .and_then(Value::as_u64)
+            .ok_or(Error::RpcMalformed)?;
+        let entries = result
+            .get("value")
+            .and_then(Value::as_array)
+            .filter(|entries| entries.len() == signatures.len())
+            .ok_or(Error::RpcMalformed)?;
+        Ok((slot, entries.clone()))
+    }
+
+    /// `getEpochInfo` at `finalized` commitment: `(absolute slot, block height)`.
+    pub async fn get_finalized_tip(&self, rpc_url: &str) -> Result<(u64, u64)> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getEpochInfo",
+            "params": [{ "commitment": "finalized" }],
+        });
+        let result = self.post_rpc_value(rpc_url, body).await?;
+        match (
+            result.get("absoluteSlot").and_then(Value::as_u64),
+            result.get("blockHeight").and_then(Value::as_u64),
+        ) {
+            (Some(slot), Some(height)) => Ok((slot, height)),
+            _ => Err(Error::RpcMalformed),
+        }
+    }
+
     /// `getMinimumBalanceForRentExemption` for a byte length.
     pub async fn get_minimum_balance_for_rent_exemption(
         &self,

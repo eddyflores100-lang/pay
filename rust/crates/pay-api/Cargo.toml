@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 pay-api-core = { path = "../pay-api-core" }
 pay-api-types = { path = "../pay-api-types" }
+pay-types = { workspace = true }
 
 axum = { workspace = true }
 chrono = { workspace = true }

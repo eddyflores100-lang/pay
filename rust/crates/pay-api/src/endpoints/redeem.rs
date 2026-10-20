@@ -26,6 +26,10 @@ use pay_api_core::ata::{ATA_PROGRAM_ID, associated_token_address};
 use pay_api_core::receipt::MEMO_PROGRAM;
 use pay_api_types::Network;
 use pay_kit::mpp::solana_keychain::TransactionSigner;
+use pay_types::landing::{
+    ChainState, ChainTip, Landing, RecordedPayout, Replaceable, SignatureStatuses,
+    confirm_not_landed, signature_status_from_rpc,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use solana_instruction::{AccountMeta, Instruction};
@@ -336,19 +340,23 @@ async fn reconcile_existing_claim(
         }
     };
 
-    let status = match state
-        .rpc
-        .get_signature_status(rpc_url, &signature.to_string())
-        .await
-    {
-        Ok(status) => status,
+    let cluster = Cluster {
+        rpc: &state.rpc,
+        rpc_url,
+    };
+    let payout = RecordedPayout {
+        signature: signature.to_string(),
+        last_valid_block_height,
+    };
+    let landing = match confirm_not_landed(&cluster, std::slice::from_ref(&payout)).await {
+        Ok(mut landings) => landings.pop().unwrap_or(Landing::Unknown),
         Err(error) => {
-            warn!(%error, %signature, "redemption reconciliation status lookup failed");
+            warn!(%error, %signature, "redemption reconciliation lookup failed");
             return Err(err_resp(StatusCode::BAD_GATEWAY, "redemption claim failed"));
         }
     };
-    match classify_signature_status(status.as_ref()) {
-        PayoutStatus::Confirmed => {
+    match landing {
+        Landing::Confirmed => {
             if let Err(error) = transition_claim(
                 cfg,
                 code,
@@ -361,25 +369,34 @@ async fn reconcile_existing_claim(
             }
             Err(already_redeemed_resp(&signature))
         }
-        PayoutStatus::Failed => release_reconciled_claim(cfg, code, &raw).await,
-        PayoutStatus::Pending if status.is_none() => {
-            // Unknown to the cluster: release only once its blockhash has
-            // expired at finalized commitment, after which it can never land.
-            let Some(last_valid) = last_valid_block_height else {
-                return Err(pending_resp(&signature));
-            };
-            match state.rpc.get_finalized_block_height(rpc_url).await {
-                Ok(height) if height > last_valid => {
-                    release_reconciled_claim(cfg, code, &raw).await
-                }
-                Ok(_) => Err(pending_resp(&signature)),
-                Err(error) => {
-                    warn!(%error, "redemption reconciliation block height lookup failed");
-                    Err(err_resp(StatusCode::BAD_GATEWAY, "redemption claim failed"))
-                }
-            }
-        }
-        PayoutStatus::Pending => Err(pending_resp(&signature)),
+        Landing::Replaceable(proof) => release_reconciled_claim(cfg, code, &raw, proof).await,
+        Landing::MayLand | Landing::Unknown => Err(pending_resp(&signature)),
+    }
+}
+
+/// The cluster `rpc_url` serves, as [`confirm_not_landed`] reads it.
+struct Cluster<'a> {
+    rpc: &'a pay_api_core::RpcClient,
+    rpc_url: &'a str,
+}
+
+impl ChainState for Cluster<'_> {
+    type Error = Error;
+
+    async fn finalized_tip(&self) -> Result<ChainTip, Error> {
+        let (slot, block_height) = self.rpc.get_finalized_tip(self.rpc_url).await?;
+        Ok(ChainTip { slot, block_height })
+    }
+
+    async fn signature_statuses(&self, signatures: &[String]) -> Result<SignatureStatuses, Error> {
+        let (context_slot, entries) = self
+            .rpc
+            .get_signature_statuses(self.rpc_url, signatures)
+            .await?;
+        Ok(SignatureStatuses {
+            context_slot,
+            statuses: entries.iter().map(signature_status_from_rpc).collect(),
+        })
     }
 }
 
@@ -388,6 +405,7 @@ async fn release_reconciled_claim(
     cfg: &RedemptionState,
     code: &str,
     raw: &str,
+    _proof: Replaceable,
 ) -> Result<(), Response> {
     match transition_claim(cfg, code, raw, None).await {
         Ok(_) => Ok(()),
@@ -1240,6 +1258,10 @@ pub(crate) mod tests {
 
         pub(super) struct MockRpc {
             pub(super) send_mode: SendMode,
+            /// Slot of the state `getSignatureStatuses` answers from.
+            pub(super) status_slot: u64,
+            /// Status every sent signature takes once the finalized tip is read.
+            pub(super) lands_after_tip_read: Option<Value>,
             pub(super) sent: Vec<Signature>,
             pub(super) statuses: HashMap<String, Value>,
             /// Status applied to every signature sent from now on.
@@ -1253,6 +1275,8 @@ pub(crate) mod tests {
             fn default() -> Self {
                 Self {
                     send_mode: SendMode::Accept,
+                    status_slot: 10,
+                    lands_after_tip_read: None,
                     sent: Vec::new(),
                     statuses: HashMap::new(),
                     next_status: Some(confirmed()),
@@ -1280,6 +1304,14 @@ pub(crate) mod tests {
             let mut mock = mock.lock().unwrap();
             let method = body["method"].as_str().unwrap_or_default();
             let result = match method {
+                "getEpochInfo" => {
+                    if let Some(status) = mock.lands_after_tip_read.take() {
+                        for signature in mock.sent.clone() {
+                            mock.statuses.insert(signature.to_string(), status.clone());
+                        }
+                    }
+                    json!({ "absoluteSlot": 10, "blockHeight": mock.block_height })
+                }
                 "getLatestBlockhash" => json!({
                     "context": { "slot": 1 },
                     "value": {
@@ -1318,7 +1350,7 @@ pub(crate) mod tests {
                 "getSignatureStatuses" => {
                     let signature = body["params"][0][0].as_str().unwrap_or_default();
                     json!({
-                        "context": { "slot": 1 },
+                        "context": { "slot": mock.status_slot },
                         "value": [mock.statuses.get(signature).cloned().unwrap_or(Value::Null)]
                     })
                 }
@@ -1608,6 +1640,61 @@ pub(crate) mod tests {
             let sent = h.sent();
             assert_eq!(sent.len(), 2);
             assert_eq!(h.claim().await, Some(ClaimState::Confirmed(sent[1])));
+        }
+
+        #[tokio::test]
+        async fn a_payout_landing_just_before_expiry_is_never_repaid() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            h.rpc.lock().unwrap().next_status = None;
+            let destination = Pubkey::new_unique();
+            let (status, _) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+            let first = h.sent()[0];
+
+            // It lands as the tip moves past its expiry: absent to a status
+            // read taken before the tip, confirmed to one taken after it.
+            {
+                let mut rpc = h.rpc.lock().unwrap();
+                rpc.block_height = 101;
+                rpc.lands_after_tip_read = Some(confirmed());
+            }
+            let (status, body) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["signature"], first.to_string());
+            assert_eq!(h.sent().len(), 1);
+            assert_eq!(h.claim().await, Some(ClaimState::Confirmed(first)));
+        }
+
+        #[tokio::test]
+        async fn statuses_older_than_the_finalized_tip_keep_the_claim() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            h.rpc.lock().unwrap().next_status = None;
+            let destination = Pubkey::new_unique();
+            let (status, _) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+            {
+                let mut rpc = h.rpc.lock().unwrap();
+                rpc.block_height = 101;
+                rpc.status_slot = 9;
+            }
+            let (status, _) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+            assert_eq!(h.sent().len(), 1);
+
+            // Positive control: current statuses let the expired claim go.
+            {
+                let mut rpc = h.rpc.lock().unwrap();
+                rpc.status_slot = 10;
+                rpc.last_valid_block_height = 200;
+                rpc.next_status = Some(confirmed());
+            }
+            let (status, body) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(h.sent().len(), 2);
         }
 
         #[tokio::test]
