@@ -3541,6 +3541,7 @@ mod tests {
                 available_base_units: 50_000,
                 authorized_base_units: CAP,
                 verified_payer: None,
+                request_body_bytes: None,
                 _reservation: Some(lease),
             };
             let body = if broken {

@@ -187,6 +187,9 @@ pub struct SessionForward {
     /// Payer identity verified by the reusable session proof. Internal
     /// upstream services use this as their tenant boundary.
     pub verified_payer: Option<String>,
+    /// Exact size of the request body the adapter forwarded upstream, when it
+    /// buffered it: the bound for input usage the provider does not report.
+    pub request_body_bytes: Option<u64>,
     /// Releases the exclusive capacity reservation on every terminal path.
     pub(crate) _reservation: Option<DelegatedCapacityLease>,
 }
@@ -240,6 +243,7 @@ impl SessionForward {
             available_base_units: capacity_base_units.0,
             authorized_base_units: capacity_base_units.1,
             verified_payer: Some(verified_payer),
+            request_body_bytes: None,
             _reservation: Some(reservation),
         }
     }
@@ -2696,6 +2700,7 @@ async fn session_authorized(
                     available_base_units: per_request_base_units,
                     authorized_base_units: state.deposit,
                     verified_payer: Some(state.payer.clone()),
+                    request_body_bytes: None,
                     _reservation: Some(reservation),
                 })),
                 receipt: signature
@@ -2723,6 +2728,7 @@ async fn session_authorized(
                     available_base_units: 0,
                     authorized_base_units: cumulative,
                     verified_payer,
+                    request_body_bytes: None,
                     _reservation: None,
                 })
             }),

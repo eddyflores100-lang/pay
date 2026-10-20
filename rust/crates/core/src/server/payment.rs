@@ -164,6 +164,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                                 Ok(result) => result,
                                 Err(response) => return response,
                             };
+                        sf.request_body_bytes = restored.body().size_hint().exact();
                         req = restored;
                         if let Some(plan) = sf.metered_plan_mut() {
                             plan.variant_hint = body_variant;
@@ -570,8 +571,15 @@ pub(super) async fn settle_axum_delegated_response(
     }
     if is_sse && session_stream::DelegatedSessionStreamMeter::supports(&forward) {
         let (mut parts, body) = response.into_parts();
+        let request_body_bytes = forward.request_body_bytes;
         let meter = match session_stream::DelegatedSessionStreamMeter::from_forward(forward) {
-            Ok(meter) => meter.with_observer(observer),
+            Ok(meter) => {
+                let meter = meter.with_observer(observer);
+                match request_body_bytes {
+                    Some(bytes) => meter.with_request_body_bytes(bytes),
+                    None => meter,
+                }
+            }
             Err(error) => {
                 tracing::error!(%error, "failed to configure delegated session stream metering");
                 return Response::builder()
@@ -1383,6 +1391,35 @@ apis:
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["stream_options"]["include_usage"], true);
+    }
+
+    #[tokio::test]
+    async fn metered_body_reports_its_forwarded_size_without_content_length() {
+        // A chunked request carries no Content-Length; the buffered body the
+        // gateway forwards is what bounds unreported input usage.
+        let original = br#"{"model":"premium","stream":true,"messages":[{"role":"user","content":"long prompt"}]}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from_stream(futures_util::stream::iter([Ok::<
+                _,
+                std::io::Error,
+            >(
+                bytes::Bytes::from_static(original),
+            )])))
+            .unwrap();
+        assert_eq!(request.body().size_hint().exact(), None);
+        let (request, _) = prepare_metered_request_body(request, true).await.unwrap();
+        let forwarded = request.body().size_hint().exact().unwrap();
+        let body = axum::body::to_bytes(request.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(forwarded, body.len() as u64);
+        assert!(
+            forwarded > original.len() as u64,
+            "stream usage was injected"
+        );
     }
 
     #[tokio::test]
