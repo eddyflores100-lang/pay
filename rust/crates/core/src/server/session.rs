@@ -591,28 +591,14 @@ impl SessionOperatorRuntime {
                 ));
             }
         };
-        let expires_at = params.voucher_expires_at.unwrap_or(0);
-
-        let mut instructions =
-            pay_kit::mpp::program::payment_channels::build_settle_and_seal_instructions(
-                &params.recipient,
-                &params.channel_id,
-                &authorized_signer,
-                signature.as_ref(),
-                params.settled,
-                expires_at,
-                &params.program_id,
-            )
-            .map_err(|e| Error::Mpp(format!("failed to build settlement instruction: {e}")))?;
-        let distribution = SealParams {
-            rent_payer: Some(rent_payer),
-            ..params.clone()
-        };
-        instructions.push(
-            distribution
-                .distribute_instruction(&treasury, &token_program)
-                .map_err(|error| Error::Mpp(format!("failed to build distribution: {error}")))?,
-        );
+        let instructions = close_instructions(
+            params,
+            &authorized_signer,
+            signature.as_ref(),
+            rent_payer,
+            &treasury,
+            &token_program,
+        )?;
 
         // Route through the shared batched worker: concurrent closes pack into
         // shared transactions, signed once by the operator and broadcast.
@@ -670,6 +656,38 @@ async fn settlement_tx_version(rpc_url: Option<String>) -> pay_kit::core::tx::Tx
     })
     .await
     .unwrap_or(pay_kit::core::tx::TxVersion::V0)
+}
+
+/// The atomic settle-and-seal plus distribute instructions closing a channel.
+fn close_instructions(
+    params: &SealParams,
+    authorized_signer: &solana_pubkey::Pubkey,
+    signature: Option<&[u8; 64]>,
+    rent_payer: solana_pubkey::Pubkey,
+    treasury: &solana_pubkey::Pubkey,
+    token_program: &solana_pubkey::Pubkey,
+) -> Result<Vec<solana_instruction::Instruction>> {
+    let mut instructions =
+        pay_kit::mpp::program::payment_channels::build_settle_and_seal_instructions(
+            &params.recipient,
+            &params.channel_id,
+            authorized_signer,
+            signature,
+            params.settled,
+            params.voucher_expires_at.unwrap_or(0),
+            &params.program_id,
+        )
+        .map_err(|e| Error::Mpp(format!("failed to build settlement instruction: {e}")))?;
+    let distribution = SealParams {
+        rent_payer: Some(rent_payer),
+        ..params.clone()
+    };
+    instructions.push(
+        distribution
+            .distribute_instruction(treasury, token_program)
+            .map_err(|error| Error::Mpp(format!("failed to build distribution: {error}")))?,
+    );
+    Ok(instructions)
 }
 
 /// The rent payer a close must name: the one recorded at open, cross-checked
@@ -4145,6 +4163,61 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         url
+    }
+
+    #[test]
+    fn a_split_heavy_close_settles_only_on_version_one() {
+        use pay_kit::core::tx::{TxVersion, build_unsigned_fitting};
+        let pubkey = |byte: u8| solana_pubkey::Pubkey::new_from_array([byte; 32]);
+        let operator = pubkey(0xAA);
+        let params = SealParams {
+            channel_id: pubkey(0x10),
+            authorized_signer: Some(operator),
+            payer: Some(pubkey(0x20)),
+            rent_payer: Some(pubkey(0x20)),
+            mint: Some(pubkey(0x21)),
+            program_id: pay_kit::core::payment_channels::default_program_id(),
+            channel_version: None,
+            channel_hooks: None,
+            settled: 1_000,
+            voucher_signature: None,
+            voucher_expires_at: None,
+            recipient: operator,
+            splits: (0..8u8)
+                .map(|index| pay_kit::mpp::server::session::Split {
+                    recipient: pubkey(0x40 + index),
+                    bps: 1_250,
+                })
+                .collect(),
+            distribution_hash: [0; 32],
+        };
+        let close = close_instructions(
+            &params,
+            &operator,
+            Some(&[7; 64]),
+            pubkey(0x20),
+            &pubkey(0x22),
+            &pubkey(0x23),
+        )
+        .unwrap();
+        let blockhash = solana_hash::Hash::new_unique();
+        // A V0-only cluster cannot carry it; the version the worker resolves
+        // on a V1 cluster can.
+        assert!(
+            build_unsigned_fitting(&[TxVersion::V0], &operator, &close, blockhash, None).is_err()
+        );
+        let tx = build_unsigned_fitting(
+            &[TxVersion::V0, TxVersion::V1],
+            &operator,
+            &close,
+            blockhash,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            tx.message,
+            solana_message::VersionedMessage::V1(_)
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]
