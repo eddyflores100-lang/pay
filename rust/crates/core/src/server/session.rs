@@ -154,6 +154,8 @@ pub mod terminal_errors {
     pub const PREDATES_PROOF_BINDING: &str = "predates proof binding";
     /// The bearer proof presented doesn't match what was bound at open.
     pub const PROOF_MISMATCH: &str = "does not match the proof bound at open";
+    /// The channel was closed, sealed or distributed on-chain.
+    pub const CLOSED_ONCHAIN: &str = "payment channel is no longer open on-chain";
 }
 fn session_close_already_finalized(message: &str) -> bool {
     message.contains("already finalized")
@@ -681,9 +683,10 @@ fn require_open_onchain(rpc_configured: bool, status: Option<u8>) -> Result<()> 
     match status {
         Some(OPEN) => Ok(()),
         None if !rpc_configured => Ok(()),
-        _ => Err(Error::PaymentRejected(
-            "payment channel is no longer open on-chain; open a new session".to_string(),
-        )),
+        _ => Err(Error::PaymentRejected(format!(
+            "{}; open a new session",
+            terminal_errors::CLOSED_ONCHAIN
+        ))),
     }
 }
 
@@ -4287,7 +4290,12 @@ mod tests {
             ChannelStatus::Closing,
             ChannelStatus::Distributed,
         ] {
-            assert!(require_open_onchain(true, Some(terminal as u8)).is_err());
+            let error = require_open_onchain(true, Some(terminal as u8)).unwrap_err();
+            // Payer proxies key cached-session eviction on this text.
+            assert!(
+                error.to_string().contains(terminal_errors::CLOSED_ONCHAIN),
+                "{error}"
+            );
         }
         // Gone from chain entirely: closed and reclaimed.
         assert!(require_open_onchain(true, None).is_err());
