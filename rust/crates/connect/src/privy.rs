@@ -690,7 +690,9 @@ impl crate::tenants::SpendHistory for OnChainSpendHistory {
                                             "maxSupportedTransactionVersion": 0 }]),
                     )
                     .await?;
-                raw = raw.saturating_add(stablecoin_outflow(&tx, wallet));
+                let tx: ConfirmedTransaction = serde_json::from_value(tx)
+                    .map_err(|e| format!("getTransaction {signature}: history unavailable: {e}"))?;
+                raw = raw.saturating_add(tx.stablecoin_outflow(wallet));
             }
             if page.len() < HISTORY_PAGE {
                 return Ok(raw.div_ceil(100));
@@ -700,35 +702,50 @@ impl crate::tenants::SpendHistory for OnChainSpendHistory {
     }
 }
 
-/// Raw six-decimal stablecoin units `owner`'s token accounts lost in `tx`.
-fn stablecoin_outflow(tx: &serde_json::Value, owner: &str) -> u64 {
-    let meta = &tx["meta"];
-    if !meta["err"].is_null() {
-        return 0;
+/// A `getTransaction` result with its status metadata. A null result or null
+/// meta does not deserialize, so missing history can't count as zero spend.
+#[derive(Deserialize)]
+struct ConfirmedTransaction {
+    meta: TransactionMeta,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TransactionMeta {
+    err: Option<serde_json::Value>,
+    pre_token_balances: Vec<serde_json::Value>,
+    post_token_balances: Vec<serde_json::Value>,
+}
+
+impl ConfirmedTransaction {
+    /// Raw six-decimal stablecoin units `owner`'s token accounts lost.
+    fn stablecoin_outflow(&self, owner: &str) -> u64 {
+        if self.meta.err.is_some() {
+            return 0;
+        }
+        let balances = |entries: &[serde_json::Value]| -> BTreeMap<u64, u64> {
+            entries
+                .iter()
+                .filter(|b| b["owner"].as_str() == Some(owner))
+                .filter(|b| {
+                    b["mint"]
+                        .as_str()
+                        .is_some_and(pay_kit::mpp::protocol::solana::is_known_stablecoin_mint)
+                })
+                .filter_map(|b| {
+                    Some((
+                        b["accountIndex"].as_u64()?,
+                        b["uiTokenAmount"]["amount"].as_str()?.parse().ok()?,
+                    ))
+                })
+                .collect()
+        };
+        let pre = balances(&self.meta.pre_token_balances);
+        let post = balances(&self.meta.post_token_balances);
+        pre.iter()
+            .map(|(index, before)| before.saturating_sub(post.get(index).copied().unwrap_or(0)))
+            .fold(0, u64::saturating_add)
     }
-    let balances = |key: &str| -> BTreeMap<u64, u64> {
-        meta[key]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|b| b["owner"].as_str() == Some(owner))
-            .filter(|b| {
-                b["mint"]
-                    .as_str()
-                    .is_some_and(pay_kit::mpp::protocol::solana::is_known_stablecoin_mint)
-            })
-            .filter_map(|b| {
-                Some((
-                    b["accountIndex"].as_u64()?,
-                    b["uiTokenAmount"]["amount"].as_str()?.parse().ok()?,
-                ))
-            })
-            .collect()
-    };
-    let (pre, post) = (balances("preTokenBalances"), balances("postTokenBalances"));
-    pre.iter()
-        .map(|(index, before)| before.saturating_sub(post.get(index).copied().unwrap_or(0)))
-        .fold(0, u64::saturating_add)
 }
 
 /// The tenant subject for a Privy user.
@@ -1314,19 +1331,24 @@ pub(crate) mod tests {
                 balance(3, ADDRESS, "So11111111111111111111111111111111111111112", 0),
             ],
         }});
-        assert_eq!(stablecoin_outflow(&tx, ADDRESS), 1_250_000);
-        assert_eq!(
-            stablecoin_outflow(&tx, "someone"),
-            0,
-            "an inflow is not spend"
-        );
+        let outflow = |tx: &serde_json::Value, owner: &str| {
+            serde_json::from_value::<ConfirmedTransaction>(tx.clone())
+                .unwrap()
+                .stablecoin_outflow(owner)
+        };
+        assert_eq!(outflow(&tx, ADDRESS), 1_250_000);
+        assert_eq!(outflow(&tx, "someone"), 0, "an inflow is not spend");
         let mut failed = tx.clone();
         failed["meta"]["err"] = json!({ "InstructionError": [0, "Custom"] });
-        assert_eq!(stablecoin_outflow(&failed, ADDRESS), 0);
+        assert_eq!(outflow(&failed, ADDRESS), 0);
         // A closed account (absent afterwards) spent everything it held.
         let mut closed = tx;
         closed["meta"]["postTokenBalances"] = json!([]);
-        assert_eq!(stablecoin_outflow(&closed, ADDRESS), 5_000_000);
+        assert_eq!(outflow(&closed, ADDRESS), 5_000_000);
+        // Unavailable history is not zero spend.
+        for missing in [json!(null), json!({ "meta": null })] {
+            assert!(serde_json::from_value::<ConfirmedTransaction>(missing).is_err());
+        }
     }
 
     #[tokio::test]
@@ -1377,6 +1399,66 @@ pub(crate) mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn unavailable_transaction_history_leaves_the_wallet_unseeded() {
+        use crate::tenants::{SpendHistory, TenantRegistry};
+        use pay_kit::mpp::protocol::solana::mints;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let spend_rpc = |transaction: serde_json::Value| async move {
+            let rpc = move |Json(request): Json<serde_json::Value>| {
+                let transaction = transaction.clone();
+                async move {
+                    let result = match request["method"].as_str().unwrap() {
+                        "getSignaturesForAddress" => {
+                            json!([{ "signature": "today", "blockTime": now, "err": null }])
+                        }
+                        "getTransaction" => transaction,
+                        other => panic!("{other}"),
+                    };
+                    Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+                }
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, Router::new().route("/", post(rpc)))
+                    .await
+                    .unwrap();
+            });
+            OnChainSpendHistory::new(format!("http://{addr}/"))
+        };
+        let mut credentials = pay_core::remote::Credentials::new();
+        credentials.insert("secret_key".to_string(), "sk_test_1".to_string());
+        let tenant = TenantRecord {
+            subject: "sub_1".to_string(),
+            account_name: "grok".to_string(),
+            provider: PROVIDER_ID.to_string(),
+            wallet_id: "w_1".to_string(),
+            pubkey: ADDRESS.to_string(),
+            credentials,
+            policy: pay_mcp::policy::SpendPolicy::dollars(1.0, 5.0),
+        };
+        let registry = TenantRegistry::new();
+        for missing in [json!(null), json!({ "meta": null })] {
+            let history = spend_rpc(missing.clone()).await;
+            let error = history.spent_today(ADDRESS).await.unwrap_err();
+            assert!(error.contains("history unavailable"), "{missing}: {error}");
+            assert!(registry.seed_spend(&tenant, &history).await.is_err());
+        }
+        // A failed seed left the wallet unseeded: complete history still lands.
+        let full = spend_rpc(json!({ "meta": { "err": null,
+            "preTokenBalances": [{ "accountIndex": 1, "owner": ADDRESS, "mint": mints::USDC_MAINNET,
+                                   "uiTokenAmount": { "amount": "5000000" } }],
+            "postTokenBalances": [] } }))
+        .await;
+        assert_eq!(full.spent_today(ADDRESS).await.unwrap(), 50_000);
+        registry.seed_spend(&tenant, &full).await.unwrap();
+        assert!(registry.reserve_cli_transaction(&tenant, 1).is_err());
     }
 
     #[tokio::test]
