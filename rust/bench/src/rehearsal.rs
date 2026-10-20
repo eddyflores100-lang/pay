@@ -651,8 +651,9 @@ mod tests {
         let (challenge, _) = SessionHandle::parse_challenge(&header).unwrap();
         let request: pay_kit::mpp::SessionRequest = challenge.request.decode().unwrap();
         assert_eq!(request.currency, local_usdc_currency().unwrap());
+        let price: u64 = request.amount.parse().unwrap();
         let handle = seeded_session::handle_for_challenge(&cfg.run.name, 0, challenge).unwrap();
-        let voucher = handle.voucher_header(1).await.unwrap();
+        let voucher = handle.voucher_header(price).await.unwrap();
         let response = client
             .post(format!("{}/v1/charge", proxy.url))
             .header("host", HOST_HEADER)
