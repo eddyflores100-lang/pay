@@ -223,6 +223,8 @@ pub fn build_credential_with_override(
     // signs v0 only); the kit negotiates against what the server advertises.
     let options = BuildChargeTransactionOptions {
         max_tx_version: signer.max_tx_version(),
+        // Split ATA rent would be spent outside the approved amount.
+        allow_payer_funded_ata_creation: false,
         ..Default::default()
     };
     let header = if let Some(hooks) = channel_hooks {
@@ -677,6 +679,99 @@ fn format_amount(amount: &str, currency: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ephemeral_mainnet_store() -> crate::accounts::MemoryAccountsStore {
+        const KEYPAIR: [u8; 64] = [
+            41, 99, 180, 88, 51, 57, 48, 80, 61, 63, 219, 75, 176, 49, 116, 254, 227, 176, 196,
+            204, 122, 47, 166, 133, 155, 252, 217, 0, 253, 17, 49, 143, 47, 94, 121, 167, 195, 136,
+            72, 22, 157, 48, 77, 88, 63, 96, 57, 122, 181, 243, 236, 188, 241, 134, 174, 224, 100,
+            246, 17, 170, 104, 17, 151, 48,
+        ];
+        let mut file = crate::accounts::AccountsFile::default();
+        file.upsert(
+            "mainnet",
+            "default",
+            crate::accounts::Account {
+                backend: crate::accounts::BackendKind::Ephemeral,
+                provider: None,
+                active: true,
+                auth_required: Some(false),
+                pubkey: Some("4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR".to_string()),
+                vault: None,
+                account: None,
+                path: None,
+                secret_key_b58: Some(bs58::encode(KEYPAIR).into_string()),
+                created_at: None,
+                subscriptions: Default::default(),
+            },
+        );
+        crate::accounts::MemoryAccountsStore::with_file(file)
+    }
+
+    fn split_charge(fee_payer: bool) -> Challenge {
+        let mut details = serde_json::json!({
+            "network": "mainnet",
+            "decimals": 6,
+            "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "recentBlockhash": "11111111111111111111111111111111",
+            "splits": (0..8).map(|i| serde_json::json!({
+                "recipient": solana_pubkey::Pubkey::new_from_array([i + 1; 32]).to_string(),
+                "amount": "1",
+                "ataCreationRequired": true,
+            })).collect::<Vec<_>>(),
+        });
+        if fee_payer {
+            details["feePayer"] = true.into();
+            details["feePayerKey"] = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".into();
+        }
+        pay_kit::mpp::PaymentChallenge::new(
+            "id",
+            "realm",
+            "solana",
+            "charge",
+            pay_kit::mpp::Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "9",
+                "currency": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "recipient": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+                "methodDetails": details,
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn split_ata_rent_is_never_charged_to_the_payer_outside_the_amount() {
+        let store = ephemeral_mainnet_store();
+        let err = build_credential_with_override(
+            &split_charge(false),
+            &store,
+            Some("mainnet"),
+            None,
+            Some("https://attacker.example/paid"),
+            None,
+        )
+        .expect_err("payer-funded split ATA rent must be refused");
+        assert!(
+            err.to_string().contains("allow_payer_funded_ata_creation"),
+            "{err}"
+        );
+        // Control: with a server fee payer funding the rent, the guard
+        // does not apply (any remaining failure is unrelated, e.g. RPC).
+        let result = build_credential_with_override(
+            &split_charge(true),
+            &store,
+            Some("mainnet"),
+            None,
+            Some("https://merchant.example/paid"),
+            None,
+        );
+        if let Err(err) = result {
+            assert!(
+                !err.to_string().contains("allow_payer_funded_ata_creation"),
+                "{err}"
+            );
+        }
+    }
 
     #[test]
     fn format_value_zero() {
