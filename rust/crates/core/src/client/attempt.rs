@@ -6,8 +6,8 @@
 //! `payment-identifier`, or the exact signed `upto` header — so the server can
 //! recognise it instead of charging again. A definitive answer clears it.
 
-use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -15,9 +15,11 @@ use sha2::{Digest, Sha256};
 use crate::Result;
 
 type Digest32 = [u8; 32];
+/// Attempt identity and signing scope (payer and network).
+type Slot = (Digest32, Digest32);
 
-/// Material kept for unresolved attempts, by attempt identity then by offer.
-static PENDING: LazyLock<Mutex<HashMap<Digest32, HashMap<Digest32, Pending>>>> =
+/// Material kept for unresolved attempts, by slot then by offer.
+static PENDING: LazyLock<Mutex<HashMap<Slot, HashMap<Digest32, Pending>>>> =
     LazyLock::new(Mutex::default);
 
 struct Pending {
@@ -26,10 +28,22 @@ struct Pending {
 }
 
 /// The identity of one logical paid request: method, URL, and body.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// It remembers the signing scopes its keys were made for, so resolving it
+/// clears only material this payer and network could have filed.
+#[derive(Debug, Clone)]
 pub struct PaymentAttempt {
     identity: Digest32,
+    scopes: Arc<Mutex<HashSet<Digest32>>>,
 }
+
+impl PartialEq for PaymentAttempt {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+
+impl Eq for PaymentAttempt {}
 
 impl PaymentAttempt {
     pub fn new(method: &str, url: &str, body: Option<&[u8]>) -> Self {
@@ -47,12 +61,19 @@ impl PaymentAttempt {
         }
         Self {
             identity: hasher.finalize().into(),
+            scopes: Arc::default(),
         }
     }
 
-    /// The server answered definitively: forget this attempt's material.
+    /// The server answered definitively: forget the material this attempt's
+    /// payers filed. Another wallet's pending material for the same request
+    /// is left for its own retry.
     pub fn resolved(&self) {
-        PENDING.lock().unwrap().remove(&self.identity);
+        let scopes = std::mem::take(&mut *self.scopes.lock().unwrap());
+        let mut pending = PENDING.lock().unwrap();
+        for scope in scopes {
+            pending.remove(&(self.identity, scope));
+        }
     }
 }
 
@@ -61,6 +82,7 @@ impl PaymentAttempt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PaymentCacheKey {
     identity: Digest32,
+    scope: Digest32,
     offer: Digest32,
 }
 
@@ -72,15 +94,22 @@ impl PaymentCacheKey {
         kind: &str,
         terms: &[&str],
     ) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(payer.to_bytes());
-        for part in [network, kind].into_iter().chain(terms.iter().copied()) {
-            hasher.update((part.len() as u64).to_le_bytes());
-            hasher.update(part.as_bytes());
+        let mut scope = Sha256::new();
+        scope.update(payer.to_bytes());
+        scope.update((network.len() as u64).to_le_bytes());
+        scope.update(network.as_bytes());
+        let scope: Digest32 = scope.finalize().into();
+        attempt.scopes.lock().unwrap().insert(scope);
+
+        let mut offer = Sha256::new();
+        for part in std::iter::once(kind).chain(terms.iter().copied()) {
+            offer.update((part.len() as u64).to_le_bytes());
+            offer.update(part.as_bytes());
         }
         Self {
             identity: attempt.identity,
-            offer: hasher.finalize().into(),
+            scope,
+            offer: offer.finalize().into(),
         }
     }
 
@@ -92,10 +121,11 @@ impl PaymentCacheKey {
         make: impl FnOnce() -> Result<String>,
     ) -> Result<String> {
         let now = Instant::now();
+        let slot = (self.identity, self.scope);
         if let Some(pending) = PENDING
             .lock()
             .unwrap()
-            .get(&self.identity)
+            .get(&slot)
             .and_then(|offers| offers.get(&self.offer))
             .filter(|pending| pending.expires > now)
         {
@@ -107,7 +137,7 @@ impl PaymentCacheKey {
             offers.retain(|_, entry| entry.expires > now);
             !offers.is_empty()
         });
-        pending.entry(self.identity).or_default().insert(
+        pending.entry(slot).or_default().insert(
             self.offer,
             Pending {
                 value: value.clone(),
@@ -209,6 +239,44 @@ mod tests {
             base
         );
         attempt.resolved();
+    }
+
+    #[test]
+    fn resolving_one_wallet_keeps_another_wallets_pending_material() {
+        let ttl = Duration::from_secs(60);
+        let mut make = counter();
+        let request = || PaymentAttempt::new("POST", "https://a.example/two-wallets", Some(b"a"));
+        let other_payer = solana_pubkey::Pubkey::new_from_array([2; 32]);
+
+        let wallet_a = request();
+        let a_material = key(&wallet_a, "k", &["t"])
+            .reuse_or_insert(ttl, &mut make)
+            .unwrap();
+
+        // Wallet B issues the same request and gets a definitive answer.
+        let wallet_b = request();
+        let b_key = PaymentCacheKey::new(&wallet_b, &other_payer, "mainnet", "k", &["t"]);
+        let b_material = b_key.reuse_or_insert(ttl, &mut make).unwrap();
+        assert_ne!(a_material, b_material);
+        wallet_b.resolved();
+
+        // A's retry still resends its own material; B's was cleared.
+        let a_retry = request();
+        assert_eq!(
+            key(&a_retry, "k", &["t"])
+                .reuse_or_insert(ttl, &mut make)
+                .unwrap(),
+            a_material
+        );
+        let b_retry = request();
+        assert_ne!(
+            PaymentCacheKey::new(&b_retry, &other_payer, "mainnet", "k", &["t"])
+                .reuse_or_insert(ttl, &mut make)
+                .unwrap(),
+            b_material
+        );
+        a_retry.resolved();
+        b_retry.resolved();
     }
 
     #[test]
