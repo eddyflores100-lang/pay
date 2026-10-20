@@ -1533,7 +1533,9 @@ impl<S: PaymentState> PaymentGate<S> {
         let realm = operator
             .and_then(|o| o.realm.as_deref())
             .or(Some(subdomain));
-        let canonical = format!("https://{subdomain}/");
+        // Authenticate tokens pin the resource they were issued for: this
+        // endpoint, not just the API.
+        let canonical = format!("https://{subdomain}/{}", path.trim_start_matches('/'));
         let defaults = sub::OperatorDefaults {
             puller: &puller,
             recipient: &recipient,

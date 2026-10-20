@@ -425,6 +425,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn tokens_do_not_verify_at_another_endpoint() {
+        let spec = make_spec(Some(PLAN_ID));
+        let server = |uri: &str| {
+            build_handler(&spec, defaults(), "api.example.com", uri)
+                .unwrap()
+                .unwrap()
+        };
+        let feed = server("https://api.example.com/v1/feed");
+        let credential = signed_credential(&feed, PLAN_ID).await;
+        feed.verify(&credential).unwrap();
+        assert!(
+            server("https://api.example.com/v1/admin")
+                .verify(&credential)
+                .is_err()
+        );
+        assert!(
+            build_handler(
+                &spec,
+                defaults(),
+                "other.example.com",
+                "https://api.example.com/v1/feed"
+            )
+            .unwrap()
+            .unwrap()
+            .verify(&credential)
+            .is_err()
+        );
+    }
+
     #[test]
     fn malformed_endpoint_expiry_is_a_config_error() {
         let mut spec = make_spec(Some("Amp9FrnEX17tVeZ7QnHX1Hh4TynhH4sXLRSde797vdKR"));

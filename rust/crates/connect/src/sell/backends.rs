@@ -232,10 +232,15 @@ impl EndpointBackends {
                     decimals: STABLECOIN_DECIMALS,
                     network: network.to_string(),
                     rpc_url: rpc_url.clone(),
-                    challenge_binding_secret: Some(operator.challenge_binding_secret.clone()),
-                    realm: Some(pay_core::server::payment::recipient_derived_charge_realm(
-                        &sale.recipient,
-                    )),
+                    // Scoped to this endpoint, never to a payout profile a
+                    // clone endpoint can copy.
+                    challenge_binding_secret: Some(
+                        pay_core::server::session::endpoint_challenge_binding_secret(
+                            &operator.challenge_binding_secret,
+                            &sale.endpoint_id,
+                        ),
+                    ),
+                    realm: Some(sale.path_prefix()),
                     store: Some(operator.charge_store.clone()),
                     fee_payer: true,
                     fee_payer_signer: Some(operator.signer.clone()),

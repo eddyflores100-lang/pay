@@ -254,6 +254,39 @@ fn x402_exact_backend(
         .with_tx_v1(pay_kit::core::tx::TxV1Mode::Auto))
 }
 
+/// Consumed MPP charge signatures. Replicas behind a deployment policy must
+/// share it; a single hosted gateway without Redis is warned that a restart
+/// forgets which payments were already served.
+async fn charge_replay_store(
+    network: &SolanaNetwork,
+    deployment_policy_mode: bool,
+) -> pay_core::Result<Arc<dyn pay_kit::mpp::store::Store>> {
+    let (store, durable) = replay_store(
+        &["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"],
+        "pay:charge:v1:",
+        "MPP charges",
+    )
+    .await?;
+    if !durable && deployment_policy_mode {
+        return Err(pay_core::Error::Config(
+            "deployment gateways need a shared MPP charge replay store; set PAY_MPP_REDIS_URL"
+                .into(),
+        ));
+    }
+    if !durable && requires_durable_store(network, deployment_policy_mode) {
+        eprintln!(
+            "{}",
+            format!(
+                "warning: MPP charges on {} use an in-memory replay store; set PAY_MPP_REDIS_URL \
+                 before running more than one gateway",
+                network.slug()
+            )
+            .yellow()
+        );
+    }
+    Ok(store)
+}
+
 /// Subscription activation and proof records. A hosted gateway that serves
 /// subscriptions refuses to keep them in process memory.
 async fn subscription_store(
@@ -1918,12 +1951,22 @@ impl StartCommand {
             // (see `payments::spawn_blockhash_cache` for why).
             let blockhash_cache = payments::spawn_blockhash_cache(&rpc_url);
 
+            // Charge challenges are scoped to this API, and every currency's
+            // server shares one replay store for the gateway's lifetime.
+            let charge_realm = api
+                .operator
+                .as_ref()
+                .and_then(|operator| operator.realm.clone())
+                .unwrap_or_else(|| api.subdomain.clone());
+            let charge_store = charge_replay_store(&network, deployment_policy_mode).await?;
             let mpps: Vec<Mpp> = payments::build_charge_mpps(
                 &currency_configs,
                 &recipient,
                 network.slug(),
                 &rpc_url,
                 &challenge_binding_secret,
+                &charge_realm,
+                charge_store,
                 fee_payer,
                 fee_payer_signer.clone(),
                 &blockhash_cache,
