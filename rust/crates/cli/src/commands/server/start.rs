@@ -2833,15 +2833,18 @@ impl StartCommand {
                     let api = api.clone();
                     async move {
                         let (parts, body) = req.into_parts();
-                        // 404 for paths not listed in the spec — prevents OAuth2
-                        // token fetches for browser auto-requests like /favicon.ico.
-                        let path = parts.uri.path().trim_start_matches('/');
-                        if pay_core::server::metering::find_endpoint_by_path(&api, path).is_none() {
+                        // Only a request the payment gate routed to the API
+                        // reaches the upstream.
+                        let Some(route) = parts
+                            .extensions
+                            .get::<pay_core::server::proxy::UpstreamRoute>()
+                            .cloned()
+                        else {
                             return axum::response::IntoResponse::into_response((
                                 axum::http::StatusCode::NOT_FOUND,
                                 axum::Json(serde_json::json!({"error": "not_found"})),
                             ));
-                        }
+                        };
                         let session_context = parts
                             .extensions
                             .get::<pay_core::server::session_stream::SessionStreamContext>()
@@ -2855,6 +2858,7 @@ impl StartCommand {
                             .unwrap_or_default();
                         pay_core::server::proxy::forward_request_with_session_metering_and_identity(
                             &api,
+                            &route,
                             parts.method,
                             &parts.uri,
                             &parts.headers,

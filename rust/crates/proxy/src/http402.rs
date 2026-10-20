@@ -27,9 +27,10 @@ use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use pay_core::PaymentState;
 use pay_core::server::gate::{
     BatchForward, GateDecision, GateRequest, GateResponse, MAX_BATCH_CACHED_RESPONSE_BYTES,
-    PaidRequestTelemetry, PaymentGate, ReceiptAnnotation, SessionForward, UptoPaymentTelemetry,
-    batch_cached_response, cache_batch_response, commit_batch, release_batch, settle_batch,
-    settle_delegated_session as settle_delegated_session_forward, settle_upto, settle_upto_metered,
+    PaidRequestTelemetry, PaymentGate, ReceiptAnnotation, SessionForward, UpstreamRoute,
+    UptoPaymentTelemetry, batch_cached_response, cache_batch_response, commit_batch, release_batch,
+    resolve_api, settle_batch, settle_delegated_session as settle_delegated_session_forward,
+    settle_upto, settle_upto_metered,
 };
 use pay_core::server::metering::{self, UptoSettlementPlan};
 use pay_core::server::payment::{TrustedPaymentIdentity, strip_internal_identity_headers};
@@ -193,11 +194,7 @@ impl<S: PaymentState> Http402Gate<S> {
     /// Resolve the API spec for a host — subdomain match, single-API fallback —
     /// the same resolution [`PaymentGate::evaluate`] uses.
     fn resolve_api<'a>(&'a self, host: &str) -> Option<&'a ApiSpec> {
-        let apis = self.state.apis();
-        let subdomain = host.split('.').next().unwrap_or("");
-        apis.iter()
-            .find(|a| a.subdomain == subdomain)
-            .or_else(|| if apis.len() == 1 { apis.first() } else { None })
+        resolve_api(self.state.apis(), Some(host))
     }
 
     /// Prepare a request whose upstream authentication depends on its body.
@@ -206,20 +203,24 @@ impl<S: PaymentState> Http402Gate<S> {
     // The response-shaped error is consumed immediately by `forward_buffered`;
     // boxing it would add allocation and obscure the existing response path.
     #[allow(clippy::result_large_err)]
+    #[allow(clippy::too_many_arguments)]
     async fn prepare_buffered_request(
         &self,
         api: &ApiSpec,
+        route: &UpstreamRoute,
         method: &http::Method,
         uri: &Uri,
         headers: &http::HeaderMap,
         body: &[u8],
         trusted_identity: Option<&TrustedPaymentIdentity>,
     ) -> Result<UpstreamPlan, axum::response::Response> {
-        prepare_upstream_with_identity(api, method, uri, headers, body, trusted_identity).await
+        prepare_upstream_with_identity(api, route, method, uri, headers, body, trusted_identity)
+            .await
     }
 
-    /// Plan the upstream for a Forward/Passthrough decision: control-plane → the
-    /// internal axum service; otherwise resolve + `prepare_upstream`. Returns
+    /// Plan the upstream for a gate decision: control-plane → the internal axum
+    /// service; otherwise resolve + `prepare_upstream` under the gate's
+    /// `route`, or 404 when the gate admitted none. Returns
     /// `Ok(true)` if a response was written here (respond-mode / not-found /
     /// upstream-prep error), `Ok(false)` to continue to `upstream_peer`.
     #[allow(clippy::too_many_arguments)]
@@ -232,6 +233,7 @@ impl<S: PaymentState> Http402Gate<S> {
         uri: &Uri,
         headers: &http::HeaderMap,
         session: &mut Session,
+        route: Option<&UpstreamRoute>,
         // Whether this request may be served by the internal control-plane axum.
         // Only `Passthrough` (free / discovery) requests qualify; a `Forward`
         // (verified payment) for a root (`path: ""`) endpoint must reach the real
@@ -243,7 +245,7 @@ impl<S: PaymentState> Http402Gate<S> {
             ctx.target = Some(Target::ControlPlane);
             return Ok(false);
         }
-        let Some(api) = self.resolve_api(host.unwrap_or("")) else {
+        let (Some(route), Some(api)) = (route, self.resolve_api(host.unwrap_or(""))) else {
             let _ = session
                 .respond_error_with_body(404, Bytes::from_static(b"{\"error\":\"not_found\"}"))
                 .await;
@@ -254,12 +256,13 @@ impl<S: PaymentState> Http402Gate<S> {
         // these endpoints through the bounded reqwest adapter.
         if routing_signs_request_body(api, path) {
             return self
-                .forward_buffered(session, ctx, path, host, method, uri, headers)
+                .forward_buffered(session, ctx, path, route, host, method, uri, headers)
                 .await;
         }
         // No body-signing auth: an empty placeholder body is safe for prep.
         match prepare_upstream_with_identity(
             api,
+            route,
             method,
             uri,
             headers,
@@ -439,6 +442,7 @@ impl<S: PaymentState> Http402Gate<S> {
         session: &mut Session,
         ctx: &mut Ctx,
         path: &str,
+        route: &UpstreamRoute,
         host: Option<&str>,
         method: &http::Method,
         uri: &Uri,
@@ -446,7 +450,7 @@ impl<S: PaymentState> Http402Gate<S> {
     ) -> pingora::Result<bool> {
         let deadline = ctx.session.as_ref().and_then(|forward| forward.deadline());
         let forwarding =
-            self.forward_buffered_inner(session, ctx, path, host, method, uri, headers);
+            self.forward_buffered_inner(session, ctx, path, route, host, method, uri, headers);
         match deadline {
             Some(deadline) => match tokio::time::timeout_at(deadline, forwarding).await {
                 Ok(result) => result,
@@ -468,6 +472,7 @@ impl<S: PaymentState> Http402Gate<S> {
         session: &mut Session,
         ctx: &mut Ctx,
         path: &str,
+        route: &UpstreamRoute,
         host: Option<&str>,
         method: &http::Method,
         uri: &Uri,
@@ -506,6 +511,7 @@ impl<S: PaymentState> Http402Gate<S> {
         let prepared = match self
             .prepare_buffered_request(
                 api,
+                route,
                 method,
                 uri,
                 headers,
@@ -1027,6 +1033,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 Ok(true)
             }
             GateDecision::Forward {
+                route,
                 session: session_forward,
                 receipt,
                 upto,
@@ -1088,6 +1095,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                             session,
                             ctx,
                             &path,
+                            &route,
                             host.as_deref(),
                             &method,
                             &uri,
@@ -1106,12 +1114,13 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                     &uri,
                     &headers,
                     session,
+                    Some(&route),
                     false,
                 )
                 .await
             }
-            GateDecision::Passthrough => {
-                // Free / discovery requests may be served by the control plane.
+            GateDecision::Passthrough(route) => {
+                // Free requests may be served by the control plane.
                 self.plan_upstream(
                     ctx,
                     &path,
@@ -1120,6 +1129,22 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                     &uri,
                     &headers,
                     session,
+                    Some(&route),
+                    true,
+                )
+                .await
+            }
+            GateDecision::Local => {
+                // Control plane only; never the API upstream.
+                self.plan_upstream(
+                    ctx,
+                    &path,
+                    host.as_deref(),
+                    &method,
+                    &uri,
+                    &headers,
+                    session,
+                    None,
                     true,
                 )
                 .await
@@ -1862,6 +1887,263 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct AllowlistState {
+        apis: Vec<ApiSpec>,
+        session: std::sync::Arc<pay_core::server::session::SessionMpp>,
+    }
+
+    impl PaymentState for AllowlistState {
+        fn apis(&self) -> &[ApiSpec] {
+            &self.apis
+        }
+        fn mpp(&self) -> Option<&pay_kit::mpp::server::Mpp> {
+            None
+        }
+        fn session_mpp(&self) -> Option<&pay_core::server::session::SessionMpp> {
+            Some(&self.session)
+        }
+        fn session_mpp_handle(
+            &self,
+        ) -> Option<std::sync::Arc<pay_core::server::session::SessionMpp>> {
+            Some(self.session.clone())
+        }
+    }
+
+    /// One declared root `POST ""` plus a parameterized paid `GET` and a free
+    /// `GET`, behind operator header auth.
+    fn allowlist_api() -> ApiSpec {
+        let metering = serde_json::json!({
+            "schemes": ["mpp-session"],
+            "dimensions": [{
+                "direction": "usage", "unit": "requests", "scale": 1,
+                "tiers": [{"price_usd": 0.001}]
+            }]
+        });
+        serde_json::from_value(serde_json::json!({
+            "name": "rpc", "subdomain": "rpc", "title": "RPC", "description": "",
+            "category": "ai_ml", "version": "v1",
+            "routing": {
+                "type": "proxy", "url": "http://127.0.0.1:1",
+                "auth": {"method": "header", "key": "x-operator-key", "value_from_env": "PATH"}
+            },
+            "endpoints": [
+                {"method": "POST", "path": "", "metering": metering},
+                {"method": "GET", "path": "v1/items/{id}", "metering": metering},
+                {"method": "GET", "path": "v1/free"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Planned {
+        Responded(String),
+        ControlPlane,
+        Api { path: String, operator_key: bool },
+    }
+
+    async fn plan<S: PaymentState>(
+        gate: &Http402Gate<S>,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> Planned {
+        use pingora::proxy::ProxyHttp;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let mut request =
+            format!("{method} {path} HTTP/1.1\r\nHost: rpc.example\r\nContent-Length: 0\r\n");
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        client.write_all(request.as_bytes()).await.unwrap();
+        let stream = pingora::protocols::l4::stream::Stream::from(server);
+        let mut session = pingora::proxy::Session::new_h1(Box::new(stream));
+        assert!(session.read_request().await.unwrap());
+        let mut ctx = gate.new_ctx();
+        if gate.request_filter(&mut session, &mut ctx).await.unwrap() {
+            assert!(
+                ctx.target.is_none(),
+                "{method} {path} responded and planned"
+            );
+            drop(session);
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            let response = String::from_utf8_lossy(&response);
+            return Planned::Responded(response.split(' ').nth(1).unwrap_or("").to_string());
+        }
+        match ctx.target {
+            Some(super::Target::ControlPlane) => Planned::ControlPlane,
+            Some(super::Target::Api {
+                path_and_query,
+                headers,
+                ..
+            }) => Planned::Api {
+                path: path_and_query,
+                operator_key: headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("x-operator-key")),
+            },
+            None => panic!("{method} {path}: no response and no target"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pingora_forwards_only_gate_routed_requests_upstream() {
+        use pay_core::server::gate::{GateDecision, GateRequest, PaymentGate};
+        let store: std::sync::Arc<dyn pay_kit::mpp::store::ChannelStore> =
+            std::sync::Arc::new(pay_kit::mpp::store::MemoryChannelStore::new());
+        let blockhash = pay_kit::mpp::blockhash::BlockhashCache::new();
+        blockhash.set(
+            "SURFNETxSAFEHASHxxxxxxxxxxxxxxxxxxxxx11x".to_string(),
+            42,
+            123,
+        );
+        let session = pay_core::server::session::SessionMpp::new_with_channel_store(
+            pay_kit::mpp::server::session::SessionConfig {
+                operator: solana_pubkey::Pubkey::new_unique().to_string(),
+                recipient: solana_pubkey::Pubkey::new_unique().to_string(),
+                suggested_deposit: Some(5_000_000),
+                currency: solana_pubkey::Pubkey::new_unique().to_string(),
+                network: "localnet".to_string(),
+                ..Default::default()
+            },
+            "test-secret-key-do-not-use-32b-pad",
+            store.clone(),
+        )
+        .with_blockhash_cache(blockhash);
+        let state = AllowlistState {
+            apis: vec![allowlist_api()],
+            session: std::sync::Arc::new(session),
+        };
+        let gate = Http402Gate::new(state.clone(), "127.0.0.1:1");
+        let responded = |status: &str| Planned::Responded(status.to_string());
+
+        for (method, path, headers, expected) in [
+            ("POST", "/", vec![], responded("402")),
+            ("GET", "/", vec![("Accept", "text/html")], responded("402")),
+            ("GET", "/v1/items/42", vec![], responded("402")),
+            ("HEAD", "/v1/items/42", vec![], responded("402")),
+            ("POST", "/rpc", vec![], responded("404")),
+            ("POST", "/anything", vec![], responded("404")),
+            ("GET", "/rpc", vec![], responded("404")),
+            (
+                "POST",
+                "/rpc",
+                vec![("Authorization", "Payment x")],
+                responded("404"),
+            ),
+            ("GET", "/v1/items/42/extra", vec![], responded("404")),
+            ("DELETE", "/v1/items/42", vec![], responded("404")),
+            (
+                "POST",
+                "/v1/free",
+                vec![("Authorization", "Payment x")],
+                responded("404"),
+            ),
+            // The root is also the control plane, which re-gates and serves
+            // only its own routes; it never injects operator credentials.
+            ("GET", "/", vec![], Planned::ControlPlane),
+            ("HEAD", "/", vec![], Planned::ControlPlane),
+            (
+                "GET",
+                "/",
+                vec![("Authorization", "Payment x")],
+                Planned::ControlPlane,
+            ),
+        ] {
+            assert_eq!(
+                plan(&gate, method, path, &headers).await,
+                expected,
+                "{method} {path} {headers:?}"
+            );
+        }
+
+        // Positive controls: a free declared route, a paid root POST, and a
+        // session commit POSTed to a declared GET resource.
+        assert_eq!(
+            plan(&gate, "GET", "/v1/free", &[]).await,
+            Planned::Api {
+                path: "/v1/free".into(),
+                operator_key: true
+            }
+        );
+        for (challenge_method, path) in [
+            (http::Method::POST, "/"),
+            (http::Method::GET, "/v1/items/42"),
+        ] {
+            let decision = PaymentGate::new(state.clone())
+                .evaluate(&GateRequest {
+                    method: &challenge_method,
+                    path: path.trim_start_matches('/'),
+                    host: Some("rpc.example"),
+                    accept: None,
+                    authorization: None,
+                    content_length: None,
+                    query: None,
+                    x402_payment: None,
+                })
+                .await;
+            let GateDecision::Respond(challenge) = decision else {
+                panic!("expected a 402 for {path}");
+            };
+            let www_auth = challenge
+                .headers
+                .iter()
+                .find(|(name, _)| name == header::WWW_AUTHENTICATE)
+                .map(|(_, value)| value.to_str().unwrap().to_string())
+                .unwrap();
+            let challenge = pay_kit::mpp::parse_www_authenticate(&www_auth).unwrap();
+            let price: u64 = challenge
+                .request
+                .decode::<pay_kit::mpp::SessionRequest>()
+                .unwrap()
+                .amount
+                .parse()
+                .unwrap();
+            let channel = solana_pubkey::Pubkey::new_unique();
+            let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+            let mut keypair = [0u8; 64];
+            keypair[..32].copy_from_slice(key.as_bytes());
+            keypair[32..].copy_from_slice(key.verifying_key().as_bytes());
+            let signer: Box<dyn pay_kit::mpp::solana_keychain::TransactionSigner> = Box::new(
+                pay_kit::mpp::solana_keychain::memory::MemorySigner::from_bytes(&keypair).unwrap(),
+            );
+            store
+                .put_channel(
+                    &channel.to_string(),
+                    pay_core::server::session::test_channel_state(
+                        channel.to_string(),
+                        1_000_000,
+                        signer.pubkey().to_string(),
+                        "client",
+                        &challenge.id,
+                        solana_pubkey::Pubkey::new_unique().to_string(),
+                        None,
+                    ),
+                )
+                .await
+                .unwrap();
+            let handle = pay_core::session::SessionHandle::new(channel, signer, challenge)
+                .with_voucher_key(key);
+            let voucher = handle.voucher_header(price).await.unwrap();
+            assert_eq!(
+                plan(&gate, "POST", path, &[("Authorization", &voucher)]).await,
+                Planned::Api {
+                    path: path.into(),
+                    operator_key: true
+                },
+                "paid POST {path}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn pingora_rejects_undeclared_proxy_routes_without_planning_upstream() {
         use pingora::proxy::ProxyHttp;
@@ -2288,9 +2570,25 @@ mod tests {
             "127.0.0.1:1",
         );
         let api = gate.resolve_api("signed.example").expect("API resolves");
+        let decision = pay_core::server::gate::PaymentGate::new(gate.state.clone())
+            .evaluate(&pay_core::server::gate::GateRequest {
+                method: &http::Method::POST,
+                path: "v1/generate",
+                host: Some("signed.example"),
+                accept: None,
+                authorization: None,
+                content_length: None,
+                query: None,
+                x402_payment: None,
+            })
+            .await;
+        let pay_core::server::gate::GateDecision::Passthrough(route) = decision else {
+            panic!("an API without endpoints is a passthrough proxy");
+        };
         let plan = gate
             .prepare_buffered_request(
                 api,
+                &route,
                 &http::Method::POST,
                 &"/v1/generate".parse().unwrap(),
                 &HeaderMap::new(),

@@ -60,6 +60,8 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
     // values before payment evaluation; only a successfully verified MPP
     // session may add them back below.
     strip_internal_identity_headers(req.headers_mut());
+    req.extensions_mut()
+        .remove::<crate::server::gate::UpstreamRoute>();
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
@@ -113,6 +115,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
         GateDecision::Forward {
+            route,
             session,
             receipt,
             upto,
@@ -186,6 +189,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                     ));
                 }
             }
+            req.extensions_mut().insert(route);
             req.extensions_mut().insert(TrustedPaymentIdentity {
                 payer: verified_payer,
                 channel_id: verified_channel,
@@ -368,7 +372,11 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
             }
             response
         }
-        GateDecision::Passthrough => next.run(req).await,
+        GateDecision::Passthrough(route) => {
+            req.extensions_mut().insert(route);
+            next.run(req).await
+        }
+        GateDecision::Local => next.run(req).await,
     }
 }
 

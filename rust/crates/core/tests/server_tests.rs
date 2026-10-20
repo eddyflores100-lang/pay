@@ -8,7 +8,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::middleware;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use pay_core::PaymentState;
 use pay_core::server::accounting::{AccountingKey, AccountingStore, InMemoryStore};
@@ -201,6 +201,24 @@ async fn start_multi_currency_server() -> (String, tokio::task::JoinHandle<()>) 
     (url, handle)
 }
 
+/// Production fallback (start.rs): forward only what the payment gate routed.
+async fn gated_forward(api: &ApiSpec, req: axum::http::Request<Body>) -> Response {
+    let (parts, body) = req.into_parts();
+    let Some(route) = parts.extensions.get::<proxy::UpstreamRoute>().cloned() else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(json!({"error": "not_found"})),
+        )
+            .into_response();
+    };
+    let bytes = axum::body::to_bytes(body, 10 * 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    proxy::forward_request(api, &route, parts.method, &parts.uri, &parts.headers, bytes)
+        .await
+        .unwrap_or_else(|e| e)
+}
+
 fn load_respond_api() -> ApiSpec {
     let content = std::fs::read_to_string("tests/fixtures/test-respond.yml").unwrap();
     serde_yml::from_str(&content).unwrap()
@@ -236,15 +254,7 @@ async fn start_respond_server() -> (String, tokio::task::JoinHandle<()>) {
     let app = Router::new()
         .fallback(any(move |req: axum::http::Request<Body>| {
             let api = api.clone();
-            async move {
-                let (parts, body) = req.into_parts();
-                let bytes = axum::body::to_bytes(body, 10 * 1024 * 1024)
-                    .await
-                    .unwrap_or_default();
-                proxy::forward_request(&api, parts.method, &parts.uri, &parts.headers, bytes)
-                    .await
-                    .unwrap_or_else(|e| e)
-            }
+            async move { gated_forward(&api, req).await }
         }))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1197,24 +1207,7 @@ async fn root_redirects_to_pdb_with_html_accept() {
         )
         .fallback(any(move |req: axum::http::Request<Body>| {
             let api = api.clone();
-            async move {
-                let (parts, body) = req.into_parts();
-                // 404 for paths not in the spec (matches production fallback in start.rs).
-                let path = parts.uri.path().trim_start_matches('/');
-                if pay_core::server::metering::find_endpoint_by_path(&api, path).is_none() {
-                    return (
-                        axum::http::StatusCode::NOT_FOUND,
-                        axum::Json(json!({"error": "not_found"})),
-                    )
-                        .into_response();
-                }
-                let bytes = axum::body::to_bytes(body, 10 * 1024 * 1024)
-                    .await
-                    .unwrap_or_default();
-                proxy::forward_request(&api, parts.method, &parts.uri, &parts.headers, bytes)
-                    .await
-                    .unwrap_or_else(|e| e)
-            }
+            async move { gated_forward(&api, req).await }
         }))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1784,4 +1777,186 @@ mod static_session_redirects {
         assert_eq!(calls, 2);
         assert_eq!(spent, 0);
     }
+}
+
+// =============================================================================
+// Proxy allowlist: only gate-routed requests reach the upstream
+// =============================================================================
+
+type UpstreamHits = Arc<std::sync::Mutex<Vec<(String, bool)>>>;
+
+/// Upstream that records `METHOD /path` and whether operator credentials arrived.
+async fn start_recording_upstream() -> (String, UpstreamHits) {
+    let hits: UpstreamHits = Arc::default();
+    let capture = Arc::clone(&hits);
+    let app = Router::new().fallback(any(move |req: Request<Body>| {
+        let capture = Arc::clone(&capture);
+        async move {
+            capture.lock().unwrap().push((
+                format!("{} {}", req.method(), req.uri().path()),
+                req.headers().contains_key("x-operator-key"),
+            ));
+            "upstream"
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
+    (url, hits)
+}
+
+/// One declared root `POST ""` (the reported spec) plus a parameterized paid
+/// `GET` and a free `GET`, behind operator header auth.
+fn allowlist_api(upstream: &str) -> ApiSpec {
+    serde_yml::from_str(&format!(
+        r#"
+name: rpc
+subdomain: rpc
+title: RPC
+description: allowlist
+category: ai_ml
+version: v1
+routing:
+  type: proxy
+  url: {upstream}
+  auth:
+    method: header
+    key: x-operator-key
+    value_from_env: PATH
+endpoints:
+  - method: POST
+    path: ""
+    metering:
+      schemes: [mpp-session]
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.001
+  - method: GET
+    path: "v1/items/{{id}}"
+    metering:
+      schemes: [mpp-session]
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.001
+  - method: GET
+    path: "v1/free"
+"#
+    ))
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_forwards_only_gate_routed_requests_upstream() {
+    let (upstream, hits) = start_recording_upstream().await;
+    let api = allowlist_api(&upstream);
+    let (session, store) =
+        test_session_mpp_with_store(&solana_pubkey::Pubkey::new_unique().to_string());
+    let state = SessionTestState {
+        apis: Arc::new(vec![api.clone()]),
+        mpp: None,
+        session_mpp: Some(Arc::new(session)),
+    };
+    let app = Router::new()
+        .fallback(any(move |req: Request<Body>| {
+            let api = api.clone();
+            async move { gated_forward(&api, req).await }
+        }))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            pay_core::server::payment::payment_middleware::<SessionTestState>,
+        ))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let send = |method: reqwest::Method, path: &str, headers: &[(&str, &str)]| {
+        let mut request = client.request(method, format!("{url}{path}"));
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        request.send()
+    };
+    use reqwest::Method as M;
+
+    let challenged = [
+        (M::POST, "/", vec![]),
+        (M::GET, "/", vec![("accept", "text/html")]),
+        (M::GET, "/v1/items/42", vec![]),
+        (M::HEAD, "/v1/items/42", vec![]),
+    ];
+    for (method, path, headers) in challenged {
+        let status = send(method.clone(), path, &headers).await.unwrap().status();
+        assert_eq!(status, 402, "{method} {path} {headers:?}");
+    }
+    let undeclared = [
+        (M::POST, "/rpc", vec![]),
+        (M::POST, "/anything", vec![]),
+        (M::GET, "/rpc", vec![]),
+        (M::GET, "/", vec![]),
+        (M::HEAD, "/", vec![]),
+        (M::GET, "/", vec![("authorization", "Payment x")]),
+        (M::POST, "/rpc", vec![("authorization", "Payment x")]),
+        (M::GET, "/v1/items/42/extra", vec![]),
+        (M::DELETE, "/v1/items/42", vec![]),
+        (M::POST, "/v1/free", vec![("authorization", "Payment x")]),
+    ];
+    for (method, path, headers) in undeclared {
+        let status = send(method.clone(), path, &headers).await.unwrap().status();
+        assert_eq!(status, 404, "{method} {path} {headers:?}");
+    }
+    assert!(
+        hits.lock().unwrap().is_empty(),
+        "{:?}",
+        hits.lock().unwrap()
+    );
+
+    // Positive controls: a free declared route, a paid root POST, and a
+    // session commit POSTed to a declared GET resource.
+    assert_eq!(send(M::GET, "/v1/free", &[]).await.unwrap().status(), 200);
+    for (challenge_method, path) in [(M::POST, "/"), (M::GET, "/v1/items/42")] {
+        let www_auth = send(challenge_method, path, &[])
+            .await
+            .unwrap()
+            .headers()
+            .get("www-authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let challenge = pay_kit::mpp::parse_www_authenticate(&www_auth).unwrap();
+        let price: u64 = challenge
+            .request
+            .decode::<pay_kit::mpp::SessionRequest>()
+            .unwrap()
+            .amount
+            .parse()
+            .unwrap();
+        let handle = seed_client_session(&store, &challenge).await;
+        let voucher = handle.voucher_header(price).await.unwrap();
+        let resp = send(M::POST, path, &[("authorization", &voucher)])
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "paid POST {path}");
+        // A session credential may not repurpose a free endpoint's method.
+        let voucher = handle.voucher_header(price * 2).await.unwrap();
+        let resp = send(M::POST, "/v1/free", &[("authorization", &voucher)])
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+    assert_eq!(
+        *hits.lock().unwrap(),
+        vec![
+            ("GET /v1/free".to_string(), true),
+            ("POST /".to_string(), true),
+            ("POST /v1/items/42".to_string(), true),
+        ]
+    );
 }

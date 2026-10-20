@@ -29,6 +29,7 @@ use sha2::{Sha256, Sha512};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+pub use crate::server::gate::UpstreamRoute;
 use crate::server::payment::TrustedPaymentIdentity;
 use crate::server::session_stream::{self, SessionStreamContext};
 use crate::server::{metering, payment, telemetry};
@@ -169,12 +170,13 @@ pub fn routing_signs_request_body(api: &ApiSpec, path: &str) -> bool {
 #[allow(clippy::result_large_err)]
 pub async fn forward_request(
     api: &ApiSpec,
+    route: &UpstreamRoute,
     method: Method,
     uri: &Uri,
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    forward_request_with_session_metering(api, method, uri, headers, body, None).await
+    forward_request_with_session_metering(api, route, method, uri, headers, body, None).await
 }
 
 /// Forward a request and optionally meter the streamed response against an open
@@ -190,6 +192,7 @@ pub async fn forward_request(
 #[allow(clippy::result_large_err)]
 pub async fn forward_request_with_session_metering(
     api: &ApiSpec,
+    route: &UpstreamRoute,
     method: Method,
     uri: &Uri,
     headers: &HeaderMap,
@@ -198,6 +201,7 @@ pub async fn forward_request_with_session_metering(
 ) -> Result<Response, Response> {
     forward_request_with_session_metering_and_identity(
         api,
+        route,
         method,
         uri,
         headers,
@@ -211,6 +215,7 @@ pub async fn forward_request_with_session_metering(
 #[allow(clippy::too_many_arguments, clippy::result_large_err)]
 pub async fn forward_request_with_session_metering_and_identity(
     api: &ApiSpec,
+    route: &UpstreamRoute,
     method: Method,
     uri: &Uri,
     headers: &HeaderMap,
@@ -220,6 +225,7 @@ pub async fn forward_request_with_session_metering_and_identity(
 ) -> Result<Response, Response> {
     let prepared = match prepare_upstream_with_identity(
         api,
+        route,
         &method,
         uri,
         headers,
@@ -328,17 +334,19 @@ pub enum UpstreamPlan {
 #[allow(clippy::result_large_err)]
 pub async fn prepare_upstream(
     api: &ApiSpec,
+    route: &UpstreamRoute,
     method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<UpstreamPlan, Response> {
-    prepare_upstream_with_identity(api, method, uri, headers, body, None).await
+    prepare_upstream_with_identity(api, route, method, uri, headers, body, None).await
 }
 
 #[allow(clippy::result_large_err)]
 pub async fn prepare_upstream_with_identity(
     api: &ApiSpec,
+    route: &UpstreamRoute,
     method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
@@ -357,6 +365,17 @@ pub async fn prepare_upstream_with_identity(
         ));
     }
 
+    // Only the gate's admission of this exact request reaches the upstream.
+    if !route.admits(api, method, uri.path()) {
+        return Ok(UpstreamPlan::Respond(
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"error":"not_found"}"#))
+                .unwrap(),
+        ));
+    }
+
     let routing = resolve_routing(api, uri.path());
 
     // Respond mode — no upstream call.
@@ -372,18 +391,6 @@ pub async fn prepare_upstream_with_identity(
                     .unwrap(),
             ));
         }
-        return Ok(UpstreamPlan::Respond(
-            Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"error":"not_found"}"#))
-                .unwrap(),
-        ));
-    }
-
-    // `endpoints[]` is the upstream allowlist: never attach operator
-    // credentials to an undeclared method/path.
-    if !upstream_route_declared(api, method, uri.path(), headers) {
         return Ok(UpstreamPlan::Respond(
             Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -531,35 +538,6 @@ pub async fn prepare_upstream_with_identity(
     }
 
     Ok(UpstreamPlan::Forward(prepared))
-}
-
-/// Whether a proxied request matches a declared endpoint. An API without
-/// declared endpoints is an explicit passthrough proxy. Session vouchers are
-/// committed to the opened resource regardless of its method, so a `Payment`
-/// credential may use path-only matching on a declared path.
-fn upstream_route_declared(
-    api: &ApiSpec,
-    method: &Method,
-    path: &str,
-    headers: &HeaderMap,
-) -> bool {
-    if api.endpoints.is_empty() {
-        return true;
-    }
-    let path = path.trim_start_matches('/');
-    let match_method = if *method == Method::HEAD {
-        "GET"
-    } else {
-        method.as_str()
-    };
-    if metering::find_endpoint(api, match_method, path).is_some() {
-        return true;
-    }
-    let payment_credential = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.len() >= 8 && value[..8].eq_ignore_ascii_case("payment "));
-    payment_credential && metering::find_endpoint_by_path(api, path).is_some()
 }
 
 fn build_session_stream_meter(
@@ -1677,6 +1655,31 @@ mod tests {
         HmacSignatureDestination, HmacStringEncoding, HmacTarget, HmacTargetType,
         HmacTimestampFormat, HttpMethod, RoutingConfig,
     };
+
+    /// Unit tests exercise upstream preparation for an already-admitted request.
+    async fn forward_request(
+        api: &ApiSpec,
+        method: Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        body: Bytes,
+    ) -> Result<Response, Response> {
+        let route = UpstreamRoute::for_tests(api, &method, uri.path());
+        super::forward_request(api, &route, method, uri, headers, body).await
+    }
+
+    async fn prepare_upstream_with_identity(
+        api: &ApiSpec,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        body: &[u8],
+        identity: Option<&TrustedPaymentIdentity>,
+    ) -> Result<UpstreamPlan, Response> {
+        let route = UpstreamRoute::for_tests(api, method, uri.path());
+        super::prepare_upstream_with_identity(api, &route, method, uri, headers, body, identity)
+            .await
+    }
 
     #[test]
     fn upstream_log_url_redacts_every_query_value() {
@@ -3818,92 +3821,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_request_rejects_undeclared_routes_before_injecting_credentials() {
-        type Observed = Vec<(String, Option<String>)>;
-        let observed: Arc<Mutex<Observed>> = Arc::new(Mutex::new(Vec::new()));
+    async fn upstream_route_admits_only_the_request_it_was_minted_for() {
+        let observed = Arc::new(Mutex::new(0_usize));
         let capture = Arc::clone(&observed);
-        let app = axum::Router::new().fallback(
-            move |method: axum::http::Method,
-                  uri: axum::http::Uri,
-                  headers: axum::http::HeaderMap| {
-                let capture = Arc::clone(&capture);
-                async move {
-                    capture.lock().unwrap().push((
-                        format!("{method} {}", uri.path()),
-                        headers
-                            .get("x-api-key")
-                            .and_then(|value| value.to_str().ok())
-                            .map(str::to_string),
-                    ));
-                    "ok"
-                }
-            },
-        );
+        let app = axum::Router::new().fallback(move || {
+            let capture = Arc::clone(&capture);
+            async move {
+                *capture.lock().unwrap() += 1;
+                "ok"
+            }
+        });
         let (base_url, _handle) = spawn_upstream(app).await;
-        // SAFETY: test-only env mutation scoped to this test.
-        unsafe { std::env::set_var("_TEST_ALLOWLIST_OPERATOR_KEY", "operator-secret") };
-        let mut api = ApiSpec {
-            routing: RoutingConfig::Proxy {
-                url: base_url,
-                path_rewrites: vec![],
-                auth: Some(Box::new(AuthConfig::Header {
-                    key: "x-api-key".to_string(),
-                    prefix: None,
-                    value_from_env: "_TEST_ALLOWLIST_OPERATOR_KEY".to_string(),
-                })),
-            },
-            ..make_api("test")
-        };
-        api.endpoints.push(declared_endpoint(
-            pay_types::metering::HttpMethod::Post,
-            "v1/search",
-        ));
-        api.endpoints.push(declared_endpoint(
-            pay_types::metering::HttpMethod::Get,
-            "v1/items/{id}",
-        ));
-
-        for (method, path) in [
-            (Method::GET, "/admin/users?scope=all"),
-            (Method::GET, "/v1/search"),
-            (Method::DELETE, "/v1/items/42"),
-            (Method::GET, "/v1/items/42/secrets"),
-        ] {
-            let uri: Uri = path.parse().unwrap();
-            let resp = forward_request(&api, method.clone(), &uri, &HeaderMap::new(), Bytes::new())
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} {path}");
-        }
-        assert!(observed.lock().unwrap().is_empty());
-
-        // Declared method/path pairs (HEAD gated like GET) still forward.
-        for (method, path) in [
-            (Method::POST, "/v1/search"),
-            (Method::GET, "/v1/items/42"),
-            (Method::HEAD, "/v1/items/7"),
-        ] {
-            let uri: Uri = path.parse().unwrap();
-            let resp = forward_request(&api, method.clone(), &uri, &HeaderMap::new(), Bytes::new())
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK, "{method} {path}");
-        }
-        unsafe { std::env::remove_var("_TEST_ALLOWLIST_OPERATOR_KEY") };
-        let observed = observed.lock().unwrap();
-        assert_eq!(observed.len(), 3);
-        assert!(
-            observed
-                .iter()
-                .all(|(_, key)| key.as_deref() == Some("operator-secret"))
-        );
-    }
-
-    #[tokio::test]
-    async fn session_commit_on_declared_path_may_use_another_method() {
-        let app = axum::Router::new().fallback(|| async { "ok" });
-        let (base_url, _handle) = spawn_upstream(app).await;
-        let mut api = ApiSpec {
+        let api = ApiSpec {
             routing: RoutingConfig::Proxy {
                 url: base_url,
                 path_rewrites: vec![],
@@ -3911,23 +3840,42 @@ mod tests {
             },
             ..make_api("test")
         };
-        api.endpoints.push(declared_endpoint(
-            pay_types::metering::HttpMethod::Get,
-            "v1/stream",
-        ));
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", HeaderValue::from_static("Payment abc"));
+        let other = make_api("other");
+        let route = UpstreamRoute::for_tests(&api, &Method::POST, "/v1/search");
 
-        let uri: Uri = "/v1/stream".parse().unwrap();
-        let resp = forward_request(&api, Method::POST, &uri, &headers, Bytes::new())
+        for (api, method, path) in [
+            (&api, Method::GET, "/v1/search"),
+            (&api, Method::POST, "/v1/search/extra"),
+            (&api, Method::POST, "/v1/other"),
+            (&other, Method::POST, "/v1/search"),
+        ] {
+            let uri: Uri = path.parse().unwrap();
+            let resp = super::forward_request(
+                api,
+                &route,
+                method.clone(),
+                &uri,
+                &HeaderMap::new(),
+                Bytes::new(),
+            )
             .await
             .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} {path}");
+        }
+        assert_eq!(*observed.lock().unwrap(), 0);
+
+        let uri: Uri = "/v1/search".parse().unwrap();
+        let resp = super::forward_request(
+            &api,
+            &route,
+            Method::POST,
+            &uri,
+            &HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-
-        let uri: Uri = "/v1/other".parse().unwrap();
-        let resp = forward_request(&api, Method::POST, &uri, &headers, Bytes::new())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(*observed.lock().unwrap(), 1);
     }
 }
