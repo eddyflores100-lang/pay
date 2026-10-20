@@ -413,21 +413,28 @@ async fn chunked_request_through_middleware_is_quoted_at_the_large_tier() {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    let body = vec![b'X'; 1_048_577];
-    let chunks = futures_util::stream::once(async move { Ok::<_, std::io::Error>(body) });
-    let response = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/upload"))
-        .header("host", "testapi.localhost")
-        .body(reqwest::Body::wrap_stream(chunks))
-        .send()
+    // Send only the chunked request head: the gate must quote without reading
+    // the body, so its 402 never races the upload.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            b"POST /v1/upload HTTP/1.1\r\nhost: testapi.localhost\r\n\
+              transfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+        )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-    let header = response
-        .headers()
-        .get("www-authenticate")
-        .unwrap()
-        .to_str()
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.unwrap();
+    let raw = String::from_utf8_lossy(&raw);
+    assert!(raw.starts_with("HTTP/1.1 402"), "{raw}");
+    let header = raw
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("www-authenticate")
+                .then(|| value.trim())
+        })
         .unwrap();
     let charge: ChargeRequest = parse_www_authenticate(header)
         .unwrap()
