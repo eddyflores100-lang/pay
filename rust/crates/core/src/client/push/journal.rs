@@ -479,25 +479,13 @@ pub fn load_events(path: &Path) -> Result<Vec<JournalEvent>> {
 
 // ── Resume reduction ─────────────────────────────────────────────────────
 
-/// What the exact on-chain/off-chain status of a signature is, as observed
-/// by a live RPC/pay-api lookup. Injected via [`ResumeRpc`] so
-/// [`reduce_chunk_resume_action`] is unit-testable without a network.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RpcSignatureStatus {
-    Confirmed,
-    Failed,
-    NotFound,
-    /// RPC could not determine the answer (timeout, ambiguous response,
-    /// etc.). This must never be treated as "safe to rebuild."
-    Unknown,
-}
+pub use pay_types::landing::{Landing, RecordedPayout, Replaceable};
 
-/// The one RPC capability resume needs: signature status, and the current
-/// confirmed block height (to decide blockhash expiry). A later slice wires
-/// this to a live RPC client; tests wire it to a fixed fixture.
+/// The one RPC capability resume needs: where a recorded payout stands, as
+/// [`pay_types::landing::confirm_not_landed`] established it. Injected so
+/// [`reduce_chunk_resume_action`] is unit-testable without a network.
 pub trait ResumeRpc {
-    fn signature_status(&self, signature: &str) -> RpcSignatureStatus;
-    fn current_block_height(&self) -> u64;
+    fn landing(&self, payout: &RecordedPayout) -> Landing;
 }
 
 /// What the executor should do next for one chunk, derived purely from the
@@ -518,12 +506,12 @@ pub enum ChunkResumeAction {
     /// RPC now reports the previously unconfirmed signature as confirmed —
     /// record it and treat the chunk as done.
     RecordConfirmedThenSkip { signature: String },
-    /// An on-chain or journal-recorded failure — a fresh attempt is allowed
+    /// The signed transaction failed for good — a fresh attempt is allowed
     /// under policy (a later slice's retry budget), not indefinitely.
-    RetryAfterFailure,
+    RetryAfterFailure { proof: Replaceable },
     /// The signed transaction's blockhash has proven expired and RPC does
     /// not see the signature: safe to rebuild the same logical chunk fresh.
-    RebuildWithFreshBlockhash,
+    RebuildWithFreshBlockhash { proof: Replaceable },
     /// No `chunk_signed` event exists yet for this chunk: it was never
     /// attempted, so it is safe to plan and sign it under the new permit.
     NeedsSigning,
@@ -595,21 +583,23 @@ pub fn reduce_chunk_resume_action(
         FeePayerMode::Gasless => ChunkResumeAction::RepresentGaslessCredential {
             signed_transaction_base64,
         },
-        FeePayerMode::SelfFunded => match rpc.signature_status(&signature) {
-            RpcSignatureStatus::Confirmed => {
-                ChunkResumeAction::RecordConfirmedThenSkip { signature }
-            }
-            RpcSignatureStatus::Failed => ChunkResumeAction::RetryAfterFailure,
-            RpcSignatureStatus::Unknown => ChunkResumeAction::StopUnknown { signature },
-            RpcSignatureStatus::NotFound => {
-                if rpc.current_block_height() <= last_valid_block_height {
-                    ChunkResumeAction::RebroadcastIdenticalBytes {
-                        signed_transaction_base64,
-                    }
-                } else {
-                    ChunkResumeAction::RebuildWithFreshBlockhash
+        FeePayerMode::SelfFunded => match rpc.landing(&RecordedPayout {
+            signature: signature.clone(),
+            last_valid_block_height: Some(last_valid_block_height),
+        }) {
+            Landing::Confirmed => ChunkResumeAction::RecordConfirmedThenSkip { signature },
+            Landing::Replaceable(proof) => match proof.reason() {
+                pay_types::landing::ReplaceReason::Failed => {
+                    ChunkResumeAction::RetryAfterFailure { proof }
                 }
-            }
+                pay_types::landing::ReplaceReason::Expired => {
+                    ChunkResumeAction::RebuildWithFreshBlockhash { proof }
+                }
+            },
+            Landing::MayLand => ChunkResumeAction::RebroadcastIdenticalBytes {
+                signed_transaction_base64,
+            },
+            Landing::Unknown => ChunkResumeAction::StopUnknown { signature },
         },
     }
 }
@@ -618,17 +608,45 @@ pub fn reduce_chunk_resume_action(
 mod tests {
     use super::*;
 
+    use pay_types::landing::{ChainState, ChainTip, SignatureStatus, SignatureStatuses};
+
+    /// `status: None` is a lookup that could not be answered.
     struct FixedRpc {
-        status: RpcSignatureStatus,
+        status: Option<SignatureStatus>,
         current_block_height: u64,
     }
 
-    impl ResumeRpc for FixedRpc {
-        fn signature_status(&self, _signature: &str) -> RpcSignatureStatus {
-            self.status
+    impl ChainState for FixedRpc {
+        type Error = ();
+
+        async fn finalized_tip(&self) -> std::result::Result<ChainTip, ()> {
+            Ok(ChainTip {
+                slot: 1,
+                block_height: self.current_block_height,
+            })
         }
-        fn current_block_height(&self) -> u64 {
-            self.current_block_height
+
+        async fn signature_statuses(
+            &self,
+            _: &[String],
+        ) -> std::result::Result<SignatureStatuses, ()> {
+            Ok(SignatureStatuses {
+                context_slot: 1,
+                statuses: self.status.into_iter().collect(),
+            })
+        }
+    }
+
+    impl ResumeRpc for FixedRpc {
+        fn landing(&self, payout: &RecordedPayout) -> Landing {
+            let payouts = [payout.clone()];
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            match std::pin::pin!(pay_types::landing::confirm_not_landed(self, &payouts))
+                .poll(&mut context)
+            {
+                std::task::Poll::Ready(Ok(mut landings)) => landings.remove(0),
+                _ => unreachable!("fixture answers at once"),
+            }
         }
     }
 
@@ -817,7 +835,7 @@ mod tests {
             },
         ];
         let rpc = FixedRpc {
-            status: RpcSignatureStatus::Unknown,
+            status: None,
             current_block_height: 0,
         };
         assert_eq!(
@@ -830,7 +848,7 @@ mod tests {
     fn never_signed_chunk_needs_signing() {
         let events = vec![signed_event(1, 1, 1_000)]; // different chunk
         let rpc = FixedRpc {
-            status: RpcSignatureStatus::NotFound,
+            status: Some(SignatureStatus::Absent),
             current_block_height: 0,
         };
         assert_eq!(
@@ -843,7 +861,7 @@ mod tests {
     fn self_funded_within_blockheight_and_not_found_rebroadcasts_identical_bytes() {
         let events = vec![signed_event(0, 1, 1_000)];
         let rpc = FixedRpc {
-            status: RpcSignatureStatus::NotFound,
+            status: Some(SignatureStatus::Absent),
             current_block_height: 500,
         };
         let action = reduce_chunk_resume_action(0, &events, FeePayerMode::SelfFunded, &rpc);
@@ -859,13 +877,13 @@ mod tests {
     fn self_funded_past_blockheight_and_not_found_rebuilds_fresh() {
         let events = vec![signed_event(0, 1, 1_000)];
         let rpc = FixedRpc {
-            status: RpcSignatureStatus::NotFound,
+            status: Some(SignatureStatus::Absent),
             current_block_height: 1_001,
         };
-        assert_eq!(
+        assert!(matches!(
             reduce_chunk_resume_action(0, &events, FeePayerMode::SelfFunded, &rpc),
-            ChunkResumeAction::RebuildWithFreshBlockhash
-        );
+            ChunkResumeAction::RebuildWithFreshBlockhash { .. }
+        ));
     }
 
     #[test]
@@ -874,7 +892,7 @@ mod tests {
         // Blockhash is still valid (current height < last valid height) AND
         // RPC can't determine status: must stop, never rebuild.
         let rpc = FixedRpc {
-            status: RpcSignatureStatus::Unknown,
+            status: None,
             current_block_height: 1,
         };
         assert_eq!(
@@ -886,7 +904,7 @@ mod tests {
 
         // Also true once the blockhash *has* expired: Unknown still wins.
         let rpc_expired = FixedRpc {
-            status: RpcSignatureStatus::Unknown,
+            status: None,
             current_block_height: 5_000,
         };
         assert_eq!(
@@ -901,7 +919,7 @@ mod tests {
     fn self_funded_confirmed_by_rpc_after_lost_response() {
         let events = vec![signed_event(0, 1, 1_000)];
         let rpc = FixedRpc {
-            status: RpcSignatureStatus::Confirmed,
+            status: Some(SignatureStatus::Confirmed),
             current_block_height: 999,
         };
         assert_eq!(
@@ -929,7 +947,7 @@ mod tests {
             },
         });
         let rpc = FixedRpc {
-            status: RpcSignatureStatus::Unknown,
+            status: None,
             current_block_height: 0,
         };
         assert_eq!(
@@ -956,7 +974,7 @@ mod tests {
             },
         });
         let rpc = FixedRpc {
-            status: RpcSignatureStatus::Confirmed,
+            status: Some(SignatureStatus::Confirmed),
             current_block_height: 999,
         };
         assert_eq!(
@@ -980,13 +998,13 @@ mod tests {
             },
         });
         let rpc = FixedRpc {
-            status: RpcSignatureStatus::Failed,
+            status: Some(SignatureStatus::Failed { finalized: true }),
             current_block_height: 0,
         };
-        assert_eq!(
+        assert!(matches!(
             reduce_chunk_resume_action(0, &events, FeePayerMode::SelfFunded, &rpc),
-            ChunkResumeAction::RetryAfterFailure
-        );
+            ChunkResumeAction::RetryAfterFailure { .. }
+        ));
     }
 
     #[test]
@@ -996,7 +1014,7 @@ mod tests {
         // direct-RPC signature lookups — pay-api's idempotency store is
         // authoritative.
         let rpc = FixedRpc {
-            status: RpcSignatureStatus::Unknown,
+            status: None,
             current_block_height: 999_999,
         };
         assert_eq!(
@@ -1025,7 +1043,7 @@ mod tests {
             signed_event(0, 3, 2_000),
         ];
         let rpc = FixedRpc {
-            status: RpcSignatureStatus::NotFound,
+            status: Some(SignatureStatus::Absent),
             current_block_height: 1_500,
         };
         assert_eq!(

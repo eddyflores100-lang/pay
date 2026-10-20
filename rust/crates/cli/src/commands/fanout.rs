@@ -17,7 +17,7 @@ use pay_core::client::push::executor::{
     drop_permit_off_runtime_thread,
 };
 use pay_core::client::push::journal::{
-    ChunkResumeAction, Journal, JournalEvent, JournalEventKind, ResumeRpc, RpcSignatureStatus,
+    ChunkResumeAction, Journal, JournalEvent, JournalEventKind, Landing, RecordedPayout, ResumeRpc,
     default_journal_path, reduce_chunk_resume_action,
 };
 use pay_core::client::push::manifest::{ManifestContext, TransferManifest, parse_manifest_csv};
@@ -28,6 +28,7 @@ use pay_core::client::push::planner::{
 };
 use pay_core::{Error, Result};
 use pay_kit::mpp::protocol::solana::{default_rpc_url, programs};
+use pay_types::landing::{ChainState, ChainTip, SignatureStatuses, signature_status_from_rpc};
 use pay_types::{Stablecoin, stablecoin_mints};
 use serde_json::{Value, json};
 use solana_pubkey::Pubkey;
@@ -137,7 +138,7 @@ impl FanoutCommand {
                     &mint_info.token_program,
                     &sender,
                 )?;
-                let statuses = runtime.block_on(rpc.resume_statuses(&events))?;
+                let statuses = runtime.block_on(resume_landings(&rpc, &events))?;
                 let resume = plan_resume(&events, &full_manifest, &statuses)?;
                 for (chunk_index, signature) in &resume.newly_confirmed {
                     journal.append_chunk_confirmed(*chunk_index, signature)?;
@@ -521,39 +522,6 @@ impl FanoutRpc {
             .map_err(|error| Error::Config(format!("token balance is invalid: {error}")))
     }
 
-    /// Status of every signature the journal recorded, plus the current
-    /// block height, for the resume reducer.
-    async fn resume_statuses(&self, events: &[JournalEvent]) -> Result<ResumeStatuses> {
-        let mut statuses = HashMap::new();
-        for batch in signed_signatures(events).chunks(256) {
-            let result = self
-                .call(
-                    "getSignatureStatuses",
-                    json!([batch, {"searchTransactionHistory": true}]),
-                )
-                .await?;
-            let values = result
-                .get("value")
-                .and_then(Value::as_array)
-                .filter(|values| values.len() == batch.len())
-                .ok_or_else(|| {
-                    Error::Config("malformed getSignatureStatuses response".to_string())
-                })?;
-            for (signature, value) in batch.iter().zip(values) {
-                statuses.insert(signature.clone(), classify_signature_status(value));
-            }
-        }
-        let block_height = self
-            .call("getBlockHeight", json!([{"commitment": "confirmed"}]))
-            .await?
-            .as_u64()
-            .ok_or_else(|| Error::Config("malformed getBlockHeight response".to_string()))?;
-        Ok(ResumeStatuses {
-            statuses,
-            block_height,
-        })
-    }
-
     async fn sol_balance(&self, address: &Pubkey) -> Result<u64> {
         let result = self
             .call(
@@ -568,36 +536,80 @@ impl FanoutRpc {
     }
 }
 
-/// Signature statuses observed once for a resume, served to the pure
-/// journal reducer. A signature the lookup did not cover is unknown.
+impl ChainState for FanoutRpc {
+    type Error = Error;
+
+    async fn finalized_tip(&self) -> Result<ChainTip> {
+        let info = self
+            .call("getEpochInfo", json!([{"commitment": "finalized"}]))
+            .await?;
+        match (
+            info.get("absoluteSlot").and_then(Value::as_u64),
+            info.get("blockHeight").and_then(Value::as_u64),
+        ) {
+            (Some(slot), Some(block_height)) => Ok(ChainTip { slot, block_height }),
+            _ => Err(Error::Config("malformed getEpochInfo response".to_string())),
+        }
+    }
+
+    async fn signature_statuses(&self, signatures: &[String]) -> Result<SignatureStatuses> {
+        let mut context_slot = u64::MAX;
+        let mut statuses = Vec::with_capacity(signatures.len());
+        for batch in signatures.chunks(256) {
+            let result = self
+                .call(
+                    "getSignatureStatuses",
+                    json!([batch, {"searchTransactionHistory": true}]),
+                )
+                .await?;
+            let malformed = || Error::Config("malformed getSignatureStatuses response".to_string());
+            let slot = result
+                .pointer("/context/slot")
+                .and_then(Value::as_u64)
+                .ok_or_else(malformed)?;
+            let values = result
+                .get("value")
+                .and_then(Value::as_array)
+                .filter(|values| values.len() == batch.len())
+                .ok_or_else(malformed)?;
+            context_slot = context_slot.min(slot);
+            statuses.extend(values.iter().map(signature_status_from_rpc));
+        }
+        Ok(SignatureStatuses {
+            context_slot,
+            statuses,
+        })
+    }
+}
+
+/// Where every payout the journal signed stands, established once for a
+/// resume and served to the pure journal reducer.
+async fn resume_landings<C: ChainState<Error = Error>>(
+    chain: &C,
+    events: &[JournalEvent],
+) -> Result<ResumeStatuses> {
+    let payouts = signed_payouts(events);
+    let landings = pay_types::landing::confirm_not_landed(chain, &payouts).await?;
+    Ok(ResumeStatuses {
+        landings: payouts
+            .into_iter()
+            .map(|payout| payout.signature)
+            .zip(landings)
+            .collect(),
+    })
+}
+
+/// A payout the lookup did not cover is unknown.
 struct ResumeStatuses {
-    statuses: HashMap<String, RpcSignatureStatus>,
-    block_height: u64,
+    landings: HashMap<String, Landing>,
 }
 
 impl ResumeRpc for ResumeStatuses {
-    fn signature_status(&self, signature: &str) -> RpcSignatureStatus {
-        self.statuses
-            .get(signature)
-            .copied()
-            .unwrap_or(RpcSignatureStatus::Unknown)
-    }
-
-    fn current_block_height(&self) -> u64 {
-        self.block_height
-    }
-}
-
-fn classify_signature_status(entry: &Value) -> RpcSignatureStatus {
-    if entry.is_null() {
-        return RpcSignatureStatus::NotFound;
-    }
-    if entry.get("err").is_some_and(|err| !err.is_null()) {
-        return RpcSignatureStatus::Failed;
-    }
-    match entry.get("confirmationStatus").and_then(Value::as_str) {
-        Some("confirmed" | "finalized") => RpcSignatureStatus::Confirmed,
-        _ => RpcSignatureStatus::Unknown,
+    fn landing(&self, payout: &RecordedPayout) -> Landing {
+        self.landings
+            .get(&payout.signature)
+            .cloned()
+            .unwrap_or(Landing::Unknown)
     }
 }
 
@@ -625,14 +637,25 @@ fn journal_chunks(events: &[JournalEvent]) -> BTreeMap<u32, Vec<u64>> {
     chunks
 }
 
-fn signed_signatures(events: &[JournalEvent]) -> Vec<String> {
-    let mut signatures = BTreeSet::new();
+fn signed_payouts(events: &[JournalEvent]) -> Vec<RecordedPayout> {
+    let mut payouts = BTreeMap::new();
     for event in events {
-        if let JournalEventKind::ChunkSigned { signature, .. } = &event.kind {
-            signatures.insert(signature.clone());
+        if let JournalEventKind::ChunkSigned {
+            signature,
+            last_valid_block_height,
+            ..
+        } = &event.kind
+        {
+            payouts.insert(signature.clone(), *last_valid_block_height);
         }
     }
-    signatures.into_iter().collect()
+    payouts
+        .into_iter()
+        .map(|(signature, last_valid)| RecordedPayout {
+            signature,
+            last_valid_block_height: Some(last_valid),
+        })
+        .collect()
 }
 
 /// A resume may only continue the exact payout the journal recorded.
@@ -740,13 +763,13 @@ fn plan_resume(
                     })?;
                 newly_confirmed.push((*chunk_index, signature));
             }
-            ChunkResumeAction::RetryAfterFailure
-            | ChunkResumeAction::RebuildWithFreshBlockhash
+            ChunkResumeAction::RetryAfterFailure { .. }
+            | ChunkResumeAction::RebuildWithFreshBlockhash { .. }
             | ChunkResumeAction::NeedsSigning => continue,
             ChunkResumeAction::RebroadcastIdenticalBytes { .. } => {
                 return Err(Error::Config(format!(
-                    "chunk {chunk_index} was signed with a blockhash that is still valid and may \
-                     still land; retry --resume once it expires (about two minutes)"
+                    "chunk {chunk_index} was signed and may still land; retry --resume once its \
+                     blockhash expires at finalized commitment (about two minutes)"
                 )));
             }
             ChunkResumeAction::StopUnknown { signature } => {
@@ -1030,6 +1053,7 @@ fn associated_token_address(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pay_types::landing::SignatureStatus;
 
     #[test]
     fn usdtest_is_rejected_outside_devnet() {
@@ -1130,14 +1154,60 @@ mod tests {
         ]
     }
 
-    fn statuses(entries: &[(u8, RpcSignatureStatus)], block_height: u64) -> ResumeStatuses {
-        ResumeStatuses {
-            statuses: entries
+    /// A cluster at finalized `block_height` that knows `entries`; any other
+    /// signature leaves the lookup incomplete.
+    struct Chain {
+        entries: HashMap<String, SignatureStatus>,
+        block_height: u64,
+        context_slot: u64,
+    }
+
+    impl ChainState for Chain {
+        type Error = Error;
+
+        async fn finalized_tip(&self) -> Result<ChainTip> {
+            Ok(ChainTip {
+                slot: 50,
+                block_height: self.block_height,
+            })
+        }
+
+        async fn signature_statuses(&self, signatures: &[String]) -> Result<SignatureStatuses> {
+            Ok(SignatureStatuses {
+                context_slot: self.context_slot,
+                statuses: signatures
+                    .iter()
+                    .filter_map(|signature| self.entries.get(signature).copied())
+                    .collect(),
+            })
+        }
+    }
+
+    fn chain(entries: &[(u8, SignatureStatus)], block_height: u64) -> Chain {
+        Chain {
+            entries: entries
                 .iter()
                 .map(|(sig, status)| (signature(*sig), *status))
                 .collect(),
             block_height,
+            context_slot: 60,
         }
+    }
+
+    fn landings(chain: &Chain, events: &[JournalEvent]) -> ResumeStatuses {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(resume_landings(chain, events))
+            .unwrap()
+    }
+
+    fn statuses(
+        entries: &[(u8, SignatureStatus)],
+        block_height: u64,
+        events: &[JournalEvent],
+    ) -> ResumeStatuses {
+        landings(&chain(entries, block_height), events)
     }
 
     #[test]
@@ -1152,11 +1222,12 @@ mod tests {
         events.push(signed(6, 2, vec![5], 3));
         let rpc = statuses(
             &[
-                (1, RpcSignatureStatus::Confirmed),
-                (2, RpcSignatureStatus::Failed),
-                (3, RpcSignatureStatus::NotFound),
+                (1, SignatureStatus::Confirmed),
+                (2, SignatureStatus::Failed { finalized: true }),
+                (3, SignatureStatus::Absent),
             ],
             101,
+            &events,
         );
         verify_resume_journal(
             &events,
@@ -1188,7 +1259,7 @@ mod tests {
         let sender = Pubkey::new_unique();
         let mut events = run_events(&manifest, &sender);
         events.push(signed(3, 0, vec![2, 3], 9));
-        let rpc = statuses(&[(9, RpcSignatureStatus::Confirmed)], 1);
+        let rpc = statuses(&[(9, SignatureStatus::Confirmed)], 1, &events);
         let plan = plan_resume(&events, &manifest, &rpc).unwrap();
         assert!(plan.remaining.rows.is_empty());
         assert_eq!(plan.confirmed_chunks, 1);
@@ -1204,19 +1275,29 @@ mod tests {
         let mut events = run_events(&manifest, &sender);
         events.push(signed(3, 0, vec![2], 4));
         // Unseen but its blockhash is still valid (height == last valid).
-        let pending = statuses(&[(4, RpcSignatureStatus::NotFound)], 100);
+        let pending = statuses(&[(4, SignatureStatus::Absent)], 100, &events);
         assert!(
             plan_resume(&events, &manifest, &pending)
                 .unwrap_err()
                 .to_string()
                 .contains("may still land")
         );
-        let unknown = statuses(&[(4, RpcSignatureStatus::Unknown)], 500);
-        assert!(plan_resume(&events, &manifest, &unknown).is_err());
-        // A status lookup that never covered the signature is unknown too.
-        assert!(plan_resume(&events, &manifest, &statuses(&[], 500)).is_err());
+        // Seen but unconfirmed, or failed short of finalized, may still land.
+        for status in [
+            SignatureStatus::Processed,
+            SignatureStatus::Failed { finalized: false },
+        ] {
+            let seen = statuses(&[(4, status)], 100, &events);
+            assert!(plan_resume(&events, &manifest, &seen).is_err());
+        }
+        // A status lookup that never covered the signature is unknown.
+        assert!(plan_resume(&events, &manifest, &statuses(&[], 500, &events)).is_err());
+        // Statuses read from state older than the finalized tip prove nothing.
+        let mut stale = chain(&[(4, SignatureStatus::Absent)], 101);
+        stale.context_slot = 49;
+        assert!(plan_resume(&events, &manifest, &landings(&stale, &events)).is_err());
         // One block past expiry it is provably dead and may be replaced.
-        let expired = statuses(&[(4, RpcSignatureStatus::NotFound)], 101);
+        let expired = statuses(&[(4, SignatureStatus::Absent)], 101, &events);
         assert_eq!(
             plan_resume(&events, &manifest, &expired)
                 .unwrap()
@@ -1258,26 +1339,6 @@ mod tests {
                 &sender,
             )
             .is_err()
-        );
-    }
-
-    #[test]
-    fn signature_statuses_classify_failures_and_unconfirmed_as_not_paid_proofs() {
-        assert_eq!(
-            classify_signature_status(&Value::Null),
-            RpcSignatureStatus::NotFound
-        );
-        assert_eq!(
-            classify_signature_status(&json!({"err": {"x": 1}, "confirmationStatus": "finalized"})),
-            RpcSignatureStatus::Failed
-        );
-        assert_eq!(
-            classify_signature_status(&json!({"err": null, "confirmationStatus": "confirmed"})),
-            RpcSignatureStatus::Confirmed
-        );
-        assert_eq!(
-            classify_signature_status(&json!({"err": null, "confirmationStatus": "processed"})),
-            RpcSignatureStatus::Unknown
         );
     }
 
