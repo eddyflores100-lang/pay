@@ -784,6 +784,27 @@ mod tests {
     }
 
     #[test]
+    fn absurd_challenge_decimals_are_refused_before_the_wallet() {
+        for decimals in [serde_json::json!(128), serde_json::json!(1.5)] {
+            let mut challenge = split_charge(false);
+            let mut request: serde_json::Value = challenge.request.decode().unwrap();
+            request["currency"] = "Mint111111111111111111111111111111111111111".into();
+            request["methodDetails"]["decimals"] = decimals;
+            challenge.request = pay_kit::mpp::Base64UrlJson::from_value(&request).unwrap();
+            let err = build_credential_with_override(
+                &challenge,
+                &crate::accounts::MemoryAccountsStore::new(),
+                Some("mainnet"),
+                None,
+                None,
+                None,
+            )
+            .expect_err("absurd decimals must be refused");
+            assert!(matches!(err, Error::InvalidChallenge(_)), "{err}");
+        }
+    }
+
+    #[test]
     fn split_ata_rent_is_never_charged_to_the_payer_outside_the_amount() {
         let store = ephemeral_mainnet_store();
         let err = build_credential_with_override(
