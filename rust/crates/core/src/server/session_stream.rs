@@ -2428,6 +2428,51 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
     }
 
     #[tokio::test]
+    async fn a_cancelled_settlement_reports_its_earnings_once() {
+        let store = Arc::new(StallingStore {
+            inner: MemoryChannelStore::new(),
+            stall_at: 5,
+            stalled: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (session, _, meter) = delegated_test_meter_on(
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )],
+            "cancelled-earnings",
+            store,
+        )
+        .await;
+        let reported = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&reported);
+        let meter = meter.with_observer(Some(MeteredSettlement::with_callback(move |usd| {
+            *sink.lock().unwrap() = Some(usd);
+        })));
+        let upstream = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
+            Bytes::from_static(b"data: {\"choices\":[],\"usage\":{\"completion_tokens\":5}}\n\n"),
+        )])
+        .chain(futures_util::stream::pending());
+        let mut metered = Box::pin(meter_delegated_response_stream(upstream, meter, true));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), metered.next())
+                .await
+                .is_err()
+        );
+        drop(metered);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while reported.lock().unwrap().is_none() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let expected = 5.0 / 10f64.powi(i32::from(session.decimals()));
+        let reported = reported.lock().unwrap().expect("earnings reported");
+        assert!(
+            (reported - expected).abs() < 1e-12,
+            "{reported} != {expected}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_completed_stream_settles_provider_usage_once() {
         let (session, channel_id, meter) = interrupted_meter("completed-provider-usage").await;
         drain_delegated(
