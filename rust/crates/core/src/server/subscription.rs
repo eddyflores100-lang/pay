@@ -62,6 +62,13 @@ pub struct OperatorDefaults<'a> {
     pub store: Option<Arc<dyn pay_kit::mpp::store::Store>>,
 }
 
+/// Lifetime of a `put_if_absent` replay reservation (consumed activation or
+/// payment signatures). Far longer than any signed transaction stays
+/// submittable, so expiry never reopens a replay, while failed or abandoned
+/// reservations cannot grow the store without bound.
+#[cfg(feature = "redis-session-store")]
+pub const REPLAY_RESERVATION_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
 /// Durable subscription proof and replay store for multi-instance gateways.
 #[cfg(feature = "redis-session-store")]
 #[derive(Clone)]
@@ -190,6 +197,8 @@ impl pay_kit::mpp::store::Store for RedisSubscriptionStore {
                 .arg(key)
                 .arg(value)
                 .arg("NX")
+                .arg("EX")
+                .arg(REPLAY_RESERVATION_TTL_SECS)
                 .query_async(&mut connection)
                 .await
                 .map_err(|e| pay_kit::mpp::store::StoreError::Internal(e.to_string()))?;
@@ -678,6 +687,58 @@ mod tests {
         let json = serde_json::to_string(&plan_id).unwrap();
         let round_trip: f64 = serde_json::from_str(&json).unwrap();
         assert_eq!(round_trip as u64, plan_id);
+    }
+
+    /// Run with a dedicated disposable Redis via PAY_TEST_SUBSCRIPTION_REDIS_URL.
+    #[cfg(all(feature = "redis-session-store", feature = "network_tests"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replay_reservations_expire_but_bindings_persist() {
+        use pay_kit::mpp::store::Store;
+        let url = std::env::var("PAY_TEST_SUBSCRIPTION_REDIS_URL")
+            .expect("network_tests requires a dedicated PAY_TEST_SUBSCRIPTION_REDIS_URL");
+        let prefix = format!("pay:subscription-ttl-test:{}:", std::process::id());
+        let store = RedisSubscriptionStore::connect(&url, prefix.clone())
+            .await
+            .unwrap();
+        let redis = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_connection_manager()
+            .await
+            .unwrap();
+        let ttl = |key: String| {
+            let mut redis = redis.clone();
+            async move {
+                redis::cmd("TTL")
+                    .arg(key)
+                    .query_async::<i64>(&mut redis)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        assert!(
+            store
+                .put_if_absent("sig", serde_json::json!(true))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .put_if_absent("sig", serde_json::json!(true))
+                .await
+                .unwrap()
+        );
+        let reservation_ttl = ttl(format!("{prefix}sig")).await;
+        assert!(
+            reservation_ttl > 0 && reservation_ttl as u64 <= REPLAY_RESERVATION_TTL_SECS,
+            "{reservation_ttl}"
+        );
+        // Authentication bindings written with `put` are not reservations.
+        store.put("binding", serde_json::json!("b")).await.unwrap();
+        assert_eq!(ttl(format!("{prefix}binding")).await, -1);
+
+        store.delete("sig").await.unwrap();
+        store.delete("binding").await.unwrap();
     }
 
     fn operator_defaults<'a>() -> OperatorDefaults<'a> {
