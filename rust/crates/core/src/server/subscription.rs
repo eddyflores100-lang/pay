@@ -427,13 +427,52 @@ pub fn build_challenge(
         .map_err(|e| Error::Mpp(format!("Failed to build subscription challenge: {e}")))
 }
 
+/// The `(method, path)` route a subscription Plan belongs to. Every Plan
+/// lookup and YAML write-back keys by this, never by path alone.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PlanRoute {
+    method: String,
+    path: String,
+}
+
+impl PlanRoute {
+    pub fn new(method: &pay_types::metering::HttpMethod, path: &str) -> Self {
+        Self {
+            method: plan_route_method(method),
+            path: path.to_string(),
+        }
+    }
+
+    pub fn of(endpoint: &pay_types::metering::Endpoint) -> Self {
+        Self::new(&endpoint.method, &endpoint.path)
+    }
+
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// See [`compute_plan_id_numeric`].
+    pub fn plan_id_numeric(&self, operator: &str, api: &str) -> u64 {
+        compute_plan_id_numeric(operator, api, &self.method, &self.path)
+    }
+}
+
+impl std::fmt::Display for PlanRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}", self.method, self.path)
+    }
+}
+
 /// Outcome of [`ensure_plan_published`] for a single subscription endpoint.
 #[derive(Debug, Clone)]
 pub struct PublishedPlan {
-    /// Endpoint path the Plan was published for. Used as the YAML
-    /// match-key when writing the new IDs back.
-    pub endpoint_path: String,
-    /// Deterministic `plan_id` u64 derived from `(operator, endpoint.path)`.
+    /// Route the Plan was published for; the YAML write-back match key.
+    pub route: PlanRoute,
+    /// Deterministic `plan_id` u64 derived from the operator, API and route.
     pub plan_id_numeric: u64,
     /// On-chain `Plan` PDA (base58).
     pub plan_pda: String,
@@ -656,6 +695,7 @@ pub async fn publish_plan(
     operator: &solana_pubkey::Pubkey,
     operator_signer: std::sync::Arc<dyn pay_kit::mpp::solana_keychain::TransactionSigner>,
     rpc_url: &str,
+    route: PlanRoute,
     plan_id_numeric: u64,
 ) -> Result<PublishedPlan> {
     use pay_kit::mpp::program::subscriptions::{
@@ -722,7 +762,7 @@ pub async fn publish_plan(
     let plan_created_at = fetch_plan_created_at(rpc_url, &plan_pda).await?;
 
     Ok(PublishedPlan {
-        endpoint_path: String::new(), // caller fills this in
+        route,
         plan_id_numeric,
         plan_pda: plan_pda.to_string(),
         plan_bump,

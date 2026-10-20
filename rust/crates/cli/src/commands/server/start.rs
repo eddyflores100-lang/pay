@@ -3252,8 +3252,7 @@ async fn ensure_subscription_plans(
     use dialoguer::Confirm;
     use dialoguer::theme::ColorfulTheme;
     use pay_core::server::subscription::{
-        PlanStatus, check_plan_exists, compute_plan_id_numeric, fetch_plan, plan_route_method,
-        publish_plan,
+        PlanRoute, PlanStatus, check_plan_exists, fetch_plan, publish_plan,
     };
     use pay_kit::mpp::program::subscriptions::{default_program_id, find_plan_pda, plan_id_seed};
     use solana_pubkey::Pubkey;
@@ -3319,15 +3318,10 @@ async fn ensure_subscription_plans(
 
         // Stable id derived from the route (operator, API, method, path).
         // Reuse the value persisted in YAML if present so manual edits stick.
-        let route = format!("{} {}", plan_route_method(&endpoint.method), endpoint.path);
-        let plan_id_numeric = sub_spec.plan_id_numeric.unwrap_or_else(|| {
-            compute_plan_id_numeric(
-                operator_pubkey_str,
-                &api_subdomain,
-                &plan_route_method(&endpoint.method),
-                &endpoint.path,
-            )
-        });
+        let route = PlanRoute::new(&endpoint.method, &endpoint.path);
+        let plan_id_numeric = sub_spec
+            .plan_id_numeric
+            .unwrap_or_else(|| route.plan_id_numeric(operator_pubkey_str, &api_subdomain));
         let seed = plan_id_seed(plan_id_numeric);
         let (plan_pda, plan_bump) = find_plan_pda(&operator, &seed, &program_id);
         // A Plan authorizes every route it is attached to, so one per route.
@@ -3376,7 +3370,7 @@ async fn ensure_subscription_plans(
                 // Persist the hydrated fields so this launch and subsequent
                 // launches emit a complete, settle-able challenge.
                 publications.push(pay_core::server::subscription::PublishedPlan {
-                    endpoint_path: endpoint.path.clone(),
+                    route,
                     plan_id_numeric,
                     plan_pda: plan_pda.to_string(),
                     plan_bump,
@@ -3439,16 +3433,20 @@ async fn ensure_subscription_plans(
                 }
 
                 eprintln!("Publishing Plan…");
-                let mut published =
-                    publish_plan(sub_spec, &operator, signer, rpc_url, plan_id_numeric)
-                        .await
-                        .map_err(|e| {
-                            pay_core::Error::Config(format!(
-                                "create_plan broadcast failed for `{}`: {e}",
-                                endpoint.path
-                            ))
-                        })?;
-                published.endpoint_path = endpoint.path.clone();
+                let published = publish_plan(
+                    sub_spec,
+                    &operator,
+                    signer,
+                    rpc_url,
+                    route.clone(),
+                    plan_id_numeric,
+                )
+                .await
+                .map_err(|e| {
+                    pay_core::Error::Config(format!(
+                        "create_plan broadcast failed for `{route}`: {e}"
+                    ))
+                })?;
                 eprintln!(
                     "  {} {}",
                     "✓".green(),
@@ -3482,7 +3480,14 @@ async fn ensure_subscription_plans(
                 spec_path
             ))
         })?;
-        let updated = write_back_published_plans(&raw, &publications);
+        let (updated, missing) = write_back_published_plans(&raw, &publications);
+        for route in missing {
+            tracing::warn!(
+                endpoint = %route,
+                "could not locate the subscription block to persist its Plan; \
+                 the next start re-derives and reuses the same Plan"
+            );
+        }
         std::fs::write(expanded.as_ref(), updated).map_err(|e| {
             pay_core::Error::Config(format!("Failed to write spec {}: {e}", spec_path))
         })?;
@@ -3492,125 +3497,27 @@ async fn ensure_subscription_plans(
 }
 
 /// In-place YAML rewrite of `plan_id` / `plan_id_numeric` / `plan_bump`
-/// / `plan_created_at` under each freshly-published subscription block.
-/// Preserves comments and key ordering — line-based rewrite rather than
-/// a full serde round-trip.
+/// / `plan_created_at` under each freshly-published route's subscription
+/// block. Routes the rewrite cannot locate are returned.
 fn write_back_published_plans(
     yaml: &str,
     publications: &[pay_core::server::subscription::PublishedPlan],
-) -> String {
-    use std::collections::HashMap;
-    // Lookup by endpoint path.
-    let by_path: HashMap<&str, &pay_core::server::subscription::PublishedPlan> = publications
+) -> (String, Vec<pay_core::server::subscription::PlanRoute>) {
+    let updates = publications
         .iter()
-        .map(|p| (p.endpoint_path.as_str(), p))
+        .map(|p| {
+            (
+                p.route.clone(),
+                vec![
+                    ("plan_id", p.plan_pda.clone()),
+                    ("plan_id_numeric", p.plan_id_numeric.to_string()),
+                    ("plan_bump", p.plan_bump.to_string()),
+                    ("plan_created_at", p.plan_created_at.to_string()),
+                ],
+            )
+        })
         .collect();
-
-    let mut out = String::with_capacity(yaml.len() + 512);
-    let mut current_path: Option<String> = None;
-    let mut current_published: Option<&pay_core::server::subscription::PublishedPlan> = None;
-    let mut inside_subscription = false;
-    let mut subscription_indent: Option<usize> = None;
-    let mut wrote_fields = false;
-
-    for line in yaml.lines() {
-        let stripped = line.trim_start();
-        let indent = line.len() - stripped.len();
-
-        // Track current endpoint via `path:`.
-        if let Some(rest) = stripped.strip_prefix("path:") {
-            let path_value = rest.trim().trim_matches('"').trim_matches('\'').to_string();
-            current_published = by_path.get(path_value.as_str()).copied();
-            current_path = Some(path_value);
-            inside_subscription = false;
-            subscription_indent = None;
-            wrote_fields = false;
-        } else if stripped.starts_with("subscription:") {
-            inside_subscription = true;
-            subscription_indent = Some(indent);
-        } else if inside_subscription
-            && let Some(block_indent) = subscription_indent
-            && indent > block_indent
-        {
-            // Drop any pre-existing entries for the fields we're about to (re)write.
-            if let Some(published) = current_published {
-                let trimmed = stripped.trim_end();
-                if trimmed.starts_with("plan_id:")
-                    || trimmed.starts_with("plan_id_numeric:")
-                    || trimmed.starts_with("plan_bump:")
-                    || trimmed.starts_with("plan_created_at:")
-                {
-                    // Skip the existing line; we'll emit fresh ones below
-                    // when we leave the subscription block.
-                    let _ = published;
-                    continue;
-                }
-            }
-        } else if inside_subscription
-            && let Some(block_indent) = subscription_indent
-            && indent <= block_indent
-            && !stripped.is_empty()
-            && !stripped.starts_with('#')
-        {
-            // Leaving the subscription block — emit the published fields
-            // immediately before the closing line.
-            if let Some(published) = current_published
-                && !wrote_fields
-            {
-                let field_indent = " ".repeat(block_indent + 2);
-                out.push_str(&field_indent);
-                out.push_str("plan_id: ");
-                out.push_str(&published.plan_pda);
-                out.push('\n');
-                out.push_str(&field_indent);
-                out.push_str("plan_id_numeric: ");
-                out.push_str(&published.plan_id_numeric.to_string());
-                out.push('\n');
-                out.push_str(&field_indent);
-                out.push_str("plan_bump: ");
-                out.push_str(&published.plan_bump.to_string());
-                out.push('\n');
-                out.push_str(&field_indent);
-                out.push_str("plan_created_at: ");
-                out.push_str(&published.plan_created_at.to_string());
-                out.push('\n');
-                wrote_fields = true;
-            }
-            inside_subscription = false;
-            subscription_indent = None;
-        }
-
-        out.push_str(line);
-        out.push('\n');
-    }
-
-    // Trailing subscription block at EOF.
-    if inside_subscription
-        && let Some(published) = current_published
-        && !wrote_fields
-        && let Some(block_indent) = subscription_indent
-    {
-        let field_indent = " ".repeat(block_indent + 2);
-        out.push_str(&field_indent);
-        out.push_str("plan_id: ");
-        out.push_str(&published.plan_pda);
-        out.push('\n');
-        out.push_str(&field_indent);
-        out.push_str("plan_id_numeric: ");
-        out.push_str(&published.plan_id_numeric.to_string());
-        out.push('\n');
-        out.push_str(&field_indent);
-        out.push_str("plan_bump: ");
-        out.push_str(&published.plan_bump.to_string());
-        out.push('\n');
-        out.push_str(&field_indent);
-        out.push_str("plan_created_at: ");
-        out.push_str(&published.plan_created_at.to_string());
-        out.push('\n');
-    }
-
-    let _ = current_path;
-    out
+    super::plan_yaml::rewrite_subscription_fields(yaml, &updates)
 }
 
 fn resolve_operator_currencies(op: Option<&OperatorConfig>, cli_currency: &str) -> Vec<String> {
@@ -5639,6 +5546,65 @@ endpoints:
         assert!(
             msg.contains("backend: account"),
             "missing alt-backend hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn write_back_keeps_get_and_post_plans_on_the_same_path_apart() {
+        use pay_core::server::subscription::{PlanRoute, PublishedPlan};
+        use pay_types::metering::HttpMethod;
+
+        let yaml = "\
+name: t
+subdomain: t
+title: t
+description: t
+category: ai_ml
+version: v1
+routing:
+  type: proxy
+  url: https://example.com
+endpoints:
+  - method: GET
+    path: v1/feed
+    subscription:
+      period: 30d
+      currency: USDC
+  - method: POST
+    path: v1/feed
+    subscription:
+      period: 30d
+      currency: USDC
+";
+        let published = |method, numeric, pda: &str| PublishedPlan {
+            route: PlanRoute::new(&method, "v1/feed"),
+            plan_id_numeric: numeric,
+            plan_pda: pda.to_string(),
+            plan_bump: 254,
+            plan_created_at: 1_780_000_000,
+            broadcast_signature: None,
+        };
+        let publications = [
+            published(HttpMethod::Get, 11, "GetPlan"),
+            published(HttpMethod::Post, 22, "PostPlan"),
+        ];
+
+        let (out, missing) = super::write_back_published_plans(yaml, &publications);
+        assert!(missing.is_empty(), "{missing:?}");
+
+        // Reloading must see one Plan per route, not the last one twice.
+        let api: pay_types::metering::ApiSpec = serde_yml::from_str(&out).unwrap();
+        let plans: Vec<_> = api
+            .endpoints
+            .iter()
+            .map(|ep| {
+                let sub = ep.subscription.as_ref().unwrap();
+                (sub.plan_id.clone().unwrap(), sub.plan_id_numeric.unwrap())
+            })
+            .collect();
+        assert_eq!(
+            plans,
+            [("GetPlan".to_string(), 11), ("PostPlan".to_string(), 22)]
         );
     }
 }
