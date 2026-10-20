@@ -113,7 +113,13 @@ async fn echo_handler(req: Request<Body>) -> impl IntoResponse {
 }
 
 async fn start_test_server(with_mpp: bool) -> (String, tokio::task::JoinHandle<()>) {
-    let api = load_test_api();
+    start_test_server_with(load_test_api(), with_mpp).await
+}
+
+async fn start_test_server_with(
+    api: ApiSpec,
+    with_mpp: bool,
+) -> (String, tokio::task::JoinHandle<()>) {
     let mpp = if with_mpp {
         Mpp::new(pay_kit::mpp::server::Config {
             recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
@@ -977,6 +983,78 @@ async fn middleware_binds_session_vouchers_to_the_route_price() {
     .await
     .unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn middleware_binds_charge_credentials_to_their_route() {
+    // A second route with exactly the same payment terms as the echo route.
+    let mut api = load_test_api();
+    let mut twin = api
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.path == "v1/simple/echo")
+        .unwrap()
+        .clone();
+    twin.path = "v1/simple/twin".to_string();
+    api.endpoints.push(twin);
+    let (url, _h) = start_test_server_with(api, true).await;
+    let client = reqwest::Client::new();
+    let charge_challenge = |path: &'static str| {
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            let resp = client
+                .post(format!("{url}/{path}"))
+                .headers(client_with_host("testapi"))
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            let headers: Vec<_> = resp
+                .headers()
+                .get_all("www-authenticate")
+                .iter()
+                .map(|value| value.to_str().unwrap().to_string())
+                .collect();
+            pay_kit::mpp::parse_www_authenticate_all(headers.iter().map(String::as_str))
+                .into_iter()
+                .filter_map(Result::ok)
+                .find(|challenge| challenge.intent.as_str() == "charge")
+                .expect("charge challenge")
+        }
+    };
+    let present = |path: &'static str, challenge: pay_kit::mpp::PaymentChallenge| {
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            let credential = pay_kit::mpp::PaymentCredential::new(
+                challenge.to_echo(),
+                json!({ "type": "transaction", "transaction": "AQAB" }),
+            );
+            let resp = client
+                .post(format!("{url}/{path}"))
+                .headers(client_with_host("testapi"))
+                .header(
+                    "authorization",
+                    pay_kit::mpp::format_authorization(&credential).unwrap(),
+                )
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            (resp.status(), resp.text().await.unwrap())
+        }
+    };
+
+    let echo = charge_challenge("v1/simple/echo").await;
+    let (status, body) = present("v1/simple/twin", echo.clone()).await;
+    assert_eq!(status, 402);
+    assert!(body.contains("different route"), "{body}");
+    // On its own route the credential passes the route check and is judged
+    // on its (here invalid) payment instead.
+    let (status, body) = present("v1/simple/echo", echo).await;
+    assert_eq!(status, 402);
+    assert!(!body.contains("different route"), "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

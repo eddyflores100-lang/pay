@@ -916,6 +916,7 @@ impl<S: PaymentState> PaymentGate<S> {
                     resource,
                     pay_kit::mpp::protocol::solana::MAX_MEMO_BYTES,
                 );
+                let route = charge_route(req, subdomain, path);
                 let mut challenges = Vec::with_capacity(mpps.len());
                 for mpp in &mpps {
                     match crate::mpp_channel_profile::charge_with_options(
@@ -923,6 +924,7 @@ impl<S: PaymentState> PaymentGate<S> {
                         &amount,
                         ChargeOptions {
                             description,
+                            route: Some(&route),
                             // The main recipient's settlement memo is the endpoint
                             // resource plus a per-challenge suffix, so repeated
                             // same-route payments don't rely on blockhash uniqueness.
@@ -1812,6 +1814,7 @@ impl<S: PaymentState> PaymentGate<S> {
             ));
         }
 
+        let route = charge_route(req, subdomain, path);
         let mut last_error = None;
         for mpp in matching {
             // Audit: verify against the challenge WE would issue (rebuilt from our
@@ -1852,7 +1855,7 @@ impl<S: PaymentState> PaymentGate<S> {
                 }
             };
             match mpp
-                .verify_credential_with_expected(&credential, &expected)
+                .verify_credential_for_route(&credential, &expected, &route)
                 .await
             {
                 Ok(receipt) => {
@@ -2426,6 +2429,18 @@ fn upto_collected_amount_usd(
 }
 
 /// Reconstruct a minimal URI from path + query for split-rule resolution.
+/// The protected route an MPP charge challenge is bound to: method, API and
+/// path with query, so a credential for one route never runs another's
+/// handler even when their payment terms are equal.
+fn charge_route(req: &GateRequest<'_>, subdomain: &str, path: &str) -> String {
+    let query = req.query.map(|q| format!("?{q}")).unwrap_or_default();
+    format!(
+        "{} {subdomain}/{}{query}",
+        req.method,
+        path.trim_start_matches('/')
+    )
+}
+
 /// The request identity an x402 `upto` authorization is bound to: method,
 /// path and query. The host is client-supplied and left out.
 fn upto_route(req: &GateRequest<'_>, path: &str) -> String {

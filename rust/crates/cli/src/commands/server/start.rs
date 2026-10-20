@@ -4131,7 +4131,11 @@ async fn gateway_verify(
                     }
                 };
                 match mpp
-                    .verify_credential_with_expected(&credential, &expected)
+                    .verify_credential_for_route(
+                        &credential,
+                        &expected,
+                        &gateway_charge_route(&req),
+                    )
                     .await
                 {
                     Ok(receipt) => {
@@ -4226,11 +4230,17 @@ fn gateway_charge_challenges(
                     description: req.description.as_deref(),
                     external_id: req.external_id.as_deref(),
                     splits: splits.clone(),
+                    route: Some(&gateway_charge_route(req)),
                     ..Default::default()
                 },
             )
         })
         .collect()
+}
+
+/// The protected route a gateway charge is bound to.
+fn gateway_charge_route(req: &GatewayVerifyRequest) -> String {
+    format!("{} {}", req.method.to_ascii_uppercase(), req.path)
 }
 
 #[cfg(test)]
