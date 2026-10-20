@@ -658,6 +658,21 @@ async fn settlement_tx_version(rpc_url: Option<String>) -> pay_kit::core::tx::Tx
     .unwrap_or(pay_kit::core::tx::TxVersion::V0)
 }
 
+/// Most distribution recipients a channel may commit to: the most pay-worker's
+/// close can distribute in one transaction.
+pub const MAX_DISTRIBUTION_RECIPIENTS: usize = 50;
+
+/// Refuse to issue sessions whose distribution could never be paid out.
+fn ensure_distributable(recipients: usize) -> Result<()> {
+    if recipients > MAX_DISTRIBUTION_RECIPIENTS {
+        return Err(Error::Config(format!(
+            "session distribution has {recipients} recipients; at most \
+             {MAX_DISTRIBUTION_RECIPIENTS} can be distributed"
+        )));
+    }
+    Ok(())
+}
+
 /// Reusable session authorization needs the channel open on-chain: a payer
 /// may already have closed, sealed or distributed it. Without an RPC there is
 /// no chain to consult.
@@ -2407,6 +2422,7 @@ impl SessionMpp {
     /// default. Deployment challenges require async preparation first and use a
     /// cache-only builder, so expiry can never fall back to a confirmed RPC read.
     pub fn challenge(&self, amount: Option<u64>) -> Result<PaymentChallenge> {
+        ensure_distributable(self.session_config.splits.len())?;
         let request = if let Some(binding) = &self.channel_binding {
             let source = self.deployment_blockhash_source.as_ref().ok_or_else(|| {
                 Error::Config("deployment finalized blockhash source is missing".into())
@@ -4188,6 +4204,27 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         url
+    }
+
+    #[test]
+    fn sessions_are_not_issued_with_undistributable_splits() {
+        let session_with = |count: usize| {
+            let mut config = test_session_config();
+            config.splits = (0..count)
+                .map(|_| pay_kit::mpp::server::session::Split {
+                    recipient: solana_pubkey::Pubkey::new_unique(),
+                    bps: 1,
+                })
+                .collect();
+            SessionMpp::new(config, "test-secret").with_blockhash_cache(test_blockhash_cache())
+        };
+        session_with(MAX_DISTRIBUTION_RECIPIENTS)
+            .challenge(None)
+            .unwrap();
+        let error = session_with(MAX_DISTRIBUTION_RECIPIENTS + 1)
+            .challenge(None)
+            .unwrap_err();
+        assert!(error.to_string().contains("can be distributed"), "{error}");
     }
 
     #[test]
