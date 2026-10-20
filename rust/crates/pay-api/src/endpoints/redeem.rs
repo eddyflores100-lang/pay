@@ -27,7 +27,7 @@ use pay_api_core::receipt::MEMO_PROGRAM;
 use pay_api_types::Network;
 use pay_kit::mpp::solana_keychain::TransactionSigner;
 use pay_types::landing::{
-    ChainState, ChainTip, Landing, RecordedPayout, Replaceable, SignatureStatuses,
+    ChainState, ChainTip, Landing, RecordedPayout, ReplaceReason, Replaceable, SignatureStatuses,
     confirm_not_landed, signature_status_from_rpc,
 };
 use serde::{Deserialize, Serialize};
@@ -443,8 +443,16 @@ async fn release_signed_claim(
     cfg: &RedemptionState,
     code: &str,
     expected: &str,
-    _proof: ReleaseProof,
+    proof: ReleaseProof,
 ) -> Result<bool, redis::RedisError> {
+    let reason = match proof {
+        ReleaseProof::CannotLand(proof) => match proof.reason() {
+            ReplaceReason::Failed => "payout failed for good",
+            ReplaceReason::Expired => "payout expired unseen",
+        },
+        ReleaseProof::NeverBroadcast(_) => "payout rejected in preflight",
+    };
+    info!(reason, "releasing redemption claim");
     transition_claim(cfg, code, expected, None).await
 }
 
