@@ -303,6 +303,7 @@ async fn redeem(
 
 /// Resolve a claim left by an earlier attempt. `Ok(())` means the claim was
 /// released because its payout can never land, so the caller may claim again.
+#[allow(clippy::result_large_err)]
 async fn reconcile_existing_claim(
     state: &AppState,
     cfg: &RedemptionState,
@@ -382,6 +383,7 @@ async fn reconcile_existing_claim(
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn release_reconciled_claim(
     cfg: &RedemptionState,
     code: &str,
