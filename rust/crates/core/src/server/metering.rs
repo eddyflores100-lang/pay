@@ -96,10 +96,12 @@ pub fn find_endpoint<'a>(api: &'a ApiSpec, method: &str, path: &str) -> Option<&
 
 /// Find an endpoint by path only (ignoring HTTP method).
 /// Used for browser payment links where the browser sends GET to a POST endpoint.
+/// Literal paths win over `{param}` / `{*rest}` patterns, as in [`find_endpoint`].
 pub fn find_endpoint_by_path<'a>(api: &'a ApiSpec, path: &str) -> Option<&'a Endpoint> {
     api.endpoints
         .iter()
-        .find(|e| e.path == path || path_matches(&e.path, path))
+        .find(|e| e.path == path)
+        .or_else(|| api.endpoints.iter().find(|e| path_matches(&e.path, path)))
 }
 
 /// Match a path pattern like "v1beta/models/{modelsId}:generateContent"

@@ -123,19 +123,12 @@ const RFC3986_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
 /// Endpoint selection mirrors the payment gate: literal paths win over
 /// `{param}` / `{*rest}` patterns, so a concrete request the gate matched
 /// against a pattern also inherits that endpoint's routing override.
+///
+/// Forwarding uses [`UpstreamRoute::routing`] instead, which follows the
+/// endpoint the gate actually selected.
 pub fn resolve_routing<'a>(api: &'a ApiSpec, path: &str) -> &'a RoutingConfig {
-    let trimmed = path.trim_start_matches('/');
-    let literal = api.endpoints.iter().any(|ep| ep.path == trimmed);
-    api.endpoints
-        .iter()
-        .filter(|ep| {
-            if literal {
-                ep.path == trimmed
-            } else {
-                metering::path_matches(&ep.path, trimmed)
-            }
-        })
-        .find_map(|ep| ep.routing.as_ref())
+    metering::find_endpoint_by_path(api, path.trim_start_matches('/'))
+        .and_then(|ep| ep.routing.as_ref())
         .unwrap_or(&api.routing)
 }
 
@@ -146,9 +139,9 @@ pub fn resolve_routing<'a>(api: &'a ApiSpec, path: &str) -> &'a RoutingConfig {
 /// The axum path always has the buffered body. The Pingora data plane uses this
 /// signal to select its bounded request-buffering adapter instead of preparing a
 /// signature against an empty placeholder body.
-pub fn routing_signs_request_body(api: &ApiSpec, path: &str) -> bool {
+pub fn routing_signs_request_body(api: &ApiSpec, route: &UpstreamRoute) -> bool {
     use pay_types::metering::{AuthConfig, HmacPrepareValue};
-    let prepares = match resolve_routing(api, path).auth() {
+    let prepares = match route.routing(api).auth() {
         Some(AuthConfig::Hmac { prepare, .. } | AuthConfig::AccessToken { prepare, .. }) => prepare,
         _ => return false,
     };
@@ -376,7 +369,7 @@ pub async fn prepare_upstream_with_identity(
         ));
     }
 
-    let routing = resolve_routing(api, uri.path());
+    let routing = route.routing(api);
 
     // Respond mode — no upstream call.
     if routing.is_respond() {
@@ -1756,15 +1749,19 @@ mod tests {
         // Alibaba-style HMAC includes a Content-MD5 `BodyDigest` prepare binding,
         // so it signs the request body → unsupported on the streaming data plane.
         let api = api_with_auth(Some(alibaba_hmac_auth_config(true)));
-        assert!(routing_signs_request_body(&api, "v1/anything"));
+        assert!(routing_signs_request_body(
+            &api,
+            &UpstreamRoute::for_tests(&api, &Method::POST, "v1/anything")
+        ));
     }
 
     #[test]
     fn routing_signs_request_body_false_when_body_untouched() {
         // No upstream auth at all.
+        let api = make_api("test");
         assert!(!routing_signs_request_body(
-            &make_api("test"),
-            "v1/anything"
+            &api,
+            &UpstreamRoute::for_tests(&api, &Method::POST, "v1/anything")
         ));
         // Header auth never reads the body.
         let header = api_with_auth(Some(AuthConfig::Header {
@@ -1772,7 +1769,10 @@ mod tests {
             prefix: Some("Bearer ".to_string()),
             value_from_env: "_TEST_KEY".to_string(),
         }));
-        assert!(!routing_signs_request_body(&header, "v1/anything"));
+        assert!(!routing_signs_request_body(
+            &header,
+            &UpstreamRoute::for_tests(&header, &Method::POST, "v1/anything")
+        ));
     }
 
     fn alibaba_hmac_auth_config(fixed_values: bool) -> AuthConfig {

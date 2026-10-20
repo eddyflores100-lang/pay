@@ -254,7 +254,7 @@ impl<S: PaymentState> Http402Gate<S> {
         // Body-digest auth needs the complete request before auth preparation.
         // Keep the common case on Pingora's native streaming path and route only
         // these endpoints through the bounded reqwest adapter.
-        if routing_signs_request_body(api, path) {
+        if routing_signs_request_body(api, route) {
             return self
                 .forward_buffered(session, ctx, path, route, host, method, uri, headers)
                 .await;
@@ -2604,6 +2604,73 @@ mod tests {
         assert!(prepared.headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("content-md5") && value == "XUFAKrxLKna5cZ2REBfFkg=="
         }));
+    }
+
+    #[tokio::test]
+    async fn forwarding_follows_the_endpoint_the_gate_selected() {
+        use pay_types::metering::{Endpoint, HttpMethod};
+        let endpoint = |method, path: &str, routing| Endpoint {
+            method,
+            path: path.to_string(),
+            description: None,
+            resource: None,
+            routing,
+            metering: None,
+            subscription: None,
+        };
+        let mut api = body_signing_api();
+        api.routing = RoutingConfig::Proxy {
+            url: "https://upstream.example".to_string(),
+            path_rewrites: vec![],
+            auth: None,
+        };
+        api.endpoints = vec![
+            // Same path, other method: must not lend its override to POST.
+            endpoint(
+                HttpMethod::Get,
+                "v1/projects/query",
+                Some(RoutingConfig::Respond {}),
+            ),
+            // First POST pattern: the gate selects it; it has no override.
+            endpoint(HttpMethod::Post, "v1/{scope}/query", None),
+            // Later overlapping pattern with an override.
+            endpoint(
+                HttpMethod::Post,
+                "v1/projects/{name}",
+                Some(RoutingConfig::Respond {}),
+            ),
+        ];
+        let state = BodySigningState { apis: vec![api] };
+        let gate = pay_core::server::gate::PaymentGate::new(state.clone());
+        let decision = gate
+            .evaluate(&pay_core::server::gate::GateRequest {
+                method: &http::Method::POST,
+                path: "v1/projects/query",
+                host: Some("signed.example"),
+                accept: None,
+                authorization: None,
+                content_length: None,
+                query: None,
+                x402_payment: None,
+            })
+            .await;
+        let pay_core::server::gate::GateDecision::Passthrough(route) = decision else {
+            panic!("a free declared endpoint is a passthrough");
+        };
+        let plan = pay_core::server::proxy::prepare_upstream(
+            &state.apis[0],
+            &route,
+            &http::Method::POST,
+            &"/v1/projects/query".parse().unwrap(),
+            &HeaderMap::new(),
+            b"",
+        )
+        .await
+        .expect("request prepares");
+        let UpstreamPlan::Forward(prepared) = plan else {
+            panic!("the selected endpoint proxies; another endpoint's override must not apply");
+        };
+        assert_eq!(prepared.url.host_str(), Some("upstream.example"));
     }
 
     #[test]

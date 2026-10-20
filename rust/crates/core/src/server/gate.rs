@@ -27,7 +27,7 @@ use pay_kit::x402::PAYMENT_RESPONSE_HEADER;
 use pay_kit::x402::server::{
     BatchAccess, BatchOutcome, ExactOptions, VerifiedUptoOpen, X402, X402BatchSettlement, X402Upto,
 };
-use pay_types::metering::{ApiSpec, Scheme};
+use pay_types::metering::{ApiSpec, Endpoint, RoutingConfig, Scheme};
 use serde_json::json;
 
 use crate::PaymentState;
@@ -471,15 +471,27 @@ pub struct UpstreamRoute {
     subdomain: String,
     method: Method,
     path: String,
+    /// Index of the endpoint the gate selected (and billed) for this request.
+    endpoint: Option<usize>,
 }
 
 impl UpstreamRoute {
-    fn new(api: &ApiSpec, req: &GateRequest<'_>) -> Self {
+    fn new(api: &ApiSpec, req: &GateRequest<'_>, endpoint: Option<&Endpoint>) -> Self {
         Self {
             subdomain: api.subdomain.clone(),
             method: req.method.clone(),
             path: req.path.to_string(),
+            endpoint: endpoint_index(api, endpoint),
         }
+    }
+
+    /// Routing of the endpoint the gate selected, else the API default, so
+    /// forwarding can never use a different endpoint than billing did.
+    pub(crate) fn routing<'a>(&self, api: &'a ApiSpec) -> &'a RoutingConfig {
+        self.endpoint
+            .and_then(|i| api.endpoints.get(i))
+            .and_then(|ep| ep.routing.as_ref())
+            .unwrap_or(&api.routing)
     }
 
     /// Whether this admission covers `method` on the wire path `path` of `api`.
@@ -491,12 +503,23 @@ impl UpstreamRoute {
 
     #[cfg(test)]
     pub(crate) fn for_tests(api: &ApiSpec, method: &Method, path: &str) -> Self {
+        let path = path.strip_prefix('/').unwrap_or(path);
+        let endpoint = metering::find_endpoint(api, method.as_str(), path)
+            .or_else(|| metering::find_endpoint_by_path(api, path));
         Self {
             subdomain: api.subdomain.clone(),
             method: method.clone(),
-            path: path.strip_prefix('/').unwrap_or(path).to_string(),
+            path: path.to_string(),
+            endpoint: endpoint_index(api, endpoint),
         }
     }
+}
+
+fn endpoint_index(api: &ApiSpec, endpoint: Option<&Endpoint>) -> Option<usize> {
+    let endpoint = endpoint?;
+    api.endpoints
+        .iter()
+        .position(|ep| std::ptr::eq(ep, endpoint))
 }
 
 /// The API a request host selects: by subdomain, or the only configured API.
@@ -592,7 +615,10 @@ impl<S: PaymentState> PaymentGate<S> {
                             Bytes::from_static(br#"{"error":"not_found"}"#),
                         ));
                     };
-                    let route = UpstreamRoute::new(api, req);
+                    let path = req.path.trim_start_matches('/');
+                    let endpoint = metering::find_endpoint(api, req.method.as_str(), path)
+                        .or_else(|| metering::find_endpoint_by_path(api, path));
+                    let route = UpstreamRoute::new(api, req, endpoint);
                     let mut decision = session_authorized(
                         &session,
                         Some(Arc::clone(&session)),
@@ -742,11 +768,11 @@ impl<S: PaymentState> PaymentGate<S> {
             // Path-only resolution exists to render or verify a payment; it
             // never admits another method to a free endpoint.
             if exact_match.is_some() || api.endpoints.is_empty() {
-                return GateDecision::Passthrough(UpstreamRoute::new(api, req));
+                return GateDecision::Passthrough(UpstreamRoute::new(api, req, endpoint));
             }
             return GateDecision::Local;
         }
-        let route = UpstreamRoute::new(api, req);
+        let route = UpstreamRoute::new(api, req, endpoint);
 
         // Custom PaymentState implementations can bypass CLI startup validation.
         // Never advertise or process payments for an unavailable credit provider.
