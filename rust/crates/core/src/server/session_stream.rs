@@ -275,6 +275,10 @@ impl DelegatedSessionStreamMeter {
         if self.accumulator.finish_stream(is_sse)? {
             self.current = self.accumulator.observation();
         }
+        self.final_decision()
+    }
+
+    fn final_decision(&mut self) -> MeteringResult<Option<SessionGateDecision>> {
         if !self.accumulator.has_observation() || self.authorization_exhausted {
             return Ok(None);
         }
@@ -391,6 +395,60 @@ impl DelegatedSessionStreamMeter {
             self.settle(decision).await?;
         }
         Ok(())
+    }
+
+    /// Persist the usage a stream that ended early implies.
+    async fn abort_stream(&mut self) -> Result<(), BoxError> {
+        if self.accumulator.abort_stream()? {
+            self.current = self.accumulator.observation();
+        }
+        if let Some(decision) = self.final_decision()? {
+            self.settle(decision).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Owns a delegated meter for one response body. Dropped before the stream
+/// completed — client disconnect, upstream or metering error — it settles
+/// the usage already released, missing-usage bounds included, so no exit
+/// path skips the final charge.
+struct DelegatedStreamFinalizer {
+    meter: Option<DelegatedSessionStreamMeter>,
+}
+
+impl DelegatedStreamFinalizer {
+    fn meter(&mut self) -> &mut DelegatedSessionStreamMeter {
+        self.meter
+            .as_mut()
+            .expect("the meter is held until the stream completes")
+    }
+
+    async fn finish(&mut self, is_sse: bool) -> Result<(), BoxError> {
+        self.meter().finish_stream(is_sse).await?;
+        self.meter = None;
+        Ok(())
+    }
+}
+
+impl Drop for DelegatedStreamFinalizer {
+    fn drop(&mut self) {
+        let Some(mut meter) = self.meter.take() else {
+            return;
+        };
+        let channel_id = meter.forward.channel_id.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    if let Err(error) = meter.abort_stream().await {
+                        tracing::error!(%error, %channel_id, "failed to settle an interrupted delegated stream");
+                    }
+                });
+            }
+            Err(_) => {
+                tracing::error!(%channel_id, "interrupted delegated stream dropped outside a runtime; usage not settled");
+            }
+        }
     }
 }
 
@@ -517,26 +575,28 @@ where
 /// Wrap a delegated-session response stream without buffering it.
 ///
 /// Chargeable chunks remain behind the payment gate until the gateway's
-/// cumulative voucher has been persisted. Dropping the returned stream drops
-/// the owned meter and releases its exclusive capacity lease.
+/// cumulative voucher has been persisted. Dropping the returned stream early
+/// settles the usage already released, then releases the meter's exclusive
+/// capacity lease.
 pub(crate) fn meter_delegated_response_stream<S, E>(
     stream: S,
-    mut meter: DelegatedSessionStreamMeter,
+    meter: DelegatedSessionStreamMeter,
     is_sse: bool,
 ) -> impl Stream<Item = Result<Bytes, BoxError>> + Send + 'static
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: StdError + Send + Sync + 'static,
 {
+    let mut meter = DelegatedStreamFinalizer { meter: Some(meter) };
     async_stream::try_stream! {
         futures_util::pin_mut!(stream);
         while let Some(next) = stream.next().await {
             let chunk = next.map_err(box_error)?;
-            meter.authorize_chunk(&chunk, is_sse).await?;
+            meter.meter().authorize_chunk(&chunk, is_sse).await?;
             yield chunk;
         }
 
-        meter.finish_stream(is_sse).await?;
+        meter.finish(is_sse).await?;
     }
 }
 
@@ -679,8 +739,25 @@ impl StreamUsageAccumulator {
         } else {
             self.finish_ndjson()?
         };
+        let bounded = self.settle_missing_usage()?;
+        self.observed |= changed;
+        Ok(changed || bounded)
+    }
+
+    /// The stream was cut short (disconnect, upstream or metering error):
+    /// settle the missing-usage bounds for what it carried. Partial input is
+    /// not flushed.
+    fn abort_stream(&mut self) -> MeteringResult<bool> {
+        if !self.request_seen {
+            return Ok(false);
+        }
+        self.settle_missing_usage()
+    }
+
+    /// From here on, missing provider usage rates at its upper bounds.
+    fn settle_missing_usage(&mut self) -> MeteringResult<bool> {
         self.finished = true;
-        let mut changed = changed || (!self.provider_output_tokens && self.output_text_bytes > 0);
+        let mut changed = !self.provider_output_tokens && self.output_text_bytes > 0;
         if !self.provider_input_tokens
             && let Some(unit) = self.charged_input_token_unit()
         {
@@ -2118,6 +2195,94 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         .unwrap();
 
         assert_eq!(session.committed_watermark(&channel_id), Some(300));
+    }
+
+    async fn interrupted_meter(
+        label: &str,
+    ) -> (Arc<SessionMpp>, String, DelegatedSessionStreamMeter) {
+        let (session, channel_id, meter) = delegated_test_meter(
+            vec![
+                token_dimension(MeterDirection::Input, "/usage/prompt_tokens"),
+                token_dimension(MeterDirection::Output, "/usage/completion_tokens"),
+            ],
+            label,
+        )
+        .await;
+        (session, channel_id, meter.with_request_body_bytes(40))
+    }
+
+    async fn settled_watermark(
+        session: &SessionMpp,
+        channel_id: &str,
+        expected: u64,
+    ) -> Option<u64> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let watermark = session.committed_watermark(channel_id);
+            if watermark == Some(expected) || Instant::now() > deadline {
+                return watermark;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_upstream_error_still_settles_the_missing_usage_bounds() {
+        let payload = "!?".repeat(64);
+        let (session, channel_id, meter) = interrupted_meter("upstream-error-bounds").await;
+        let upstream = futures_util::stream::iter(vec![
+            Ok(Bytes::from(sse_text_event(&payload))),
+            Err(std::io::Error::other("upstream reset")),
+        ]);
+        let mut metered = Box::pin(meter_delegated_response_stream(upstream, meter, true));
+        assert!(metered.next().await.unwrap().is_ok(), "text is released");
+        assert!(metered.next().await.unwrap().is_err());
+        drop(metered);
+
+        // Input from the request body bound, output from the text bytes.
+        let expected = 40 + payload.len() as u64;
+        assert_eq!(
+            settled_watermark(&session, &channel_id, expected).await,
+            Some(expected)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_disconnect_still_settles_the_missing_usage_bounds() {
+        let payload = "!?".repeat(64);
+        let (session, channel_id, meter) = interrupted_meter("disconnect-bounds").await;
+        let upstream = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(
+            sse_text_event(&payload),
+        ))])
+        .chain(futures_util::stream::pending());
+        let mut metered = Box::pin(meter_delegated_response_stream(upstream, meter, true));
+        assert!(metered.next().await.unwrap().is_ok(), "text is released");
+        // The buyer disconnects before the stream completes.
+        drop(metered);
+
+        let expected = 40 + payload.len() as u64;
+        assert_eq!(
+            settled_watermark(&session, &channel_id, expected).await,
+            Some(expected)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_stream_settles_provider_usage_once() {
+        let (session, channel_id, meter) = interrupted_meter("completed-provider-usage").await;
+        drain_delegated(
+            vec![
+                sse_text_event("hello world"),
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n"
+                    .to_vec(),
+                b"data: [DONE]\n\n".to_vec(),
+            ],
+            meter,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(session.committed_watermark(&channel_id), Some(5));
     }
 
     #[test]
