@@ -315,10 +315,12 @@ impl DelegatedSessionStreamMeter {
             self.authorization_exhausted |= exhausted_by_reprice;
             return Ok(());
         }
+        // A fixed cumulative target, never a delta: an attempt interrupted
+        // after its voucher was saved is then not charged again on retry.
         let accepted = self
             .forward
             .handle
-            .authorize_delegated_usage(&self.forward.channel_id, amount)
+            .authorize_delegated_cumulative(&self.forward.channel_id, target)
             .await
             .map_err(box_error)?;
         self.gate.record_commit(accepted.cumulative);
@@ -1917,6 +1919,14 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         dimensions: Vec<MeterDimension>,
         label: &str,
     ) -> (Arc<SessionMpp>, String, DelegatedSessionStreamMeter) {
+        delegated_test_meter_on(dimensions, label, Arc::new(MemoryChannelStore::new())).await
+    }
+
+    async fn delegated_test_meter_on(
+        dimensions: Vec<MeterDimension>,
+        label: &str,
+        store: Arc<dyn ChannelStore>,
+    ) -> (Arc<SessionMpp>, String, DelegatedSessionStreamMeter) {
         use ed25519_dalek::SigningKey;
 
         let signing_key = SigningKey::generate(&mut rand::thread_rng());
@@ -1925,7 +1935,6 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         operator_keypair[32..].copy_from_slice(signing_key.verifying_key().as_bytes());
         let operator: Arc<dyn TransactionSigner> =
             Arc::new(MemorySigner::from_bytes(&operator_keypair).unwrap());
-        let store: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::new());
         let session = Arc::new(
             SessionMpp::new_with_channel_store(
                 SessionConfig {
@@ -2265,6 +2274,157 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             settled_watermark(&session, &channel_id, expected).await,
             Some(expected)
         );
+    }
+
+    /// A store whose first read after the watermark reaches `stall_at` never
+    /// answers: an attempt that saved its voucher is then cancelled while it
+    /// waits on the lifecycle touch that follows.
+    struct StallingStore {
+        inner: MemoryChannelStore,
+        stall_at: u64,
+        stalled: std::sync::atomic::AtomicBool,
+    }
+
+    type StoreFuture<'a, T> = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<T, pay_kit::mpp::store::StoreError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    impl ChannelStore for StallingStore {
+        fn list_channels(&self) -> StoreFuture<'_, Vec<pay_kit::mpp::store::ChannelState>> {
+            self.inner.list_channels()
+        }
+
+        fn get_channel(
+            &self,
+            channel_id: &str,
+        ) -> StoreFuture<'_, Option<pay_kit::mpp::store::ChannelState>> {
+            let channel_id = channel_id.to_string();
+            Box::pin(async move {
+                let state = self.inner.get_channel(&channel_id).await?;
+                if state
+                    .as_ref()
+                    .is_some_and(|state| state.cumulative >= self.stall_at)
+                    && !self.stalled.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    std::future::pending::<()>().await;
+                }
+                Ok(state)
+            })
+        }
+
+        fn put_channel(
+            &self,
+            channel_id: &str,
+            state: pay_kit::mpp::store::ChannelState,
+        ) -> StoreFuture<'_, ()> {
+            self.inner.put_channel(channel_id, state)
+        }
+
+        fn delete_channel(&self, channel_id: &str) -> StoreFuture<'_, ()> {
+            self.inner.delete_channel(channel_id)
+        }
+
+        fn update_channel(
+            &self,
+            channel_id: &str,
+            updater: Box<
+                dyn FnOnce(
+                        Option<pay_kit::mpp::store::ChannelState>,
+                    ) -> Result<
+                        pay_kit::mpp::store::ChannelState,
+                        pay_kit::mpp::store::StoreError,
+                    > + Send,
+            >,
+        ) -> StoreFuture<'_, pay_kit::mpp::store::ChannelState> {
+            self.inner.update_channel(channel_id, updater)
+        }
+
+        fn read_channel(
+            &self,
+            channel_id: &str,
+            reader: pay_kit::mpp::store::ChannelReader,
+        ) -> StoreFuture<'_, ()> {
+            self.inner.read_channel(channel_id, reader)
+        }
+
+        fn mutate_channel(
+            &self,
+            channel_id: &str,
+            seed: Option<pay_kit::mpp::store::ChannelState>,
+            mutator: pay_kit::mpp::store::ChannelMutator,
+        ) -> StoreFuture<'_, ()> {
+            self.inner.mutate_channel(channel_id, seed, mutator)
+        }
+
+        fn touch_channel_lifecycle(
+            &self,
+            channel_id: &str,
+            lifecycle: pay_kit::mpp::store::ChannelLifecycle,
+        ) -> StoreFuture<'_, pay_kit::mpp::store::ChannelState> {
+            self.inner.touch_channel_lifecycle(channel_id, lifecycle)
+        }
+
+        fn advance_cumulative(
+            &self,
+            channel_id: &str,
+            expected: u64,
+            new: u64,
+        ) -> StoreFuture<'_, bool> {
+            self.inner.advance_cumulative(channel_id, expected, new)
+        }
+
+        fn update_deposit(&self, channel_id: &str, new_deposit: u64) -> StoreFuture<'_, ()> {
+            self.inner.update_deposit(channel_id, new_deposit)
+        }
+
+        fn mark_sealed(&self, channel_id: &str) -> StoreFuture<'_, ()> {
+            self.inner.mark_sealed(channel_id)
+        }
+
+        fn mark_finalized(&self, channel_id: &str) -> StoreFuture<'_, ()> {
+            self.inner.mark_finalized(channel_id)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_settlement_is_never_charged_twice() {
+        let store = Arc::new(StallingStore {
+            inner: MemoryChannelStore::new(),
+            stall_at: 5,
+            stalled: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (session, channel_id, meter) = delegated_test_meter_on(
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )],
+            "cancelled-settlement",
+            store.clone(),
+        )
+        .await;
+        let upstream = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
+            Bytes::from_static(b"data: {\"choices\":[],\"usage\":{\"completion_tokens\":5}}\n\n"),
+        )])
+        .chain(futures_util::stream::pending());
+        let mut metered = Box::pin(meter_delegated_response_stream(upstream, meter, true));
+        // The voucher for 5 is saved, then the lifecycle touch never returns.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), metered.next())
+                .await
+                .is_err()
+        );
+        assert!(store.stalled.load(std::sync::atomic::Ordering::SeqCst));
+        // The buyer disconnects mid-settlement; the finalizer retries.
+        drop(metered);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let state = store.inner.get_channel(&channel_id).await.unwrap().unwrap();
+        assert_eq!(state.cumulative, 5, "the usage is charged exactly once");
+        assert_eq!(session.committed_watermark(&channel_id), Some(5));
     }
 
     #[tokio::test]

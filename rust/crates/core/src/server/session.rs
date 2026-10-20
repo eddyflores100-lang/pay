@@ -217,6 +217,14 @@ pub enum SessionOutcome {
     },
 }
 
+/// How a delegated charge is expressed: an increment on whatever the
+/// watermark is, or the cumulative total it must reach.
+#[derive(Debug, Clone, Copy)]
+enum UsageCharge {
+    Delta(u64),
+    Cumulative(u64),
+}
+
 /// State needed to emit a canonical receipt after delegated usage is accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelegatedUsageAuthorization {
@@ -2047,12 +2055,45 @@ impl SessionMpp {
             .await
     }
 
+    /// Bring the channel's operator-signed cumulative to `target`.
+    ///
+    /// Idempotent: a target the durable watermark already covers is applied,
+    /// so a settlement retried after an interrupted attempt never charges the
+    /// same usage twice.
+    pub async fn authorize_delegated_cumulative(
+        &self,
+        channel_id: &str,
+        target: u64,
+    ) -> Result<DelegatedUsageAuthorization> {
+        self.authorize_usage(channel_id, UsageCharge::Cumulative(target), None)
+            .await
+    }
+
     pub async fn authorize_reserved_usage(
         &self,
         channel_id: &str,
         amount: u64,
         lease: Option<&DelegatedCapacityLease>,
     ) -> Result<DelegatedUsageAuthorization> {
+        self.authorize_usage(channel_id, UsageCharge::Delta(amount), lease)
+            .await
+    }
+
+    async fn authorize_usage(
+        &self,
+        channel_id: &str,
+        charge: UsageCharge,
+        lease: Option<&DelegatedCapacityLease>,
+    ) -> Result<DelegatedUsageAuthorization> {
+        let requested = match charge {
+            UsageCharge::Delta(amount) => amount,
+            UsageCharge::Cumulative(_) if lease.is_some() => {
+                return Err(Error::Mpp(
+                    "a reserved charge is priced per request, not as a cumulative".into(),
+                ));
+            }
+            UsageCharge::Cumulative(_) => 0,
+        };
         let lease_id = lease.and_then(|lease| lease.durable_id.clone());
         if self.channel_binding.is_some() && lease_id.is_none() {
             return Err(Error::PaymentRejected(
@@ -2065,9 +2106,9 @@ impl SessionMpp {
                     "reservation belongs to another channel".into(),
                 ));
             }
-            lease.require_active(amount).await?;
+            lease.require_active(requested).await?;
         }
-        if self.channel_binding.is_some() && amount != self.session_config.amount {
+        if self.channel_binding.is_some() && requested != self.session_config.amount {
             return Err(Error::PaymentRejected(
                 "deployment charge differs from policy price".into(),
             ));
@@ -2108,6 +2149,10 @@ impl SessionMpp {
             ))
         })?;
         self.record_committed_watermark(channel_id.to_string(), current);
+        let amount = match charge {
+            UsageCharge::Delta(amount) => amount,
+            UsageCharge::Cumulative(target) => target.saturating_sub(current),
+        };
         if amount == 0 {
             return Ok(DelegatedUsageAuthorization {
                 cumulative: current,
