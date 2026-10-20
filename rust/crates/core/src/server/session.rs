@@ -2007,7 +2007,7 @@ impl SessionMpp {
         if self.network() == "localnet" && self.decimals() == 6 {
             return Ok(());
         }
-        if !matches!(self.network(), "mainnet" | "devnet" | "testnet")
+        if !matches!(self.network(), "mainnet" | "devnet")
             || self.decimals() != 6
             || !self.accepts_currency(pay_types::Stablecoin::Usdc.mint(Some(self.network())))
         {
@@ -3057,11 +3057,17 @@ pub fn test_channel_state(
 fn payment_channel_treasury_owner(network: &str) -> Result<solana_pubkey::Pubkey> {
     const DEVNET_TREASURY_OWNER: &str = "4zTeC5mVqWLruDexgU2mV66p9t5vCA9JyiZqdGDUspap";
 
-    if network == "devnet" {
-        return solana_pubkey::Pubkey::from_str(DEVNET_TREASURY_OWNER)
-            .map_err(|error| Error::Mpp(format!("invalid devnet treasury owner: {error}")));
+    match network {
+        "devnet" => solana_pubkey::Pubkey::from_str(DEVNET_TREASURY_OWNER)
+            .map_err(|error| Error::Mpp(format!("invalid devnet treasury owner: {error}"))),
+        // Localnet runs the mainnet build of the program.
+        "mainnet" | "mainnet-beta" | "localnet" => {
+            Ok(pay_kit::mpp::program::payment_channels::treasury_owner())
+        }
+        other => Err(Error::Mpp(format!(
+            "no payment-channels treasury owner for network `{other}`"
+        ))),
     }
-    Ok(pay_kit::mpp::program::payment_channels::treasury_owner())
 }
 
 fn decode_voucher_signature(signature: &str) -> Result<[u8; 64]> {
@@ -3853,6 +3859,20 @@ mod tests {
                 .to_string(),
             "4zTeC5mVqWLruDexgU2mV66p9t5vCA9JyiZqdGDUspap"
         );
+    }
+
+    #[test]
+    fn payment_channel_treasury_owner_rejects_unknown_networks() {
+        let mainnet = pay_kit::mpp::program::payment_channels::treasury_owner();
+        for network in ["mainnet", "mainnet-beta", "localnet"] {
+            assert_eq!(payment_channel_treasury_owner(network).unwrap(), mainnet);
+        }
+        for network in ["testnet", "devnet2", "", "solana:mainnet"] {
+            assert!(
+                payment_channel_treasury_owner(network).is_err(),
+                "{network} must not fall back to the mainnet treasury"
+            );
+        }
     }
 
     #[test]
