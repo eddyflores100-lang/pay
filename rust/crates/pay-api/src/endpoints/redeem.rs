@@ -246,10 +246,19 @@ async fn redeem(
 
     // 5. Broadcast, then wait for the payout to confirm before reporting it.
     if let Err(error) = broadcast_transaction(state, &rpc_url, &signed_tx).await {
-        if is_deterministic_preflight_error(&error) {
+        if let Some(proof) = NeverBroadcast::from_preflight_rejection(&error) {
             // A rejected preflight never submits the transaction, so the
             // claim can be retried.
-            release_claim_best_effort(cfg, &req.code, &pending).await;
+            if let Err(error) = release_signed_claim(
+                cfg,
+                &req.code,
+                &pending,
+                ReleaseProof::NeverBroadcast(proof),
+            )
+            .await
+            {
+                warn!(%error, "failed to release redemption claim");
+            }
             return err_resp(StatusCode::BAD_GATEWAY, &error.to_string());
         }
         // Transport and timeout errors keep the pending claim: the RPC may
@@ -261,9 +270,12 @@ async fn redeem(
     match await_signature(state, &rpc_url, &signature, cfg.confirm_timeout).await {
         PayoutStatus::Confirmed => {}
         PayoutStatus::Failed => {
+            // Released only once the failure is final, as for any retry.
             warn!(%signature, "redemption payout failed on-chain");
-            release_claim_best_effort(cfg, &req.code, &pending).await;
-            return err_resp(StatusCode::BAD_GATEWAY, "redemption payout failed; retry");
+            return match reconcile_existing_claim(state, cfg, &rpc_url, &req.code).await {
+                Ok(()) => err_resp(StatusCode::BAD_GATEWAY, "redemption payout failed; retry"),
+                Err(response) => response,
+            };
         }
         PayoutStatus::Pending => return pending_resp(&signature),
     }
@@ -369,7 +381,15 @@ async fn reconcile_existing_claim(
             }
             Err(already_redeemed_resp(&signature))
         }
-        Landing::Replaceable(proof) => release_reconciled_claim(cfg, code, &raw, proof).await,
+        Landing::Replaceable(proof) => {
+            match release_signed_claim(cfg, code, &raw, ReleaseProof::CannotLand(proof)).await {
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    warn!(%error, "redemption claim store unavailable");
+                    Err(err_resp(StatusCode::BAD_GATEWAY, "redemption claim failed"))
+                }
+            }
+        }
         Landing::MayLand | Landing::Unknown => Err(pending_resp(&signature)),
     }
 }
@@ -400,20 +420,32 @@ impl ChainState for Cluster<'_> {
     }
 }
 
-#[allow(clippy::result_large_err)]
-async fn release_reconciled_claim(
+/// Why a claim holding a signed payout may be released: nothing signed
+/// under it can ever land.
+enum ReleaseProof {
+    /// The chain proves the payout failed for good or expired unseen.
+    CannotLand(Replaceable),
+    NeverBroadcast(NeverBroadcast),
+}
+
+/// The RPC rejected the payout in preflight, so it was never forwarded.
+struct NeverBroadcast(());
+
+impl NeverBroadcast {
+    fn from_preflight_rejection(error: &Error) -> Option<Self> {
+        is_deterministic_preflight_error(error).then_some(Self(()))
+    }
+}
+
+/// Release a claim that recorded a signed payout. The only way to delete
+/// one: a release needs a proof the payout cannot land.
+async fn release_signed_claim(
     cfg: &RedemptionState,
     code: &str,
-    raw: &str,
-    _proof: Replaceable,
-) -> Result<(), Response> {
-    match transition_claim(cfg, code, raw, None).await {
-        Ok(_) => Ok(()),
-        Err(error) => {
-            warn!(%error, "redemption claim store unavailable");
-            Err(err_resp(StatusCode::BAD_GATEWAY, "redemption claim failed"))
-        }
-    }
+    expected: &str,
+    _proof: ReleaseProof,
+) -> Result<bool, redis::RedisError> {
+    transition_claim(cfg, code, expected, None).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -779,18 +811,17 @@ return 1
     Ok(changed == 1)
 }
 
-async fn release_claim_best_effort(cfg: &RedemptionState, code: &str, expected: &str) {
-    if let Err(error) = transition_claim(cfg, code, expected, None).await {
-        warn!(%error, "failed to release redemption claim");
-    }
-}
-
+/// Release a claim that never recorded a payout signature. It only matches
+/// `Claimed`, so a pending or confirmed claim is never released here.
 async fn release_redemption_claim_best_effort(
     cfg: &RedemptionState,
     code: &str,
     destination: &Pubkey,
 ) {
-    release_claim_best_effort(cfg, code, &ClaimState::Claimed(*destination).encode()).await;
+    let unsigned = ClaimState::Claimed(*destination).encode();
+    if let Err(error) = transition_claim(cfg, code, &unsigned, None).await {
+        warn!(%error, "failed to release redemption claim");
+    }
 }
 
 fn pending_resp(signature: &Signature) -> Response {
@@ -1292,6 +1323,10 @@ pub(crate) mod tests {
         }
 
         pub(super) fn failed() -> Value {
+            json!({ "err": { "InstructionError": [1, { "Custom": 1 }] }, "confirmationStatus": "finalized" })
+        }
+
+        pub(super) fn failed_unfinalized() -> Value {
             json!({ "err": { "InstructionError": [1, { "Custom": 1 }] }, "confirmationStatus": "confirmed" })
         }
 
@@ -1597,6 +1632,32 @@ pub(crate) mod tests {
             assert_eq!(h.claim().await, None);
 
             h.rpc.lock().unwrap().next_status = Some(confirmed());
+            let (status, body) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(h.sent().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn a_failure_short_of_finalized_keeps_the_claim_until_final() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            h.rpc.lock().unwrap().next_status = Some(failed_unfinalized());
+            let destination = Pubkey::new_unique();
+            let (status, body) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+            let first = h.sent()[0];
+            assert!(matches!(
+                h.claim().await,
+                Some(ClaimState::Pending { signature, .. }) if signature == first
+            ));
+
+            // Positive control: once the failure is final, a retry pays.
+            {
+                let mut rpc = h.rpc.lock().unwrap();
+                rpc.statuses.insert(first.to_string(), failed());
+                rpc.next_status = Some(confirmed());
+            }
             let (status, body) = h.redeem(&destination).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(h.sent().len(), 2);
