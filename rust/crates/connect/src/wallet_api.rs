@@ -626,7 +626,7 @@ mod tests {
         // New read-only signers go after the existing signers.
         let at = usize::from(message.header.num_required_signatures);
         for _ in 0..signers {
-            message.account_keys.insert(at, Pubkey::new_unique());
+            message.account_keys.splice(at..at, [Pubkey::new_unique()]);
             for instruction in &mut message.instructions {
                 if usize::from(instruction.program_id_index) >= at {
                     instruction.program_id_index += 1;
