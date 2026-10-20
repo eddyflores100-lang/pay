@@ -22,15 +22,15 @@ pub(crate) fn payment_prompt_context(
 /// Exact decimal rendering of `base` units at `decimals` places, without
 /// trailing zeros (`1500000000`, 9 -> `1.5`).
 pub(crate) fn format_base_units(base: u64, decimals: u32) -> String {
-    let scale = 10u128.pow(decimals);
-    let base = u128::from(base);
-    let whole = base / scale;
-    let fraction = base % scale;
-    if fraction == 0 {
-        return whole.to_string();
+    let decimals = decimals as usize;
+    let digits = format!("{base:0>width$}", width = decimals + 1);
+    let (whole, fraction) = digits.split_at(digits.len() - decimals);
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fraction}")
     }
-    let fraction = format!("{fraction:0width$}", width = decimals as usize);
-    format!("{whole}.{}", fraction.trim_end_matches('0'))
 }
 
 /// Native SOL is not a USD amount. It is named in SOL so no USD spending
@@ -272,6 +272,12 @@ mod tests {
         assert_eq!(format_base_units(u64::MAX, 0), u64::MAX.to_string());
         assert_eq!(format_base_units(u64::MAX, 19), "1.8446744073709551615");
         assert_eq!(format_base_units(50_000_000, 2), "500000");
+        // Decimals past any integer power of ten still render exactly.
+        assert_eq!(
+            format_base_units(15, 128),
+            format!("0.{}15", "0".repeat(126))
+        );
+        assert_eq!(format_base_units(0, u32::from(u8::MAX)), "0");
     }
 
     #[test]
