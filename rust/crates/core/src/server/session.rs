@@ -658,6 +658,20 @@ async fn settlement_tx_version(rpc_url: Option<String>) -> pay_kit::core::tx::Tx
     .unwrap_or(pay_kit::core::tx::TxVersion::V0)
 }
 
+/// Reusable session authorization needs the channel open on-chain: a payer
+/// may already have closed, sealed or distributed it. Without an RPC there is
+/// no chain to consult.
+fn require_open_onchain(rpc_configured: bool, status: Option<u8>) -> Result<()> {
+    const OPEN: u8 = 0;
+    match status {
+        Some(OPEN) => Ok(()),
+        None if !rpc_configured => Ok(()),
+        _ => Err(Error::PaymentRejected(
+            "payment channel is no longer open on-chain; open a new session".to_string(),
+        )),
+    }
+}
+
 /// The atomic settle-and-seal plus distribute instructions closing a channel.
 fn close_instructions(
     params: &SealParams,
@@ -2953,6 +2967,15 @@ impl SessionMpp {
                 terminal_errors::PROOF_MISMATCH
             )));
         }
+        // The payer can close and seal on-chain before this store catches up.
+        let onchain = self
+            .operator_runtime
+            .fetch_payment_channel(&state.channel_id)
+            .await?;
+        require_open_onchain(
+            self.operator_runtime.rpc_url.is_some(),
+            onchain.as_ref().map(|channel| channel.status),
+        )?;
         Ok(state)
     }
 
@@ -4163,6 +4186,22 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         url
+    }
+
+    #[test]
+    fn reusable_use_requires_an_open_channel_on_chain() {
+        use pay_kit::mpp::program::payment_channels::generated::generated::types::ChannelStatus;
+        assert!(require_open_onchain(true, Some(ChannelStatus::Open as u8)).is_ok());
+        for terminal in [
+            ChannelStatus::Sealed,
+            ChannelStatus::Closing,
+            ChannelStatus::Distributed,
+        ] {
+            assert!(require_open_onchain(true, Some(terminal as u8)).is_err());
+        }
+        // Gone from chain entirely: closed and reclaimed.
+        assert!(require_open_onchain(true, None).is_err());
+        assert!(require_open_onchain(false, None).is_ok());
     }
 
     #[test]

@@ -3128,7 +3128,8 @@ mod tests {
                     network: "devnet".into(),
                     voucher_signer: SessionVoucherSigner::Operator,
                     fee_payer_signer: Some(operator.signer.clone()),
-                    rpc_url: Some("http://127.0.0.1:1".into()),
+                    // No chain: the seeded channel is not re-read on `use`.
+                    rpc_url: None,
                     ..SessionConfig::default()
                 };
                 let cache = pay_kit::mpp::blockhash::BlockhashCache::new();
