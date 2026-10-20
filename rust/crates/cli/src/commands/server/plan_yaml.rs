@@ -149,12 +149,27 @@ fn endpoint_items(lines: &[&str]) -> Vec<EndpointItem> {
         if indent < item_indent || (indent == item_indent && !stripped.starts_with('-')) {
             break;
         }
-        // `- key: value` — the item's keys align with the first key after `-`.
+        // `- key: value` — the item's keys align with the first key after `-`;
+        // a bare `-` puts them on the following lines, aligned with its first child.
         let after_dash = &stripped[1..];
-        let field_indent = indent + 1 + (after_dash.len() - after_dash.trim_start().len());
+        let inline = after_dash.trim_start();
+        let (field_indent, mut first) = if is_content(inline) {
+            (indent + 1 + (after_dash.len() - inline.len()), Some(inline))
+        } else {
+            let child = lines[idx + 1..]
+                .iter()
+                .find(|line| is_content(line))
+                .map(|line| indent_of(line))
+                .filter(|&child| child > indent);
+            let Some(child) = child else {
+                items.push(EndpointItem::default());
+                idx += 1;
+                continue;
+            };
+            (child, None)
+        };
         let mut item = EndpointItem::default();
         let mut cursor = idx;
-        let mut first = Some(after_dash.trim_start());
         loop {
             let key_line = match first.take() {
                 Some(text) => Some(text),
@@ -283,6 +298,52 @@ endpoints:
         assert_eq!(
             out,
             "endpoints:\n# lead\n- method: GET\n  path: v1/feed # trailing\n  subscription:\n    period: 30d\n    plan_id: P\n\n    # tail\nrouting: {}\n"
+        );
+    }
+
+    #[test]
+    fn standalone_dash_items_are_matched() {
+        let yaml = "\
+endpoints:
+  -
+    method: GET
+    path: v1/feed
+    subscription:
+      period: 30d
+  - # post
+    method: POST
+    path: v1/feed
+    subscription:
+      period: 7d
+";
+        let updates = HashMap::from([
+            (route(HttpMethod::Get, "v1/feed"), plan_id("GET_PLAN")),
+            (route(HttpMethod::Post, "v1/feed"), plan_id("POST_PLAN")),
+        ]);
+        let (out, missing) = rewrite_subscription_fields(yaml, &updates);
+        assert!(missing.is_empty(), "{missing:?}");
+        assert_eq!(
+            out,
+            "\
+endpoints:
+  -
+    method: GET
+    path: v1/feed
+    subscription:
+      period: 30d
+      plan_id: GET_PLAN
+  - # post
+    method: POST
+    path: v1/feed
+    subscription:
+      period: 7d
+      plan_id: POST_PLAN
+"
+        );
+        let parsed: serde_yml::Value = serde_yml::from_str(&out).unwrap();
+        assert_eq!(
+            parsed["endpoints"][1]["subscription"]["plan_id"],
+            "POST_PLAN"
         );
     }
 }
