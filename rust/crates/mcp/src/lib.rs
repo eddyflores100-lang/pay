@@ -2,6 +2,7 @@
 
 mod auth;
 pub mod authority;
+pub mod authority_remote;
 pub mod context;
 pub mod permissions;
 pub mod policy;
