@@ -344,7 +344,11 @@ async fn deny_after_real_quote_prevents_wallet_approval_and_paid_http() {
     assert!(text(&result).contains("DENIED"));
     assert_eq!(m.probes.load(Ordering::SeqCst), 1);
     assert_eq!(m.paid.load(Ordering::SeqCst), 0);
-    assert_eq!(c.store.reads.load(Ordering::SeqCst), 0);
+    // Upstream's payer-keyed session cache derives the payer via session_payer()
+    // before the authority verdict, which is one benign store.load(). What the
+    // gate still guarantees: nothing beyond that lookup touches the store before
+    // the verdict, and nothing at all after the denial.
+    assert_eq!(c.store.reads.load(Ordering::SeqCst), 1);
     assert_eq!(c.approval.load(Ordering::SeqCst), 0);
     let facts = a.facts.lock().unwrap();
     let f = &facts[0];
@@ -376,7 +380,9 @@ async fn provider_error_and_timeout_fail_closed() {
         assert!(text(&result).contains(code));
         assert_eq!(a.calls.load(Ordering::SeqCst), 1);
         assert_eq!(m.paid.load(Ordering::SeqCst), 0);
-        assert_eq!(c.store.reads.load(Ordering::SeqCst), 0);
+        // One benign session_payer() store.load() precedes the failed provider
+        // call; the provider error itself must not trigger any account work.
+        assert_eq!(c.store.reads.load(Ordering::SeqCst), 1);
         assert_eq!(c.approval.load(Ordering::SeqCst), 0);
     }
 }
@@ -557,7 +563,10 @@ async fn yaml_permissions_remain_an_independent_gate() {
             text(&result)
         );
         assert_eq!(a.calls.load(Ordering::SeqCst), calls);
-        assert_eq!(c.store.reads.load(Ordering::SeqCst), 0);
+        // The benign session_payer() store.load() happens inside the paid flow
+        // before the cap check and the authority consult, so both iterations
+        // (cap rejection and authority denial) show exactly one store read.
+        assert_eq!(c.store.reads.load(Ordering::SeqCst), 1);
         assert_eq!(c.approval.load(Ordering::SeqCst), 0);
         assert_eq!(m.paid.load(Ordering::SeqCst), 0);
     }
@@ -571,7 +580,9 @@ async fn unsupported_version_and_redirect_cannot_find_a_free_path() {
         let _ = call(c.clone(), args(&m.url, Some(mode))).await;
         assert_eq!(m.probes.load(Ordering::SeqCst), 1);
         assert_eq!(m.paid.load(Ordering::SeqCst), 0);
-        assert_eq!(c.store.reads.load(Ordering::SeqCst), 0);
+        // One benign session_payer() lookup precedes the verdict that rejects
+        // the unsupported version/redirect/mpp path.
+        assert_eq!(c.store.reads.load(Ordering::SeqCst), 1);
         assert_eq!(a.calls.load(Ordering::SeqCst), 0);
     }
 }
@@ -643,7 +654,12 @@ async fn failed_context_and_forged_caller_are_not_authorization_fallbacks() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn canonical_yaml_rejection_remains_fail_closed_without_a_fallback() {
+async fn caip2_only_challenge_with_yaml_cap_flows_after_upstream_caip2_support() {
+    // Pre-merge, a canonical CAIP-2-only challenge under a USD max_payment cap
+    // was rejected by the YAML network parser ("invalid Solana network").
+    // Upstream's parser now understands CAIP-2 (cluster_for_caip2_network), so
+    // the same combination must flow through the gate instead of erroring: the
+    // authority is consulted, the in-cap payment is signed and retried once.
     let m = Merchant::new("exact").await;
     let a = Authority::new(Decision::Allow);
     let mut c = Context::new(Some(a.clone()));
@@ -652,9 +668,8 @@ async fn canonical_yaml_rejection_remains_fail_closed_without_a_fallback() {
     ));
     let c = Arc::new(c);
     let result = call(c.clone(), args(&m.url, Some("existing-yaml-rejection"))).await;
-    assert!(text(&result).contains("invalid Solana network"));
-    assert_eq!(a.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(c.store.reads.load(Ordering::SeqCst), 0);
-    assert_eq!(c.approval.load(Ordering::SeqCst), 0);
-    assert_eq!(m.paid.load(Ordering::SeqCst), 0);
+    assert_eq!(result.is_error, Some(false));
+    assert_eq!(a.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(c.approval.load(Ordering::SeqCst), 1);
+    assert_eq!(m.paid.load(Ordering::SeqCst), 1);
 }

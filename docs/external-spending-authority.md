@@ -13,11 +13,31 @@ Override the default `PayContext::spending_authority` method and return an
 wallets and YAML permission files keep their current behavior. No external app,
 service or additional wallet is required for existing users.
 
-The first extension is programmatic. This PR adds no command runner, HTTP client,
-CLI flag or new YAML field. A host can implement a provider using its existing
-local IPC or authenticated policy client. Provider failures must remain errors;
-an enabled host must not return `None` when its policy service is unavailable.
-`None` means deliberately disabled, never unavailable.
+The first extension is programmatic. No command runner, CLI flag or new YAML
+field is added. This PR does ship a reference HTTP provider,
+`pay_mcp::authority_remote::RemoteHttpAuthority`, whose constructor builds the
+HTTP client and whose implementation posts the spend request to your policy
+endpoint and maps the JSON verdict (fail closed: timeouts, non-2xx responses,
+malformed flags and oversized verdicts all deny the spend). A host can bind it
+directly, or implement a provider with its existing local IPC or authenticated
+policy client. Provider failures must remain errors; an enabled host must not
+return `None` when its policy service is unavailable. `None` means deliberately
+disabled, never unavailable.
+
+```rust,ignore
+use std::sync::Arc;
+use std::time::Duration;
+use pay_mcp::authority::{AuthorityBinding, SpendingAuthority};
+use pay_mcp::authority_remote::RemoteHttpAuthority;
+
+// Reference provider: point it at your policy endpoint and bind it.
+let http_authority: Arc<dyn SpendingAuthority> = Arc::new(
+    RemoteHttpAuthority::new("https://policy.internal.example/v1/spend")?
+        .with_request_timeout(Duration::from_secs(5)),
+);
+// ...or keep your own provider (local IPC, authenticated policy client, ...):
+let custom_authority: Arc<dyn SpendingAuthority> = my_existing_client;
+```
 
 ```rust,ignore
 use std::sync::Arc;

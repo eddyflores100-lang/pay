@@ -2776,7 +2776,10 @@ mod external_authority_cache_tests {
         };
         let cache = SessionCache::default();
         cache.store(
-            session_cache_key("GET", &url).unwrap(),
+            // do_paid_fetch derives the payer via session_payer(); with an empty
+            // MemoryAccountsStore that is the empty string, so preload the key the
+            // production flow would actually compute.
+            session_cache_key("", "GET", &url).unwrap(),
             "must-not-be-attached".into(),
         );
         let attempt = cache
