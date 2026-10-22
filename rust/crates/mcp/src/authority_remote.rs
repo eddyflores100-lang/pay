@@ -132,6 +132,13 @@ impl RemoteHttpAuthority {
 /// broken or hostile authority cannot grow host memory with an unbounded
 /// body. Real verdicts are tens of bytes; 64 KiB leaves orders of magnitude
 /// of headroom.
+///
+/// This is deliberately much tighter than the general response caps in
+/// `pay-core` (`MAX_PUBLIC_RESPONSE_BODY_BYTES`, 64 MiB). Authority verdicts
+/// are tiny, structured payloads; the tight bound is what keeps a hostile or
+/// compromised authority from forcing response-sized buffering. If a
+/// legitimate verdict ever exceeds the cap, the failure mode is a fail-closed
+/// `AuthorityUnavailable`, never a silent truncation.
 pub const MAX_VERDICT_BYTES: usize = 64 * 1024;
 
 impl SpendingAuthority for RemoteHttpAuthority {
