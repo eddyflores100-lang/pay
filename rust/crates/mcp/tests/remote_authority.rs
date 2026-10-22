@@ -287,3 +287,96 @@ async fn inner_request_timeout_fails_closed() {
     let verdict = verdict_of(&authority).await;
     assert!(matches!(verdict, Err(AuthorityUnavailable)));
 }
+
+// Regression tests for PR #525 review findings (greptile, 2026-10-21):
+// - P1: malformed `unavailable` values must fail closed (never coerce to false)
+// - P2: verdict bodies are capped at MAX_VERDICT_BYTES
+//
+// Append to rust/crates/mcp/tests/remote_authority.rs (uses the existing
+// MockService / verdict_of helpers defined in that file).
+
+/// P1 regression: a present `unavailable` value that is not a JSON boolean
+/// must fail closed. Before the fix, `as_bool()` returned `None` and
+/// `unwrap_or(false)` coerced every malformed flag into "available", so
+/// `{"decision":"allow","unavailable":"true"}` reached wallet approval.
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_unavailable_values_fail_closed() {
+    let malformed = vec![
+        json!({"decision": "allow", "unavailable": "true"}),
+        json!({"decision": "allow", "unavailable": "false"}),
+        json!({"decision": "allow", "unavailable": null}),
+        json!({"decision": "allow", "unavailable": 1}),
+        json!({"decision": "allow", "unavailable": 0}),
+        json!({"decision": "allow", "unavailable": {"forced": true}}),
+        json!({"decision": "allow", "unavailable": ["true"]}),
+    ];
+    for body in malformed {
+        let label = body.to_string();
+        let value = body.clone();
+        let mock = MockService::start(Arc::new(move |_, _| MockService::json(200, value.clone())))
+            .await;
+        let authority = RemoteHttpAuthority::new(&mock.url).unwrap();
+        let verdict = verdict_of(&authority).await;
+        assert!(
+            matches!(verdict, Err(AuthorityUnavailable)),
+            "malformed unavailable flag must fail closed: {label}"
+        );
+    }
+}
+
+/// Sanity guard for the strict mapping: well-formed flags keep working, and
+/// an explicit `true` still wins over `decision:"allow"`.
+#[tokio::test(flavor = "multi_thread")]
+async fn wellformed_unavailable_flags_unchanged() {
+    // false + allow -> Allow (unchanged behavior)
+    let mock =
+        MockService::start(Arc::new(|_, _| MockService::json(200, json!({"decision": "allow", "unavailable": false}))))
+            .await;
+    let authority = RemoteHttpAuthority::new(&mock.url).unwrap();
+    assert!(matches!(verdict_of(&authority).await, Ok(AuthorityDecision::Allow)));
+
+    // true + allow -> Unavailable (precedence unchanged)
+    let mock =
+        MockService::start(Arc::new(|_, _| MockService::json(200, json!({"decision": "allow", "unavailable": true}))))
+            .await;
+    let authority = RemoteHttpAuthority::new(&mock.url).unwrap();
+    assert!(matches!(verdict_of(&authority).await, Err(AuthorityUnavailable)));
+
+    // absent flag + deny -> Deny (unchanged behavior)
+    let mock = MockService::start(Arc::new(|_, _| MockService::json(200, json!({"decision": "deny"})))).await;
+    let authority = RemoteHttpAuthority::new(&mock.url).unwrap();
+    assert!(matches!(verdict_of(&authority).await, Ok(AuthorityDecision::Deny)));
+}
+
+/// P2 regression: a 2xx verdict larger than `MAX_VERDICT_BYTES` must fail
+/// closed instead of being buffered in full.
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_verdict_fails_closed() {
+    // 100 KiB of padding: over the 64 KiB cap, valid JSON, decision allow.
+    let body = format!(
+        r#"{{"decision":"allow","pad":"{}"}}"#,
+        "a".repeat(100 * 1024)
+    );
+    let mock = MockService::start(Arc::new(move |_, _| {
+        (200, vec![], body.clone().into_bytes())
+    }))
+    .await;
+    let authority = RemoteHttpAuthority::new(&mock.url).unwrap();
+    let verdict = verdict_of(&authority).await;
+    assert!(matches!(verdict, Err(AuthorityUnavailable)));
+}
+
+/// Boundary: a verdict just under the cap is still processed normally.
+#[tokio::test(flavor = "multi_thread")]
+async fn verdict_under_cap_still_parsed() {
+    let body = format!(
+        r#"{{"decision":"allow","pad":"{}"}}"#,
+        "a".repeat(32 * 1024)
+    );
+    let mock = MockService::start(Arc::new(move |_, _| {
+        (200, vec![], body.clone().into_bytes())
+    }))
+    .await;
+    let authority = RemoteHttpAuthority::new(&mock.url).unwrap();
+    assert!(matches!(verdict_of(&authority).await, Ok(AuthorityDecision::Allow)));
+}

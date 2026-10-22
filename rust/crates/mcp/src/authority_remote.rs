@@ -19,7 +19,9 @@
 //! 2xx + {"decision":"allow","unavailable":false}  -> Ok(AuthorityDecision::Allow)
 //! 2xx + {"decision":"deny", "unavailable":false}  -> Ok(AuthorityDecision::Deny)
 //! 2xx + {"unavailable":true, ...}                 -> Err(AuthorityUnavailable)
+//! 2xx + {"unavailable":<non-bool>, ...}           -> Err(AuthorityUnavailable)
 //! non-2xx, malformed body, unknown verdict,
+//! body larger than [`MAX_VERDICT_BYTES`],
 //! transport error, timeout                        -> Err(AuthorityUnavailable)
 //! ```
 //!
@@ -102,13 +104,20 @@ impl RemoteHttpAuthority {
 
     /// Maps a parsed verdict to a decision. Anything that is not an
     /// unambiguous, available allow/deny fails closed.
+    ///
+    /// A present `unavailable` value that is not a JSON boolean is treated as
+    /// a malformed verdict and fails closed: coercing it to `false` would let
+    /// a broken (or hostile) authority turn an ambiguous availability flag
+    /// into a spend approval.
     fn map_verdict(verdict: &Value) -> Result<AuthorityDecision, AuthorityUnavailable> {
-        if verdict
-            .get("unavailable")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            return Err(AuthorityUnavailable);
+        match verdict.get("unavailable") {
+            // Absent, or an explicit `false`: proceed to the decision match.
+            None | Some(Value::Bool(false)) => {}
+            // Explicit `true`: the authority self-reports unavailability.
+            Some(Value::Bool(true)) => return Err(AuthorityUnavailable),
+            // Present but not a boolean (string, null, number, object,
+            // array): malformed verdict, never coerced, fail closed.
+            Some(_) => return Err(AuthorityUnavailable),
         }
         match verdict.get("decision").and_then(Value::as_str) {
             Some("allow") => Ok(AuthorityDecision::Allow),
@@ -117,6 +126,13 @@ impl RemoteHttpAuthority {
         }
     }
 }
+
+/// Hard cap on the buffered verdict body. A 2xx response larger than this is
+/// rejected as `AuthorityUnavailable` instead of being buffered in full, so a
+/// broken or hostile authority cannot grow host memory with an unbounded
+/// body. Real verdicts are tens of bytes; 64 KiB leaves orders of magnitude
+/// of headroom.
+pub const MAX_VERDICT_BYTES: usize = 64 * 1024;
 
 impl SpendingAuthority for RemoteHttpAuthority {
     fn authorize(
@@ -137,12 +153,21 @@ impl SpendingAuthority for RemoteHttpAuthority {
             if let Some(timeout) = self.request_timeout {
                 builder = builder.timeout(timeout);
             }
-            let response = builder.send().await.map_err(|_| AuthorityUnavailable)?;
+            let mut response = builder.send().await.map_err(|_| AuthorityUnavailable)?;
             if !response.status().is_success() {
                 return Err(AuthorityUnavailable);
             }
-            let bytes = response.bytes().await.map_err(|_| AuthorityUnavailable)?;
-            let verdict: Value = serde_json::from_slice(&bytes).map_err(|_| AuthorityUnavailable)?;
+            // Stream the body under a hard cap instead of buffering the whole
+            // response: `response.bytes()` would accept arbitrarily large 2xx
+            // bodies from the consulted host.
+            let mut buf: Vec<u8> = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|_| AuthorityUnavailable)? {
+                if buf.len().saturating_add(chunk.len()) > MAX_VERDICT_BYTES {
+                    return Err(AuthorityUnavailable);
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            let verdict: Value = serde_json::from_slice(&buf).map_err(|_| AuthorityUnavailable)?;
             Self::map_verdict(&verdict)
         })
     }
